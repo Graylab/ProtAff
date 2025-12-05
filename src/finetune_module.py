@@ -160,19 +160,4 @@ class ProteinAffinityModule(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        encoder_params = []
-        head_params = []
-        pretrained = ["projector", "norm_input", "task_encoder", "pooler", "lora"]
-        
-        for name, param in self.named_parameters():
-            if not param.requires_grad: continue
-            if any(k in name for k in pretrained):
-                encoder_params.append(param)
-            else:
-                head_params.append(param)
-
-        lr = self.cfg.training.learning_rate
-        return torch.optim.AdamW([
-            {'params': encoder_params, 'lr': lr * 0.1}, 
-            {'params': head_params, 'lr': lr}
-        ])
+        return torch.optim.AdamW(self.parameters(), lr=self.cfg.training.learning_rate, weight_decay=self.cfg.training.weight_decay)

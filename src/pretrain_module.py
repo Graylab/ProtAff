@@ -85,4 +85,4 @@ class DMSModule(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.cfg.training.learning_rate)
+        return torch.optim.AdamW(self.parameters(), lr=self.cfg.training.learning_rate, weight_decay=self.cfg.training.weight_decay)
