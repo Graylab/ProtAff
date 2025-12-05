@@ -1,0 +1,43 @@
+# configs/inference.yaml
+defaults:
+  - _self_
+  # 1. INHERIT MODEL CONFIG
+  # This loads 'configs/model/esm_lora.yaml', providing 'cfg.model.name'
+  # so the script knows which ESM-2 version to load automatically.
+  - model: esm_lora
+  
+  # 2. DISABLE LOGGING
+  # Keeps your folder structure clean (no inference.log or hydra.log)
+  - override hydra/job_logging: none
+  - override hydra/hydra_logging: none
+
+# ==============================================================================
+# INPUTS
+# ==============================================================================
+# Path to the FOLDER containing adapter_model.bin and adapter_config.json
+# (Generated at the end of training in outputs/DATE/TIME/saved_model)
+model_path: "outputs/2025-11-18/14-30-00/saved_model"
+
+# CSV file containing 'binder_sequence' and 'target_sequence'
+input_csv: "data/raw/test_data.csv"
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+# The results will be saved to: inference_results/{input_filename}/predictions.csv
+base_results_dir: "inference_results"
+output_filename: "predictions.csv"
+
+# ==============================================================================
+# SETTINGS
+# ==============================================================================
+batch_size: 32
+device: "auto"  # "cuda", "cpu", or "auto"
+
+# ==============================================================================
+# HYDRA SYSTEM SETTINGS
+# ==============================================================================
+hydra:
+  output_subdir: null  # Disable .hydra config saving
+  run:
+    dir: .             # Run in current directory (no timestamped folder)
