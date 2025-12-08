@@ -69,19 +69,35 @@ class DMSModule(pl.LightningModule):
         return bm.single_head(pooled)
 
     def training_step(self, batch, batch_idx):
-        pred_wt = self.forward_single(batch['wt_ids'], batch['wt_mask'])
-        pred_mut = self.forward_single(batch['mut_ids'], batch['mut_mask'])
-        
-        # MSE on Delta
+        # 1. Concatenate inputs (Stack WT and Mut)
+        combined_ids = torch.cat([batch['wt_ids'], batch['mut_ids']], dim=0)
+        combined_mask = torch.cat([batch['wt_mask'], batch['mut_mask']], dim=0)
+
+        # 2. Single Forward Pass
+        combined_preds = self.forward_single(combined_ids, combined_mask)
+
+        # 3. Split results back
+        pred_wt, pred_mut = combined_preds.chunk(2, dim=0)
+
+        # 4. Calculate Loss
         loss = self.loss_fn(pred_mut - pred_wt, batch['labels'].unsqueeze(-1))
-        self.log('train_loss', loss, on_step=True, on_epoch=True)
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        pred_wt = self.forward_single(batch['wt_ids'], batch['wt_mask'])
-        pred_mut = self.forward_single(batch['mut_ids'], batch['mut_mask'])
+        # 1. Concatenate
+        combined_ids = torch.cat([batch['wt_ids'], batch['mut_ids']], dim=0)
+        combined_mask = torch.cat([batch['wt_mask'], batch['mut_mask']], dim=0)
+
+        # 2. Single Forward Pass
+        combined_preds = self.forward_single(combined_ids, combined_mask)
+
+        # 3. Split
+        pred_wt, pred_mut = combined_preds.chunk(2, dim=0)
+
+        # 4. Calculate Loss
         loss = self.loss_fn(pred_mut - pred_wt, batch['labels'].unsqueeze(-1))
-        self.log('val_loss', loss, on_epoch=True)
+        self.log('val_loss', loss, on_epoch=True, prog_bar=True)
         return loss
 
     def configure_optimizers(self):

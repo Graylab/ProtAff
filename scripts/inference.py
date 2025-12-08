@@ -66,7 +66,7 @@ def main(cfg: DictConfig):
     # Paths
     input_path = Path(cfg.input_csv)
     base_res = Path(cfg.base_results_dir)
-    save_dir = base_res / input_path.stem
+    save_dir = base_res / cfg.model.name.split("/")[-1] / input_path.stem
     save_dir.mkdir(parents=True, exist_ok=True)
     output_path = save_dir / cfg.output_filename
 

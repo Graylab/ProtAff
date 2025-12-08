@@ -84,10 +84,12 @@ def main(cfg: DictConfig):
         max_epochs=cfg.training.max_epochs,
         logger=wandb_logger,
         callbacks=[checkpoint_cb, hf_save_cb, lr_monitor],
-        default_root_dir=hydra_out_dir, # Explicit root
+        default_root_dir=hydra_out_dir, 
         log_every_n_steps=10,
         accumulate_grad_batches=cfg.training.get("accumulate_grad_batches", 1),
-        precision="16-mixed" if cfg.training.get("use_mixed_precision", False) else 32
+        precision="bf16-mixed" if cfg.training.get("use_mixed_precision", False) else 32,
+        gradient_clip_val=cfg.training.get("gradient_clip_val", 1.0),
+        gradient_clip_algorithm=cfg.training.get("gradient_clip_algorithm", "norm")
     )
 
     # 7. Start Training

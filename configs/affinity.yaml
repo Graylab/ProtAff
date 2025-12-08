@@ -10,18 +10,24 @@ data:
   base_csv: "data/dummy/base_data.csv"
   lookup_csv: "data/dummy/lookup_data.csv"
   num_workers: 6
+  weight_col: null
+  balance_clusters: false
 
 training:
   seed: 42
-  batch_size: 16
+  batch_size: 32
   learning_rate: 1e-4  
   weight_decay: 1e-4
-  max_epochs: 20
+  max_epochs: 30
+
+  # Hardware
   accelerator: "auto"
   devices: "auto"
   strategy: "auto"
-  use_mixed_precision: false
+  use_mixed_precision: true
   accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: "norm"
 
   wandb:
     project: "affinity-finetune"

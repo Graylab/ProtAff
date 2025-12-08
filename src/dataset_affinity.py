@@ -17,8 +17,9 @@ class DualStreamCollator:
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         eos = self.tokenizer.eos_token
-        binder_seqs = [f["binder_seq"].replace(":", eos) for f in features]
-        target_seqs = [f["target_seq"].replace(":", eos) for f in features]
+        # Ensure we convert to string to avoid errors if pandas inferred types weirdly
+        binder_seqs = [str(f["binder_seq"]).replace(":", eos) for f in features]
+        target_seqs = [str(f["target_seq"]).replace(":", eos) for f in features]
         labels = [f["labels"] for f in features]
 
         batch_binder = self.tokenizer(
@@ -38,23 +39,45 @@ class DualStreamCollator:
 
 class AffinityDataset(Dataset):
     def __init__(self, base_df: pd.DataFrame, lookup_csv_path: str, weight_col: Optional[str] = None, balance_clusters: bool = False):
+        # 1. Load Lookup
         lookup_df = pd.read_csv(lookup_csv_path)
-        self.id2seq = dict(zip(lookup_df['type'] + "_" + lookup_df['id'].astype(str), lookup_df['seq']))
+        # Fast dictionary creation
+        lookup_df['key'] = lookup_df['type'].astype(str) + "_" + lookup_df['id'].astype(str)
+        self.id2seq = dict(zip(lookup_df['key'], lookup_df['seq']))
         
+        # 2. Map IDs
         base_df["binder_key"] = "binder_" + base_df["binder_id"].astype(str)
         base_df["target_key"] = "target_" + base_df["target_id"].astype(str)
         
-        base_df = base_df[base_df['binder_key'].isin(self.id2seq) & base_df['target_key'].isin(self.id2seq)]
+        # 3. Filter missing sequences
+        # (This vector operation is faster than iterating)
+        mask = base_df['binder_key'].isin(self.id2seq) & base_df['target_key'].isin(self.id2seq)
+        base_df = base_df[mask].reset_index(drop=True)
         
+        # 4. Balancing Logic (Target-Centric Inverse Sqrt)
         self.weights = None
-        if weight_col and weight_col in base_df.columns:
-            if balance_clusters:
-                counts = base_df[weight_col].value_counts()
-                cluster_sizes = base_df[weight_col].map(counts)
-                self.weights = (1.0 / (np.log10(cluster_sizes) + 1.0)).to_numpy(dtype=np.float32)
-            else:
-                self.weights = pd.to_numeric(base_df[weight_col], errors='coerce').fillna(1.0).to_numpy(dtype=np.float32)
+        
+        if balance_clusters:
+            # Default to balancing by target_id if no column provided, 
+            # because your plots show Target is the imbalanced entity.
+            stratify_col = weight_col if weight_col and weight_col in base_df.columns else "target_id"
+            print(f"[Dataset] Balancing training data based on: {stratify_col}")
 
+            # Count frequency of every group
+            counts = base_df[stratify_col].value_counts()
+            
+            # Map frequency back to the individual rows
+            freqs = base_df[stratify_col].map(counts)
+            
+            # STRATEGY: Weight = 1 / sqrt(Frequency)
+            # This flattens the "skyscraper" in your plot without making rare targets explode.
+            self.weights = (1.0 / np.sqrt(freqs)).to_numpy(dtype=np.float32)
+            
+        elif weight_col and weight_col in base_df.columns:
+            # Use raw numeric weights if provided (e.g. confidence scores)
+            self.weights = pd.to_numeric(base_df[weight_col], errors='coerce').fillna(1.0).to_numpy(dtype=np.float32)
+
+        # 5. Convert Data to Dict for __getitem__ speed
         self.data = base_df[["binder_key", "target_key", "log_Aff"]].to_dict('records')
 
     def __len__(self):
@@ -83,20 +106,20 @@ class ProteinDataModule(LightningDataModule):
         self.sampler = None
 
     def setup(self, stage: Optional[str] = None):
+        # Load Data
         base_df = pd.read_csv(self.cfg.data.base_csv)
+        
+        # Initialize Dataset
         full_dataset = AffinityDataset(
             base_df, 
             self.cfg.data.lookup_csv, 
             weight_col=self.cfg.data.get("weight_col"), 
-            balance_clusters=self.cfg.data.get("balance_clusters")
+            balance_clusters=self.cfg.data.get("balance_clusters", False)
         )
         
-        # Consistent Split Logic
+        # Split Logic
         total_len = len(full_dataset)
-        if total_len < 10:
-            val_len = 1
-        else:
-            val_len = int(total_len * 0.1)
+        val_len = int(total_len * 0.1) if total_len >= 10 else 1
         train_len = total_len - val_len
 
         self.train_dataset, self.val_dataset = random_split(
@@ -104,19 +127,37 @@ class ProteinDataModule(LightningDataModule):
             generator=torch.Generator().manual_seed(self.cfg.training.seed)
         )
 
+        # Setup Weighted Sampler (Only for Training)
         if full_dataset.weights is not None:
-            train_weights = torch.tensor([full_dataset.get_weight(i) for i in self.train_dataset.indices], dtype=torch.float)
-            self.sampler = WeightedRandomSampler(weights=train_weights, num_samples=len(train_weights), replacement=True)
+            print("[DataModule] Setting up WeightedRandomSampler for training...")
+            # We must map the subset indices back to the full dataset weights
+            train_weights = torch.tensor(
+                [full_dataset.get_weight(i) for i in self.train_dataset.indices], 
+                dtype=torch.float
+            )
+            
+            self.sampler = WeightedRandomSampler(
+                weights=train_weights, 
+                num_samples=len(train_weights), 
+                replacement=True # Standard for rebalancing
+            )
 
     def train_dataloader(self):
         return DataLoader(
-            self.train_dataset, batch_size=self.cfg.training.batch_size, 
-            collate_fn=self.collate_fn, num_workers=self.num_workers, 
-            sampler=self.sampler, shuffle=(self.sampler is None), pin_memory=True
+            self.train_dataset, 
+            batch_size=self.cfg.training.batch_size, 
+            collate_fn=self.collate_fn, 
+            num_workers=self.num_workers, 
+            sampler=self.sampler, 
+            shuffle=(self.sampler is None), # Shuffle only if sampler is NOT used
+            pin_memory=True
         )
 
     def val_dataloader(self):
         return DataLoader(
-            self.val_dataset, batch_size=self.cfg.training.batch_size, 
-            collate_fn=self.collate_fn, num_workers=self.num_workers, pin_memory=True
+            self.val_dataset, 
+            batch_size=self.cfg.training.batch_size, 
+            collate_fn=self.collate_fn, 
+            num_workers=self.num_workers, 
+            pin_memory=True
         )
