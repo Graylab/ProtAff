@@ -6,6 +6,9 @@ defaults:
 # --- TRANSFER LEARNING ---
 pretrained_ckpt_path: null
 
+# Resume path to a specific .ckpt file (e.g., "outputs/.../checkpoints/last.ckpt")
+resume_checkpoint_path: null
+
 data:
   base_csv: "data/dummy/base_data.csv"
   lookup_csv: "data/dummy/lookup_data.csv"

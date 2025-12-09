@@ -3,6 +3,9 @@ defaults:
   - _self_
   - model: esm_lora
 
+# Resume path to a specific .ckpt file (e.g., "outputs/.../checkpoints/last.ckpt")
+resume_checkpoint_path: null
+
 data:
   mutant_csv: "data/dummy_dms/mutants.csv"
   wt_csv: "data/dummy_dms/wildtypes.csv"

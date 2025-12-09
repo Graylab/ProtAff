@@ -37,28 +37,33 @@ def main(cfg: DictConfig):
     pl.seed_everything(cfg.training.seed, workers=True)
     
     # 1. Get Explicit Absolute Output Path from Hydra
-    # This guarantees we point to outputs/phase1_dms/YYYY.../
     hydra_out_dir = HydraConfig.get().runtime.output_dir
     
-    # 2. Force WandB to save inside this directory (Prevents root pollution)
+    # 2. Force WandB to save inside this directory
     os.environ["WANDB_DIR"] = hydra_out_dir
     
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(f"[System] Hydra Output Directory: {hydra_out_dir}")
         print(f"[Config] Task: DMS Pre-training")
+        
+        # Log Logic Status
+        if cfg.get("resume_checkpoint_path"):
+            print(f"[Config] RESUMING STATE from: {cfg.resume_checkpoint_path}")
+        else:
+            print(f"[Config] Training from Scratch")
 
     # 3. Init Data & Model
     dm = DMSDataModule(cfg)
     model = DMSModule(cfg)
 
-    # 4. Callbacks (Using Absolute Path)
+    # 4. Callbacks
     checkpoint_cb = ModelCheckpoint(
         dirpath=os.path.join(hydra_out_dir, "checkpoints"),
         filename="dms-{epoch:02d}-{val_loss:.4f}",
         save_top_k=1,
         monitor="val_loss",
         mode="min",
-        save_last=True
+        save_last=True # Essential for resuming
     )
 
     hf_save_cb = SaveHuggingFaceFormatCallback(
@@ -68,12 +73,15 @@ def main(cfg: DictConfig):
     
     lr_monitor = LearningRateMonitor(logging_interval='step')
 
-    # 5. Logger (Using Absolute Path)
+    # 5. Logger
     wandb_logger = WandbLogger(
         project=getattr(cfg.training.wandb, "project", "dms-pretrain"),
         save_dir=hydra_out_dir, 
         name=f"dms-{cfg.model.name}",
-        log_model=False 
+        log_model=False,
+        # Optional: Allow resuming WandB plots if ID provided
+        # id=cfg.training.wandb.get("id", None), 
+        # resume="allow"
     )
 
     # 6. Trainer
@@ -92,14 +100,29 @@ def main(cfg: DictConfig):
         gradient_clip_algorithm=cfg.training.get("gradient_clip_algorithm", "norm")
     )
 
-    # 7. Start Training
-    trainer.fit(model, datamodule=dm)
+    # --- RESUME LOGIC ---
+    ckpt_path = cfg.get("resume_checkpoint_path", None)
+    
+    if ckpt_path:
+        # Convert relative path to absolute because Hydra changes CWD
+        ckpt_path = hydra.utils.to_absolute_path(ckpt_path)
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
+
+    # 7. Start Training (With Resume Support)
+    trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path)
 
     # 8. Final Export
     if trainer.is_global_zero:
         best_path = checkpoint_cb.best_model_path
+        
+        # Fallback: if we just resumed and finished without a new "best", use the resume path
+        if not best_path and ckpt_path:
+            best_path = ckpt_path
+
         if best_path:
-            print(f"[System] Loading best checkpoint: {best_path}")
+            print(f"[System] Loading checkpoint for export: {best_path}")
+            # Load weights to CPU to avoid memory issues during export
             ckpt = torch.load(best_path, map_location="cpu")
             model.load_state_dict(ckpt["state_dict"])
             

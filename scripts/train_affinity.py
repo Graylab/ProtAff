@@ -42,8 +42,12 @@ def main(cfg: DictConfig):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(f"[System] Hydra Output Directory: {hydra_out_dir}")
         print(f"[Config] Task: Affinity Fine-tuning")
-        if cfg.pretrained_ckpt_path:
-            print(f"[Config] Transfer Learning: Enabled -> {cfg.pretrained_ckpt_path}")
+        
+        # Log Logic Status
+        if cfg.get("resume_checkpoint_path"):
+            print(f"[Config] RESUMING STATE from: {cfg.resume_checkpoint_path}")
+        elif cfg.get("pretrained_ckpt_path"):
+            print(f"[Config] Transfer Learning (Weights Only): {cfg.pretrained_ckpt_path}")
 
     # 2. Components
     dm = ProteinDataModule(cfg)
@@ -56,7 +60,7 @@ def main(cfg: DictConfig):
         save_top_k=1,
         monitor="val_loss",
         mode="min",
-        save_last=True
+        save_last=True # Useful for resuming later
     )
 
     hf_save_cb = SaveHuggingFaceFormatCallback(
@@ -71,7 +75,10 @@ def main(cfg: DictConfig):
         project=getattr(cfg.training.wandb, "project", "affinity-finetune"),
         save_dir=hydra_out_dir,
         name=f"affinity-{cfg.model.name}",
-        log_model=False
+        log_model=False,
+        # Optional: Set id to resume WandB charts if you have the ID string
+        # id=cfg.training.wandb.get("id", None), 
+        # resume="allow"
     )
 
     # 5. Trainer
@@ -90,13 +97,31 @@ def main(cfg: DictConfig):
         gradient_clip_algorithm=cfg.training.get("gradient_clip_algorithm", "norm")
     )
 
-    trainer.fit(model, datamodule=dm)
+    # --- RESUME LOGIC ---
+    ckpt_path = cfg.get("resume_checkpoint_path", None)
+    
+    # Handle absolute path conversion because Hydra changes CWD
+    if ckpt_path:
+        ckpt_path = hydra.utils.to_absolute_path(ckpt_path)
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
+
+    # Pass ckpt_path to fit()
+    # If ckpt_path is None, it trains from scratch (or transfer weights)
+    # If ckpt_path is set, it ignores transfer weights and loads the FULL state
+    trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path)
 
     # 6. Final Export
     if trainer.is_global_zero:
         best_path = checkpoint_cb.best_model_path
+        # If we resumed, best path might be from previous run if not improved,
+        # so fallback to checkpoint_cb.last_model_path if needed or just skip if empty
+        if not best_path and ckpt_path:
+             # If we just resumed and finished without improvement, save the resumed state as 'saved_model'
+             best_path = ckpt_path
+
         if best_path:
-            print(f"[System] Loading best checkpoint: {best_path}")
+            print(f"[System] Loading best/last checkpoint: {best_path}")
             ckpt = torch.load(best_path, map_location="cpu")
             model.load_state_dict(ckpt["state_dict"])
             

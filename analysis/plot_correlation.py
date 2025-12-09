@@ -1,0 +1,174 @@
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy import stats
+import os
+
+# ================= CONFIGURATION =================
+MODEL = "esm2_t33_650M_UR50D"
+STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv" # Structural scores (ipSAE, pDockQ, etc.)
+GT_CSV = "data/test/test_adaptyv.csv"                           # Ground Truth (id, log_Aff)
+PRED_AFF_CSV = f"inference_results/{MODEL}/test_adaptyv/predictions.csv"     # New Predictions (id, predicted_affinity)
+OUTPUT_DIR = "analysis_output/correlation_plots"
+
+STRUCT_METRICS = ['ipSAE', 'ipTM_af', 'pDockQ', 'pDockQ2', 'LIS']
+AGG_METHODS = ['max', 'min', 'mean', 'median']
+# =================================================
+
+def analyze_results():
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+
+    print("Loading data...")
+    try:
+        struct_df = pd.read_csv(STRUCT_SCORES_CSV)
+        gt_df = pd.read_csv(GT_CSV)
+        aff_pred_df = pd.read_csv(PRED_AFF_CSV)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        return
+
+    # Cleanup IDs
+    struct_df['id'] = struct_df['id'].astype(str).str.strip()
+    gt_df['id'] = gt_df['id'].astype(str).str.strip()
+    aff_pred_df['id'] = aff_pred_df['id'].astype(str).str.strip()
+
+    # Aggregation
+    print(f"Aggregating {len(struct_df)} structural models...")
+    grouped_df = struct_df.groupby('id')[STRUCT_METRICS].agg(AGG_METHODS)
+    grouped_df.columns = ['_'.join(col).strip() for col in grouped_df.columns.values]
+    grouped_df = grouped_df.reset_index()
+
+    # Merging
+    merged_df = pd.merge(grouped_df, gt_df[['id', 'log_Aff']], on='id', how='inner')
+    merged_df = pd.merge(merged_df, aff_pred_df[['id', 'predicted_affinity']], on='id', how='inner')
+
+    # --- TRANSFORMATION (Higher = Stronger) ---
+    merged_df['neg_log_Aff'] = -1 * merged_df['log_Aff']
+    merged_df['neg_predicted_affinity'] = -1 * merged_df['predicted_affinity']
+
+    n_samples = len(merged_df)
+    print(f"Merged {n_samples} targets.")
+    
+    if n_samples < 3:
+        print("Not enough data points (>2 required).")
+        return
+
+    all_stats = []
+
+    # Loop Aggregations
+    for agg in AGG_METHODS:
+        print(f"\n--- Processing Aggregation: {agg.upper()} ---")
+        
+        setup_plotting()
+        fig, axes = plt.subplots(2, 3, figsize=(22, 16))
+        axes = axes.flatten()
+        
+        # Define columns to plot
+        plot_targets = []
+        for m in STRUCT_METRICS:
+            plot_targets.append((f"{m}_{agg}", f"{m} ({agg})"))
+        plot_targets.append(('neg_predicted_affinity', 'Predicted Affinity'))
+
+        for i, (col_name, label) in enumerate(plot_targets):
+            ax = axes[i]
+            
+            clean_data = merged_df[[col_name, 'neg_log_Aff']].dropna()
+            if clean_data.empty: continue
+
+            x = clean_data[col_name]
+            y = clean_data['neg_log_Aff']
+
+            # Calculate Stats
+            pearson_r, p_val = stats.pearsonr(x, y)
+            spearman_rho, s_p_val = stats.spearmanr(x, y)
+
+            all_stats.append({
+                'Aggregation': agg,
+                'Metric': label,
+                'Pearson_R': pearson_r,
+                'Spearman_Rho': spearman_rho,
+                'P_Value': p_val,
+                'N': len(x)
+            })
+
+            # Plot
+            sns.regplot(
+                data=merged_df, 
+                x=col_name, 
+                y='neg_log_Aff', 
+                ax=ax,
+                scatter_kws={'alpha': 0.6, 'edgecolor': 'w', 's': 120}, # Larger dots
+                line_kws={'color': '#d62728', 'alpha': 0.8, 'linewidth': 4} # Thicker line
+            )
+
+            # --- ANNOTATION BOX ---
+            box_color = '#e6fffa' if pearson_r > 0 else '#ffe6e6'
+            stats_text = (
+                f"Pearson R = {pearson_r:.2f}\n"
+                f"Spearman $\\rho$ = {spearman_rho:.2f}\n"
+                f"P-value = {p_val:.1e}"
+            )
+
+            ax.text(0.05, 0.95, stats_text, 
+                    transform=ax.transAxes, fontsize=16, 
+                    verticalalignment='top', fontweight='medium',
+                    bbox=dict(facecolor=box_color, alpha=0.9, edgecolor='gray', boxstyle='round,pad=0.5'))
+
+            # --- TITLES AND LABELS ---
+            # 1. Subplot Title (Just the Metric Name)
+            ax.set_title(label, fontsize=22, fontweight='bold', pad=15)
+            
+            # 2. Simplified X Label
+            if "Predicted Affinity" in label:
+                xlabel = "Predicted -log_Aff"
+            else:
+                xlabel = f"Predicted {label}"
+            
+            ax.set_xlabel(xlabel, fontsize=18, fontweight='bold')
+            
+            # 3. Simplified Y Label
+            ax.set_ylabel("Ground Truth -log_Aff", fontsize=18, fontweight='bold')
+            
+            ax.grid(True, linestyle='--', alpha=0.5)
+
+        # Output
+        # N is now in the FIGURE title
+        out_img_path = os.path.join(OUTPUT_DIR, f"correlation_{agg}_final.png")
+        fig.suptitle(f"Binder Selection Metrics ({agg.upper()} aggregation) | N={n_samples}", fontsize=26, fontweight='bold', y=0.99)
+        
+        plt.tight_layout()
+        plt.savefig(out_img_path, dpi=300)
+        print(f"Saved plot: {out_img_path}")
+        plt.close(fig)
+
+    # 5. Save Summary
+    save_summary(all_stats)
+
+def save_summary(all_stats):
+    stats_df = pd.DataFrame(all_stats)
+    out_csv_path = os.path.join(OUTPUT_DIR, "analysis_summary_full.csv")
+    stats_df.to_csv(out_csv_path, index=False)
+    
+    print("\n" + "="*50)
+    print("RANKING: MOST IMPORTANT METRICS")
+    print("="*50)
+    ranked = stats_df.sort_values(by="Spearman_Rho", ascending=False)
+    print(ranked[['Aggregation', 'Metric', 'Spearman_Rho', 'P_Value']].head(10).to_string(index=False))
+
+def setup_plotting():
+    """Sets visual styles for the plots with LARGE FONTS"""
+    sns.set_theme(style="whitegrid")
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.size': 16,              
+        'axes.titlesize': 22,         
+        'axes.labelsize': 18,         
+        'xtick.labelsize': 16,
+        'ytick.labelsize': 16,
+        'legend.fontsize': 16,
+        'figure.titlesize': 26
+    })
+
+if __name__ == "__main__":
+    analyze_results()
