@@ -14,6 +14,8 @@ defaults:
 # ==============================================================================
 # INPUTS
 # ==============================================================================
+tag: none
+
 # Path to the FOLDER containing adapter_model.bin and adapter_config.json
 # (Generated at the end of training in outputs/DATE/TIME/saved_model)
 model_path: "outputs/2025-11-18/14-30-00/saved_model"

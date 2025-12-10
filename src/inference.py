@@ -5,13 +5,14 @@ import pandas as pd
 import hydra
 from pathlib import Path
 from tqdm import tqdm
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import Dataset, DataLoader
 
-# Fix: Allow importing from 'src' relative to scripts/
+# Fix: Allow importing from 'src'
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from src.models.model_base import ESMCrossAttentionClassifier
+# UPDATED IMPORT: Use the factory
+from src.models import build_model
 from transformers import EsmTokenizer
 from peft import PeftModel
 
@@ -29,6 +30,7 @@ class InferenceDataset(Dataset):
         self.t_col = "target_sequence" if "target_sequence" in df.columns else "target_seq"
         
         if self.b_col not in df.columns or self.t_col not in df.columns:
+            # Fallback for phase 1 style input if needed, or error
             raise ValueError(f"CSV missing columns. Need '{self.b_col}' and '{self.t_col}'")
 
     def __len__(self):
@@ -39,11 +41,11 @@ class InferenceDataset(Dataset):
         b_raw = str(row[self.b_col])
         t_raw = str(row[self.t_col])
 
-        # Logic: Replace ':' with EOS token (Matches training logic for multi-chain)
+        # Logic: Replace ':' with EOS token (Matches training logic)
         b_seq = b_raw.replace(":", self.tokenizer.eos_token)
         t_seq = t_raw.replace(":", self.tokenizer.eos_token)
 
-        # Tokenize with padding/truncation
+        # Tokenize
         b_enc = self.tokenizer(b_seq, truncation=True, padding="max_length", max_length=self.max_length, return_tensors="pt")
         t_enc = self.tokenizer(t_seq, truncation=True, padding="max_length", max_length=self.max_length, return_tensors="pt")
 
@@ -64,21 +66,18 @@ def main(cfg: DictConfig):
     print(f"[System] Device: {device}")
 
     # Paths
-    exp_tag = cfg.get("tag", None)
-    
-    if not exp_tag:
-        raise ValueError(
-            "\n❌ Error: You must provide a 'tag' to name the output folder.\n"
-            "   Example: python scripts/inference.py tag='baseline_run' ...\n"
-        )
-
+    exp_tag = cfg.get("tag", "default_run")
     input_path = Path(cfg.input_csv)
-    base_res = Path(cfg.base_results_dir)
-
-
-    save_dir = base_res / exp_tag / input_path.stem
+    
+    # Handle Output Directory
+    if cfg.get("base_results_dir"):
+        save_dir = Path(cfg.base_results_dir) / exp_tag / input_path.stem
+    else:
+        # Fallback to local output folder
+        save_dir = Path("outputs/inference") / exp_tag / input_path.stem
+        
     save_dir.mkdir(parents=True, exist_ok=True)
-    output_path = save_dir / cfg.output_filename
+    output_path = save_dir / cfg.get("output_filename", "predictions.csv")
 
     # ------------------------------------------------------------------
     # Load Model
@@ -89,15 +88,15 @@ def main(cfg: DictConfig):
     if not os.path.exists(cfg.model_path):
         raise FileNotFoundError(f"Model path not found: {cfg.model_path}")
 
-    # A. Init Base (Architecture params from config)
-    # Ensure cfg.model.pooling and cfg.model.d_model match training config
-    base_model = ESMCrossAttentionClassifier(cfg.model.name, cfg=cfg)
+    # A. Init Base (Use Factory to ensure correct architecture - Siamese/CrossAttn)
+    # This automatically picks ESMCrossAttentionClassifier
+    base_model = build_model(cfg)
     
     # B. Load Adapter (Standard PEFT loading)
-    # Since we are loading the final saved model, keys should match perfectly
     try:
+        # PeftModel wraps the base_model and injects the adapters
         model = PeftModel.from_pretrained(base_model, cfg.model_path)
-        print("[INFO] Model loaded successfully.")
+        print("[INFO] Model loaded successfully (Adapters Injected).")
     except Exception as e:
         print(f"[ERROR] Error loading weights: {e}")
         return
@@ -111,10 +110,14 @@ def main(cfg: DictConfig):
     # Data Loading
     # ------------------------------------------------------------------
     df = pd.read_csv(input_path)
-    dataset = InferenceDataset(df, tokenizer, max_length=cfg.model.max_length)
+    dataset = InferenceDataset(df, tokenizer, max_length=cfg.model.get("max_length", 1024))
     
-    # num_workers=0 avoids tokenizer deadlocks and overhead for inference
-    dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=cfg.get("batch_size", 16), 
+        shuffle=False, 
+        num_workers=cfg.get("num_workers", 0)
+    )
 
     print(f"[Inference] Processing {len(df)} samples...")
     predictions = []
@@ -128,13 +131,17 @@ def main(cfg: DictConfig):
             batch = {k: v.to(device) for k, v in batch.items()}
             
             # Forward Pass
-            # We use **batch to unpack dictionary into arguments (binder_ids, etc.)
-            logits = model(**batch) 
+            # CRITICAL: We access 'base_model' to ensure our custom arguments 
+            # (binder_ids, target_ids) are passed to the correct 'forward' method.
+            # PeftModel wrappers sometimes confuse custom signatures.
+            if hasattr(model, "base_model"):
+                logits = model.base_model(**batch)
+            else:
+                # Fallback if structure varies
+                logits = model(**batch)
             
-            # Robust Flattening: Ensure output is a 1D list of floats
-            # reshape(-1) flattens any (B, 1) or (B) shape to (B)
+            # Robust Flattening
             flat_scores = logits.reshape(-1).float().cpu().numpy().tolist()
-            
             predictions.extend(flat_scores)
 
     # ------------------------------------------------------------------

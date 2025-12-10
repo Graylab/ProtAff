@@ -1,5 +1,5 @@
 # configs/model/esm_lora.yaml
-name: "facebook/esm2_t30_150M_UR50D"
+name: "facebook/esm2_t33_650M_UR50D"
 max_length: 1024
 
 # Decoder Parameters (Simple/Standard)

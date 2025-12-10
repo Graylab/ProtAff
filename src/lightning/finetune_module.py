@@ -5,7 +5,8 @@ import pytorch_lightning as pl
 from peft import get_peft_model, LoraConfig
 from peft.utils import load_peft_weights
 from omegaconf import DictConfig, OmegaConf
-from src.model_base import ESMCrossAttentionClassifier
+from transformers import get_linear_schedule_with_warmup
+from src.models.model_base import ESMCrossAttentionClassifier
 
 class ProteinAffinityModule(pl.LightningModule):
     def __init__(self, cfg: DictConfig):
@@ -160,4 +161,35 @@ class ProteinAffinityModule(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.cfg.training.learning_rate, weight_decay=self.cfg.training.weight_decay)
+        # 1. Optimizer (AdamW)
+        optimizer = torch.optim.AdamW(
+            self.parameters(), 
+            lr=self.cfg.training.learning_rate, 
+            weight_decay=self.cfg.training.weight_decay
+        )
+
+        # 2. Calculate Total Steps
+        # (Lightning helper to get total number of batches across all epochs)
+        total_steps = self.trainer.estimated_stepping_batches
+        
+        # 3. Warmup Calculation
+        # The standard convention (RoBERTa/BERT/LoRA) is ~6% to 10% of total steps.
+        # If your config doesn't specify it, default to 10% (0.1).
+        warmup_ratio = getattr(self.cfg.training, "warmup_ratio", 0.1)
+        num_warmup_steps = int(total_steps * warmup_ratio)
+
+        # 4. Scheduler: Linear Warmup -> Linear Decay
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=total_steps
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step", # IMPORTANT: Update every batch, not every epoch
+                "frequency": 1
+            }
+        }

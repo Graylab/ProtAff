@@ -94,7 +94,7 @@ class AffinityDataset(Dataset):
     def get_weight(self, idx):
         return self.weights[idx] if self.weights is not None else 1.0
 
-class ProteinDataModule(LightningDataModule):
+class AffinityDataModule(LightningDataModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.cfg = cfg

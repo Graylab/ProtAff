@@ -44,19 +44,16 @@ def analyze_enrichment():
     aff_pred_df['id'] = aff_pred_df['id'].astype(str).str.strip()
 
     # 1. Prepare Data
-    # Aggregate Structural Scores (using SELECTED_AGG, e.g., 'max')
     grouped_df = struct_df.groupby('id')[STRUCT_METRICS].agg(SELECTED_AGG).reset_index()
     
     # Merge All
     merged_df = pd.merge(grouped_df, gt_df[['id', 'log_Aff']], on='id', how='inner')
     merged_df = pd.merge(merged_df, aff_pred_df[['id', 'predicted_affinity']], on='id', how='inner')
 
-    # 2. Define Binary Class (Binder = 1, Non-Binder = 0)
-    # Since lower log_Aff is better, a binder is anything <= Threshold
+    # 2. Define Binary Class
     merged_df['is_binder'] = (merged_df['log_Aff'] <= BINDER_THRESHOLD).astype(int)
     
-    # Transform scores for plotting (Higher score = Better)
-    # Predicted affinity needs flipping (-1) so higher is better
+    # Transform scores (Higher = Better)
     merged_df['neg_predicted_affinity'] = -1 * merged_df['predicted_affinity']
 
     num_binders = merged_df['is_binder'].sum()
@@ -67,15 +64,37 @@ def analyze_enrichment():
     print(f"True Binders (log_Aff <= {BINDER_THRESHOLD}): {num_binders} ({base_rate:.1%} hit rate)")
     
     if num_binders == 0 or num_binders == total_samples:
-        print("ERROR: Cannot calculate ROC/Enrichment. You either have 0 binders or 0 non-binders.")
-        print("Adjust your BINDER_THRESHOLD.")
+        print("ERROR: Cannot calculate ROC/Enrichment. 0 binders or 0 non-binders.")
         return
 
-    # Prepare list of metrics to evaluate (Name, Column, is_structural)
+    # Prepare list of metrics
     eval_metrics = []
     for m in STRUCT_METRICS:
         eval_metrics.append((f"{m} ({SELECTED_AGG})", m, True))
     eval_metrics.append(("Predicted Affinity", "neg_predicted_affinity", False))
+
+    # --- DEFINE RESEARCH PAPER COLORS (Okabe-Ito / High Contrast) ---
+    research_colors = [
+        "#0072B2", # Blue
+        "#009E73", # Bluish Green
+        "#CC79A7", # Reddish Purple
+        "#56B4E9", # Sky Blue
+        "#E69F00", # Orange
+        "#333333", # Dark Grey
+        "#F0E442", # Yellow
+    ]
+    
+    color_map = {}
+    color_idx = 0
+    
+    for label, col, is_struct in eval_metrics:
+        if "Predicted Affinity" in label:
+            # Highlight: Vermillion (Deep Red-Orange)
+            color_map[label] = "#D55E00" 
+        else:
+            # Cycle through the other research colors
+            color_map[label] = research_colors[color_idx % len(research_colors)]
+            color_idx += 1
 
     # Store results
     results = []
@@ -88,16 +107,11 @@ def analyze_enrichment():
     for label, col, is_struct in eval_metrics:
         if col not in merged_df.columns: continue
         
-        # Drop NaNs
         tmp = merged_df[[col, 'is_binder']].dropna()
         y_true = tmp['is_binder']
-        y_score = tmp[col] # Higher is better for all these columns now
+        y_score = tmp[col]
 
-        # ROC AUC
         auc = metrics.roc_auc_score(y_true, y_score)
-
-        # Enrichment Factors
-        # EF_x% = (Hits in Top x%) / (Total Hits * x%)
         ef_10 = calc_enrichment_factor(y_true, y_score, 0.10)
         ef_20 = calc_enrichment_factor(y_true, y_score, 0.20)
 
@@ -112,31 +126,45 @@ def analyze_enrichment():
 
         print(f"{label:<25} | {auc:.3f}    | {ef_10:.2f}     | {ef_20:.2f}")
 
-    # 4. PLOT 1: ROC Curves (The Industry Standard)
-    setup_plotting()
-    plt.figure(figsize=(12, 10))
-    
-    for res in results:
-        fpr, tpr, _ = metrics.roc_curve(res['y_true'], res['y_score'])
-        plt.plot(fpr, tpr, lw=3, label=f"{res['Metric']} (AUC={res['AUC']:.2f})")
+    # Standard Figure Size for both plots
+    FIG_SIZE = (10, 7)
 
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random Guess')
+    # 4. PLOT 1: ROC Curves
+    setup_plotting()
+    plt.figure(figsize=FIG_SIZE)
+    
+    results_sorted = sorted(results, key=lambda x: x['AUC'], reverse=True)
+    
+    for res in results_sorted:
+        label = res['Metric']
+        color = color_map[label]
+        
+        fpr, tpr, _ = metrics.roc_curve(res['y_true'], res['y_score'])
+        
+        lw = 3 if "Predicted Affinity" in label else 2.5
+        zorder = 10 if "Predicted Affinity" in label else 5
+        
+        plt.plot(fpr, tpr, lw=lw, label=f"{label} (AUC={res['AUC']:.2f})", color=color, zorder=zorder)
+
+    plt.plot([0, 1], [0, 1], color='gray', lw=1.5, linestyle='--', label='Random Guess')
     plt.xlim([0.0, 1.0])
     plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate (1 - Specificity)', fontweight='bold')
-    plt.ylabel('True Positive Rate (Sensitivity)', fontweight='bold')
-    plt.title(f'ROC Curves (Binder Threshold: log_Aff <= {BINDER_THRESHOLD})', fontweight='bold', pad=20)
-    plt.legend(loc="lower right")
-    plt.grid(True, alpha=0.3)
+    plt.xlabel('False Positive Rate', fontweight='bold')
+    plt.ylabel('True Positive Rate', fontweight='bold')
+    plt.title(f'ROC Evaluation', fontweight='bold', pad=15)
+    
+    # Legend Lower Right
+    plt.legend(loc="lower right", frameon=True, framealpha=0.9, edgecolor='gray')
+    
+    plt.grid(True, alpha=0.2, linestyle='-')
     
     out_roc = os.path.join(OUTPUT_DIR, "validation_ROC.png")
-    plt.savefig(out_roc, dpi=300)
+    plt.savefig(out_roc, dpi=300, bbox_inches='tight')
     print(f"\nSaved ROC Plot: {out_roc}")
     plt.close()
 
     # 5. PLOT 2: Success Rate (Precision) at Top N%
-    # "If I define my cutoff at the top 10%, what % are binders?"
-    plot_success_rates(results, total_samples, base_rate)
+    plot_success_rates(results, total_samples, base_rate, color_map, FIG_SIZE)
     
     # 6. Save Summary Table
     df_res = pd.DataFrame(results)[['Metric', 'AUC', 'EF_10', 'EF_20']]
@@ -149,7 +177,6 @@ def calc_enrichment_factor(y_true, y_score, percentile):
     cutoff_index = int(n * percentile)
     if cutoff_index == 0: return 0.0
     
-    # Sort by score descending
     sorted_indices = np.argsort(y_score)[::-1]
     sorted_y_true = y_true.iloc[sorted_indices].values
     
@@ -158,68 +185,74 @@ def calc_enrichment_factor(y_true, y_score, percentile):
     
     if total_hits == 0: return 0.0
     
-    # EF = (Hits_Top / N_Top) / (Total_Hits / N_Total)
     precision_at_k = hits_in_top / cutoff_index
     global_hit_rate = total_hits / n
-    
     return precision_at_k / global_hit_rate
 
-def plot_success_rates(results, total_n, base_rate):
+def plot_success_rates(results, total_n, base_rate, color_map, fig_size):
     """Plots Hit Rate (Precision) vs Top % Screened"""
-    plt.figure(figsize=(14, 8))
+    plt.figure(figsize=fig_size)
     
-    thresholds = [0.05, 0.10, 0.20, 0.30, 0.50] # Top 5%, 10%, etc.
+    thresholds = [0.05, 0.10, 0.20, 0.30, 0.50]
     threshold_labels = ["Top 5%", "Top 10%", "Top 20%", "Top 30%", "Top 50%"]
-    
-    # Prepare data for bar chart
-    bar_width = 0.8 / len(results)
     indices = np.arange(len(thresholds))
     
-    # Sort results by AUC so best are first in legend
     sorted_results = sorted(results, key=lambda x: x['AUC'], reverse=True)
 
-    for i, res in enumerate(sorted_results):
+    for res in sorted_results:
+        label = res['Metric']
+        color = color_map[label]
+        
         precisions = []
         for t in thresholds:
-            # Calculate precision at top t
             n = len(res['y_true'])
             cut = int(n * t)
             if cut == 0: cut = 1
             
-            # Sort
             sorted_idx = np.argsort(res['y_score'])[::-1]
             top_binders = res['y_true'].iloc[sorted_idx].values[:cut]
             precision = sum(top_binders) / cut
             precisions.append(precision)
             
-        plt.plot(indices, precisions, marker='o', linewidth=3, markersize=10, label=res['Metric'])
+        plt.plot(indices, precisions, marker='o', linewidth=2.5, markersize=8, 
+                 label=label, color=color)
 
-    # Plot Random Baseline
-    plt.axhline(y=base_rate, color='black', linestyle='--', linewidth=2, label=f"Random Hit Rate ({base_rate:.1%})")
+    plt.axhline(y=base_rate, color='#333333', linestyle='--', linewidth=1.5, label=f"Random ({base_rate:.1%})")
 
-    plt.xticks(indices, threshold_labels, fontsize=14)
-    plt.ylabel("Success Rate (Precision)", fontweight='bold')
-    plt.title("Binder Success Rate by Selection Threshold", fontweight='bold', pad=20)
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.grid(True, axis='y', alpha=0.3)
+    plt.xticks(indices, threshold_labels, fontsize=12)
+    plt.ylabel("Precision (Success Rate)", fontweight='bold')
+    plt.title("Enrichment Analysis", fontweight='bold', pad=15)
+    
+    # Legend Lower Right (Inside plot)
+    plt.legend(loc="lower right", frameon=True, framealpha=0.9, edgecolor='gray')
+    
+    plt.grid(True, axis='y', alpha=0.2)
     plt.tight_layout()
     
     out_path = os.path.join(OUTPUT_DIR, "validation_SuccessRate.png")
-    plt.savefig(out_path, dpi=300)
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
     print(f"Saved Success Rate Plot: {out_path}")
     plt.close()
 
 def setup_plotting():
-    sns.set_theme(style="whitegrid")
+    """Sets specific visual styles for scientific publication"""
+    sns.set_theme(style="whitegrid", rc={
+        'axes.edgecolor': '.15',
+        'xtick.bottom': True,
+        'ytick.left': True,
+        'grid.linestyle': '--'
+    })
     plt.rcParams.update({
         'font.family': 'sans-serif',
-        'font.size': 14,              
-        'axes.titlesize': 18,         
-        'axes.labelsize': 15,         
-        'xtick.labelsize': 13,
-        'ytick.labelsize': 13,
-        'legend.fontsize': 13,
-        'figure.titlesize': 22
+        'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'Bitstream Vera Sans', 'sans-serif'],
+        'font.size': 12,              
+        'axes.titlesize': 14,         
+        'axes.labelsize': 12,         
+        'xtick.labelsize': 11,
+        'ytick.labelsize': 11,
+        'legend.fontsize': 11,
+        'figure.titlesize': 16,
+        'lines.linewidth': 2.5
     })
 
 if __name__ == "__main__":

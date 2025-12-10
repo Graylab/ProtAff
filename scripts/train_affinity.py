@@ -76,9 +76,6 @@ def main(cfg: DictConfig):
         save_dir=hydra_out_dir,
         name=f"affinity-{cfg.model.name}",
         log_model=False,
-        # Optional: Set id to resume WandB charts if you have the ID string
-        # id=cfg.training.wandb.get("id", None), 
-        # resume="allow"
     )
 
     # 5. Trainer
@@ -92,7 +89,7 @@ def main(cfg: DictConfig):
         default_root_dir=hydra_out_dir,
         log_every_n_steps=10,
         accumulate_grad_batches=cfg.training.get("accumulate_grad_batches", 1),
-        precision="bf16-mixed" if cfg.training.get("use_mixed_precision", False) else 32,
+        precision=cfg.training.get("precision", "16-mixed"),
         gradient_clip_val=cfg.training.get("gradient_clip_val", 1.0),
         gradient_clip_algorithm=cfg.training.get("gradient_clip_algorithm", "norm")
     )

@@ -3,6 +3,9 @@ defaults:
   - _self_
   - model: esm_lora  
 
+# Task name
+task_name: "affinity"
+
 # --- TRANSFER LEARNING ---
 pretrained_ckpt_path: null
 
@@ -26,17 +29,17 @@ training:
 
   # Optimizer
   learning_rate: 1e-4  
-  weight_decay: 0.01
+  weight_decay: 1e-4
   warmup_ratio: 0.1
 
   # Hardware
-  accelerator: "gpu"
+  accelerator: "auto"
   devices: "auto"
   strategy: "auto"
   precision: "bf16-mixed"
 
   # Stability
-  gradient_clip_val: 0.5
+  gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
 
   wandb:

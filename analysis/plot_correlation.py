@@ -150,6 +150,87 @@ def save_summary(all_stats):
     out_csv_path = os.path.join(OUTPUT_DIR, "analysis_summary_full.csv")
     stats_df.to_csv(out_csv_path, index=False)
     
+    # --- PLOTTING RANKING BARPLOT ---
+    print("Generating Spearman ranking plot...")
+    
+    # 1. Deduplicate
+    # "Predicted Affinity" is calculated in every loop but is identical.
+    plot_df = stats_df.drop_duplicates(subset=['Metric', 'Spearman_Rho']).copy()
+    
+    # 2. Sort High to Low
+    plot_df = plot_df.sort_values(by="Spearman_Rho", ascending=False)
+    
+    # 3. Setup Figure
+    plt.figure(figsize=(14, max(8, len(plot_df) * 0.6)))
+    sns.set_style("whitegrid")
+    
+    # 4. Create Horizontal Bar Plot (Uniform colors)
+    ax = sns.barplot(
+        data=plot_df,
+        x="Spearman_Rho",
+        y="Metric",
+        palette="viridis", # Uniform palette, no conditional coloring on bars
+        edgecolor="0.2"
+    )
+    
+    # 5. Add Value Labels to Bars
+    for p in ax.patches:
+        width = p.get_width()
+        # Positioning logic
+        if width >= 0:
+            ha = 'left'
+            x_offset = 0.02
+        else:
+            ha = 'right'
+            x_offset = -0.02
+            
+        ax.text(
+            width + x_offset,
+            p.get_y() + p.get_height() / 2,
+            f'{width:.3f}',
+            ha=ha,
+            va='center',
+            fontsize=12,
+            fontweight='bold',
+            color='#333333'
+        )
+
+    # 6. Highlight "Predicted Affinity" Text on Y-Axis
+    for tick_label in ax.get_yticklabels():
+        if "Predicted Affinity" in tick_label.get_text():
+            tick_label.set_fontweight('bold')
+            tick_label.set_fontsize(16) # Make it slightly larger for emphasis
+        else:
+            tick_label.set_fontweight('normal')
+
+    # 7. Adjust X-Axis to fit text (Wider)
+    data_min = plot_df['Spearman_Rho'].min()
+    data_max = plot_df['Spearman_Rho'].max()
+    
+    lower_bound = min(0, data_min)
+    upper_bound = max(0, data_max)
+    span = upper_bound - lower_bound
+    if span == 0: span = 1.0
+        
+    # Add 25% padding to fit labels comfortably
+    ax.set_xlim(lower_bound - (span * 0.25), upper_bound + (span * 0.25))
+
+    # 8. Styling and Titles
+    plt.axvline(0, color='black', linewidth=1.5, linestyle='-') 
+    plt.title("Spearman Correlation Ranking (High to Low)", fontsize=20, fontweight='bold', pad=20)
+    plt.xlabel("Spearman Coefficient (Higher is Better)", fontsize=16, fontweight='bold')
+    plt.ylabel("") 
+    plt.xticks(fontsize=12)
+    # Note: yticks fontsize is handled in the highlight loop above
+    
+    # 9. Save Plot
+    out_plot_path = os.path.join(OUTPUT_DIR, "spearman_ranking_barplot.png")
+    plt.tight_layout()
+    plt.savefig(out_plot_path, dpi=300)
+    print(f"Saved ranking plot: {out_plot_path}")
+    plt.close()
+
+    # --- TEXT SUMMARY ---
     print("\n" + "="*50)
     print("RANKING: MOST IMPORTANT METRICS")
     print("="*50)
