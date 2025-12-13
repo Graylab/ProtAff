@@ -1,4 +1,3 @@
-import argparse
 import os
 import pandas as pd
 import numpy as np
@@ -8,9 +7,19 @@ from scipy import stats
 from sklearn.metrics import mean_squared_error, mean_absolute_error, roc_auc_score, average_precision_score, r2_score
 
 # --- CONFIGURATION ---
+
+# Path to your CSV
+CSV_PATH = "inference_results/combined_esm2_650M_concat_phase2_from_scratch_3/test_adaptyv/predictions.csv" 
+
 # Set to True for log(Kd) or dG (where -9 is better than -5)
 # Set to False for pKd or Affinity Score (where 9 is better than 5)
 LOWER_IS_BETTER = True 
+
+# Set your manual threshold here (e.g., -9.0 for tight binding)
+# If set to None, it will default to Top 10%
+BINARY_THRESHOLD = 3
+
+# ---------------------
 
 def calculate_enrichment_factor(y_true, y_pred, top_percent, binary_threshold):
     """
@@ -22,10 +31,8 @@ def calculate_enrichment_factor(y_true, y_pred, top_percent, binary_threshold):
 
     # 1. Identify Actives (True Binders)
     if LOWER_IS_BETTER:
-        # Good binders have values LOWER than threshold (e.g. < -9)
         actives_mask = y_true <= binary_threshold
     else:
-        # Good binders have values HIGHER than threshold (e.g. > 9)
         actives_mask = y_true >= binary_threshold
 
     total_actives = actives_mask.sum()
@@ -82,20 +89,27 @@ def analyze_and_plot(csv_path):
     # 3. Design Metrics (Enrichment & Classification)
     # -----------------------------------------------------------
     
-    # Define "Good Binder" threshold based on Ground Truth distribution
-    # If Lower is Better, the best binders are in the BOTTOM 10th percentile
-    if LOWER_IS_BETTER:
-        binary_threshold = np.percentile(y_true, 10) 
-        print(f"[Config] Lower is Better. 'Good' defined as log_Aff <= {binary_threshold:.2f}")
-        # Binary Labels (1 = Good, 0 = Bad)
-        y_bin = (y_true <= binary_threshold).astype(int)
-        # For AUC calculation, we need to invert the predictions 
-        # (because sklearn assumes Higher Prediction = Class 1)
-        y_score_for_auc = -y_pred 
+    # Logic: Determine Threshold
+    if BINARY_THRESHOLD is not None:
+        used_threshold = BINARY_THRESHOLD
+        print(f"[Config] Using MANUAL threshold: {used_threshold}")
     else:
-        binary_threshold = np.percentile(y_true, 90)
-        print(f"[Config] Higher is Better. 'Good' defined as log_Aff >= {binary_threshold:.2f}")
-        y_bin = (y_true >= binary_threshold).astype(int)
+        # Fallback to percentile logic
+        if LOWER_IS_BETTER:
+            used_threshold = np.percentile(y_true, 10) 
+            print(f"[Config] Lower is Better. Using calculated 10th percentile: {used_threshold:.2f}")
+        else:
+            used_threshold = np.percentile(y_true, 90)
+            print(f"[Config] Higher is Better. Using calculated 90th percentile: {used_threshold:.2f}")
+
+    # Logic: Define Actives based on threshold
+    if LOWER_IS_BETTER:
+        print(f"[Config] 'Good' defined as log_Aff <= {used_threshold:.2f}")
+        y_bin = (y_true <= used_threshold).astype(int)
+        y_score_for_auc = -y_pred # Invert for sklearn AUC
+    else:
+        print(f"[Config] 'Good' defined as log_Aff >= {used_threshold:.2f}")
+        y_bin = (y_true >= used_threshold).astype(int)
         y_score_for_auc = y_pred
 
     # AUC Scores
@@ -103,12 +117,13 @@ def analyze_and_plot(csv_path):
         auroc = roc_auc_score(y_bin, y_score_for_auc)
         auprc = average_precision_score(y_bin, y_score_for_auc)
     else:
+        print("[Warn] Only one class present in binary labels. AUC set to 0.5")
         auroc, auprc = 0.5, 0.0
 
     # Enrichment Factors
-    ef_1 = calculate_enrichment_factor(y_true, y_pred, 1.0, binary_threshold)
-    ef_5 = calculate_enrichment_factor(y_true, y_pred, 5.0, binary_threshold)
-    ef_10 = calculate_enrichment_factor(y_true, y_pred, 10.0, binary_threshold)
+    ef_1 = calculate_enrichment_factor(y_true, y_pred, 1.0, used_threshold)
+    ef_5 = calculate_enrichment_factor(y_true, y_pred, 5.0, used_threshold)
+    ef_10 = calculate_enrichment_factor(y_true, y_pred, 10.0, used_threshold)
 
     # Console Output
     print("-" * 40)
@@ -121,7 +136,7 @@ def analyze_and_plot(csv_path):
     print(f"\n--- Error ---")
     print(f"RMSE         : {rmse:.4f}")
     print(f"MAE          : {mae:.4f}")
-    print(f"\n--- Screening Power (Top 10% Target) ---")
+    print(f"\n--- Screening Power (Threshold: {used_threshold:.2f}) ---")
     print(f"AUROC        : {auroc:.4f}")
     print(f"AUPRC        : {auprc:.4f}")
     print(f"EF @ 1%      : {ef_1:.2f}x")
@@ -132,6 +147,7 @@ def analyze_and_plot(csv_path):
     # Save Metrics
     txt_path = os.path.join(output_dir, f"{base_name}_metrics.txt")
     with open(txt_path, "w") as f:
+        f.write(f"Threshold used: {used_threshold}\n")
         f.write(f"Pearson R: {pearson_r:.4f}\n")
         f.write(f"Spearman Rho: {spearman_rho:.4f}\n")
         f.write(f"RMSE: {rmse:.4f}\n")
@@ -155,12 +171,6 @@ def analyze_and_plot(csv_path):
                  truncate=False,
                  scatter_kws={'alpha': 0.6, 's': 80, 'edgecolor': 'white', 'linewidths': 0.8, 'zorder': 2},
                  line_kws={'color': "#C44E52", 'alpha': 0.9, 'linewidth': 2.5, 'label': 'Linear Fit', 'zorder': 3})
-
-    # Identity Line
-    min_val = min(y_plot.min(), x_plot.min())
-    max_val = max(y_plot.max(), x_plot.max())
-    lims = [min_val, max_val]
-    #g.ax_joint.plot(lims, lims, color="#333333", linestyle="--", linewidth=1.5, alpha=0.6, label="Ideal (y=x)", zorder=1)
 
     g.plot_marginals(sns.kdeplot, color="#4C72B0", fill=True, alpha=0.3)
 
@@ -190,7 +200,4 @@ def analyze_and_plot(csv_path):
     print(f"[Success] Plot saved to: {plot_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", type=str, required=True, help="Path to prediction CSV")
-    args = parser.parse_args()
-    analyze_and_plot(args.csv)
+    analyze_and_plot(CSV_PATH)

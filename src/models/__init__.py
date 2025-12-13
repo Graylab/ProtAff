@@ -1,8 +1,10 @@
 from .esm_cross_attn import ESMCrossAttentionClassifier
+from .esm_concat import ESMConcatModel
 
 # Strict registry: Only valid architectures allowed
 MODEL_REGISTRY = {
-    "cross_attn": ESMCrossAttentionClassifier
+    "cross_attn": ESMCrossAttentionClassifier,
+    "concat": ESMConcatModel
 }
 
 def build_model(cfg):

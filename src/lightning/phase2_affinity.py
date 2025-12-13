@@ -18,18 +18,24 @@ class AffinityModule(pl.LightningModule):
         self.base_model = build_model(cfg)
         
         # 2. Setup PEFT (LoRA)
-        # We target the exact same modules as Phase 1 to ensure compatibility.
-        custom_modules = ["projector", "norm_input", "task_encoder", 
-                          "decoder_b2t", "decoder_t2b", 
-                          "norm_pooled_b", "norm_pooled_t", 
-                          "head_score"] # This head is new/reset in Phase 2
+        # Determine architecture to decide what custom modules to save
+        arch = getattr(cfg.model, "arch", "cross_attn")
         
-        if getattr(cfg.model, "pooling", "mean") == "attention":
-            custom_modules.extend(["pooler_b", "pooler_t"])
+        if arch == "concat":
+            # Concat Model: Only Projector and Head need saving
+            custom_modules = ["projector", "norm_input", "head_score"]
+        else:
+            # Dual/Cross-Attn Model: Needs Encoders, Decoders, Poolers
+            custom_modules = ["projector", "norm_input", "task_encoder", 
+                              "decoder_b2t", "decoder_t2b", 
+                              "norm_pooled_b", "norm_pooled_t", 
+                              "head_score"]
+            if getattr(cfg.model, "pooling", "mean") == "attention":
+                custom_modules.extend(["pooler_b", "pooler_t"])
         
         target_modules = OmegaConf.to_container(cfg.model.lora.target_modules)
         
-        # Ensure custom modules are in 'modules_to_save' so gradients update them
+        # Ensure custom modules are in 'modules_to_save'
         modules_to_save = OmegaConf.to_container(cfg.model.lora.modules_to_save) if cfg.model.lora.modules_to_save else []
         for mod in custom_modules:
             if mod not in modules_to_save: modules_to_save.append(mod)
@@ -49,7 +55,6 @@ class AffinityModule(pl.LightningModule):
         # ----------------------------------------------------------------------
         # 3. TRANSFER LEARNING (Load Phase 1)
         # ----------------------------------------------------------------------
-        # Check both root level (CLI) and training block (YAML)
         ckpt_path = cfg.get("pretrained_ckpt_path", None) 
         
         if ckpt_path:
@@ -63,17 +68,16 @@ class AffinityModule(pl.LightningModule):
         print(f"\n[INFO] Loading Phase 1 weights from {ckpt_path}")
         
         try:
-            # 1. Capture Fingerprint (Verify if weights actually change)
+            # 1. Capture Fingerprint
             with torch.no_grad():
-                # Access innermost model to be safe
+                # Access innermost model safely
+                # Concat model has same structure: base_model.model.projector
                 init_proj = self.model.base_model.model.projector.weight.norm().item()
 
             # 2. Load Raw Weights
             raw_weights = load_peft_weights(ckpt_path, device="cpu")
             
             # --- UNIVERSAL KEY MATCHER ---
-            # We strip ALL prefixes/suffixes that PEFT/Lightning adds.
-            # Crucial: Added 'base_layer' to this list to handle LoRA nesting.
             ignore_list = [
                 'base_model', 'model', 'module', 'original_module', 
                 'modules_to_save', 'default', 'base_layer'
@@ -84,11 +88,10 @@ class AffinityModule(pl.LightningModule):
                 clean = [p for p in parts if p not in ignore_list]
                 return '.'.join(clean)
 
-            # A. Map Current Model Keys (The "Destination")
-            # This creates a lookup: "projector.weight" -> "base_model.model.projector.weight"
+            # A. Map Current Model Keys
             model_map = {normalize_key(k): k for k in self.model.state_dict().keys()}
             
-            # B. Match Checkpoint Keys (The "Source")
+            # B. Match Checkpoint Keys
             final_weights = {}
             for k, v in raw_weights.items():
                 if "single_head" in k: continue 
@@ -100,21 +103,21 @@ class AffinityModule(pl.LightningModule):
 
             # 3. Load
             if not final_weights:
-                print("[CRITICAL] No keys matched! Check your ignore_list.")
-                return
-
-            # Load into the top-level PEFT model
-            missing, unexpected = self.model.load_state_dict(final_weights, strict=False)
+                print("[WARN] No keys matched (Normal if architecture changed significantly).")
+            else:
+                self.model.load_state_dict(final_weights, strict=False)
             
-            # 4. Symmetrize (Binder -> Target)
-            # We do this AFTER loading, using the model's own logic
-            print("[INFO] Copying Binder Weights to Target (Siamese Init)...")
+            # 4. Symmetrize (Only for Dual/Siamese models)
+            print("[INFO] Checking for Siamese weights to clone...")
             with torch.no_grad():
-                bm = self.model.base_model.model # Access the Clean ESMCrossAttentionClassifier
+                bm = self.model.base_model.model
+                # hasattr check prevents crash on Concat model
                 if hasattr(bm, "pooler_t") and hasattr(bm, "pooler_b"):
                     bm.pooler_t.load_state_dict(bm.pooler_b.state_dict())
+                    print("   -> Cloned pooler_b to pooler_t")
                 if hasattr(bm, "norm_pooled_t") and hasattr(bm, "norm_pooled_b"):
                     bm.norm_pooled_t.load_state_dict(bm.norm_pooled_b.state_dict())
+                    print("   -> Cloned norm_pooled_b to norm_pooled_t")
 
             # 5. Verify Fingerprint
             with torch.no_grad():
@@ -123,7 +126,7 @@ class AffinityModule(pl.LightningModule):
             print(f"[DEBUG] Fingerprint Check (Projector Norm): {init_proj:.4f} -> {new_proj:.4f}")
             
             if abs(init_proj - new_proj) > 1e-6:
-                print("✅ SUCCESS: Phase 1 weights loaded.")
+                print("✅ SUCCESS: Weights loaded.")
             else:
                 print("⚠️ WARN: Weights loaded but values didn't change.")
 
@@ -137,8 +140,7 @@ class AffinityModule(pl.LightningModule):
             raise e
 
     def forward(self, batch):
-        # Delegate to ESMCrossAttentionClassifier
-        # Input keys match the Batch generated by AffinityDataModule
+        # Delegate to base_model (handles both Concat and Dual logic internally)
         preds = self.model.base_model(
             binder_ids=batch['binder_ids'], 
             binder_mask=batch['binder_mask'],
@@ -160,7 +162,6 @@ class AffinityModule(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        # Standard LoRA Optimization Strategy
         optimizer = torch.optim.AdamW(
             self.parameters(), 
             lr=self.cfg.training.learning_rate, 

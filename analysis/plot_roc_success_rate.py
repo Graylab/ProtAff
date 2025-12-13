@@ -6,10 +6,9 @@ import numpy as np
 import os
 
 # ================= CONFIGURATION =================
-MODEL = "esm2_t33_650M_UR50D"
 STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv" # Structural scores (ipSAE, pDockQ, etc.)
 GT_CSV = "data/test/test_adaptyv.csv"                           # Ground Truth (id, log_Aff)
-PRED_AFF_CSV = f"inference_results/{MODEL}/test_adaptyv/predictions.csv"     # New Predictions (id, predicted_affinity)
+PRED_AFF_CSV = "inference_results/combined_esm2_650M_concat_phase2_from_scratch_2/test_adaptyv/predictions.csv"     # New Predictions (id, predicted_affinity)
 OUTPUT_DIR = "analysis_output/roc_success_rate_plots"
 
 # --- CRITICAL: DEFINING 'TRUE BINDERS' ---
@@ -62,6 +61,12 @@ def analyze_enrichment():
 
     print(f"Total Samples: {total_samples}")
     print(f"True Binders (log_Aff <= {BINDER_THRESHOLD}): {num_binders} ({base_rate:.1%} hit rate)")
+
+    # =================================================================
+    # --- NEW: Generate Confirmatory Scatter Plot ---
+    # This passes the prepared dataframe and your thresholds
+    plot_negated_affinity_scatter(merged_df, BINDER_THRESHOLD, OUTPUT_DIR)
+    # =================================================================
     
     if num_binders == 0 or num_binders == total_samples:
         print("ERROR: Cannot calculate ROC/Enrichment. 0 binders or 0 non-binders.")
@@ -232,6 +237,93 @@ def plot_success_rates(results, total_n, base_rate, color_map, fig_size):
     out_path = os.path.join(OUTPUT_DIR, "validation_SuccessRate.png")
     plt.savefig(out_path, dpi=300, bbox_inches='tight')
     print(f"Saved Success Rate Plot: {out_path}")
+    plt.close()
+
+def plot_negated_affinity_scatter(df, binder_threshold, output_dir):
+    """
+    Plots (-Predicted) vs (-log_Aff). 
+    Result: Top-Right corner contains the best binders (Higher is Better).
+    """
+    print("\nGenerating Negated Affinity Scatter Plot (Higher is Better)...")
+    
+    # 1. Create Negated Columns (Higher = Better)
+    # We use .copy() to avoid SettingWithCopy warnings on the slice
+    plot_df = df.copy()
+    plot_df['neg_log_Aff'] = -1 * plot_df['log_Aff']
+    plot_df['neg_pred_Aff'] = -1 * plot_df['predicted_affinity']
+    
+    # New Threshold: If binder was log_Aff <= -6, now it is neg_log_Aff >= 6
+    neg_binder_threshold = -1 * binder_threshold
+
+    # 2. Calculate Top N% Cutoffs (Sort Descending now)
+    # Since Higher is Better, we sort highest first
+    df_sorted = plot_df.sort_values(by='neg_pred_Aff', ascending=False)
+    total_n = len(df_sorted)
+    
+    thresholds_pct = [0.05, 0.10, 0.20, 0.50]
+    cutoff_map = {}
+    
+    for t in thresholds_pct:
+        cutoff_idx = int(total_n * t)
+        if cutoff_idx >= total_n: cutoff_idx = total_n - 1
+        val = df_sorted.iloc[cutoff_idx]['neg_pred_Aff']
+        cutoff_map[f"Top {int(t*100)}%"] = val
+
+    # 3. Plot Setup
+    plt.figure(figsize=(12, 9))
+    plot_df['Label'] = plot_df['is_binder'].map({1: 'True Binder', 0: 'Non-Binder'})
+
+    # Scatter
+    sns.scatterplot(
+        data=plot_df, x='neg_pred_Aff', y='neg_log_Aff',
+        hue='Label', palette={'True Binder': '#D55E00', 'Non-Binder': '#0072B2'},
+        style='Label', markers={'True Binder': 'o', 'Non-Binder': 'X'},
+        alpha=0.6, s=80, edgecolor='w', linewidth=0.5, zorder=2
+    )
+
+    # 4. Reference Lines
+    # A) Horizontal Line: Ground Truth Threshold
+    # Note: Binders are now ABOVE this line (>= threshold)
+    plt.axhline(y=neg_binder_threshold, color='#CC79A7', linestyle='--', linewidth=2.5, 
+                label=f'GT Threshold (pKd ≥ {neg_binder_threshold})', zorder=1)
+
+    # B) Vertical Lines: Predicted Cutoffs
+    # Note: Top candidates are to the RIGHT of these lines
+    line_colors = ['#009E73', '#E69F00', '#56B4E9', '#333333'] 
+    for i, (label, val) in enumerate(cutoff_map.items()):
+        plt.axvline(x=val, color=line_colors[i], linestyle=':', linewidth=2, 
+                    label=f'{label} Cutoff (Score ≥ {val:.2f})', zorder=1)
+        
+        # Label at top
+        plt.text(val, plt.gca().get_ylim()[1], f'  {label}', 
+                 color=line_colors[i], fontsize=10, rotation=90, verticalalignment='top', zorder=3)
+
+    # 5. Highlight the "Golden Corner" (Top-Right)
+    # Area: Right of Top 5% cutoff AND Above GT Threshold
+    xmin, xmax = plt.gca().get_xlim()
+    ymin, ymax = plt.gca().get_ylim()
+    
+    # Fill region: x=[cutoff, xmax], y=[threshold, ymax]
+    top5_val = cutoff_map["Top 5%"]
+    
+    # We use fill_between to shade the area where y >= threshold
+    # constrained by x >= top5_val
+    plt.fill_between([top5_val, xmax], neg_binder_threshold, ymax, 
+                     color='#009E73', alpha=0.1, zorder=0, label='Ideal Region')
+
+    # Titles
+    plt.title("Predicted vs. Experimental Affinity (Negated Scale)", fontweight='bold', pad=20, fontsize=16)
+    plt.xlabel("Negative Predicted Affinity (Higher is Better) $\\rightarrow$", fontweight='bold', fontsize=14)
+    plt.ylabel("Negative Experimental log_Aff (Higher is Better) $\\rightarrow$", fontweight='bold', fontsize=14)
+
+    # Legend Cleanup
+    plt.legend(loc='upper left', frameon=True, framealpha=0.95, shadow=True)
+    plt.grid(True, linestyle='-', alpha=0.3)
+    plt.tight_layout()
+
+    out_path = os.path.join(output_dir, "validation_NegatedScatter.png")
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    print(f"Saved Negated Scatter Plot: {out_path}")
     plt.close()
 
 def setup_plotting():

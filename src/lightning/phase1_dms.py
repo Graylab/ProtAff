@@ -12,21 +12,28 @@ class DMSModule(pl.LightningModule):
         self.cfg = cfg
         self.save_hyperparameters(OmegaConf.to_container(cfg, resolve=True))
         
-        # 1. Base Container (ESM Siamese/Cross-Attn)
-        # This initializes the Encoder, Decoder, and the 4x width Head
+        # 1. Base Container (Factory: returns ESMCrossAttentionClassifier or ESMConcatModel)
         self.base_model = build_model(cfg)
         
-        # 2. Setup PEFT (Training Decoders + Encoder + Poolers)
-        # We must save the DECODERS so they are learned during Phase 1
-        custom_modules = ["projector", "norm_input", "task_encoder", 
-                          "decoder_b2t", "decoder_t2b", 
-                          "norm_pooled_b", "norm_pooled_t", 
-                          "head_score"] # Using the main head
-        
-        if getattr(cfg.model, "pooling", "mean") == "attention":
-            custom_modules.extend(["pooler_b", "pooler_t"])
-        
+        # 2. Setup PEFT (Conditional on Architecture)
+        arch = getattr(cfg.model, "arch", "cross_attn")
+
+        if arch == "concat":
+            # Concat Model: Only Projector and Head need saving
+            # No Decoders or Poolers exist in this architecture
+            custom_modules = ["projector", "norm_input", "head_score"]
+        else:
+            # Dual/Siamese Model: Save everything
+            custom_modules = ["projector", "norm_input", "task_encoder", 
+                              "decoder_b2t", "decoder_t2b", 
+                              "norm_pooled_b", "norm_pooled_t", 
+                              "head_score"]
+            if getattr(cfg.model, "pooling", "mean") == "attention":
+                custom_modules.extend(["pooler_b", "pooler_t"])
+
         target_modules = OmegaConf.to_container(cfg.model.lora.target_modules)
+        
+        # Ensure custom modules are in 'modules_to_save'
         modules_to_save = OmegaConf.to_container(cfg.model.lora.modules_to_save) if cfg.model.lora.modules_to_save else []
         for mod in custom_modules:
             if mod not in modules_to_save:
@@ -45,10 +52,11 @@ class DMSModule(pl.LightningModule):
         self.loss_fn = nn.MSELoss()
 
     def training_step(self, batch, batch_idx):
-        # --- STRATEGY: Cross-Attention ---
-        # We treat Mutant as 'Binder' (Query) and Wildtype as 'Target' (Reference).
-        # The model learns "How does this mutation fit into the WT context?"
+        # --- STRATEGY ---
+        # Phase 1: Mutant (Binder) vs Wildtype (Target)
+        # Compatible with both 'concat' and 'cross_attn' models
         
+        # We access base_model directly to ensure argument mapping works
         preds = self.model.base_model(
             binder_ids=batch['mut_ids'], 
             binder_mask=batch['mut_mask'],
@@ -56,12 +64,7 @@ class DMSModule(pl.LightningModule):
             target_mask=batch['wt_mask']
         )
         
-        # Squeeze to match label shape [Batch]
         preds = preds.squeeze(-1) 
-        
-        # Loss: Regress directly to the experimental score
-        # Note: If your scores are delta (mut - wt), this fits perfectly.
-        # If scores are absolute stability, this also works (predicting stability given context).
         loss = self.loss_fn(preds, batch['labels'])
         
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
