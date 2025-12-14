@@ -9,7 +9,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, roc_auc_sco
 # --- CONFIGURATION ---
 
 # Path to your CSV
-CSV_PATH = "inference_results/combined_esm2_650M_concat_phase2_from_scratch_3/test_adaptyv/predictions.csv" 
+CSV_PATH = "inference_results/combined_esm2_650M_concat_phase2_from_scratch_5/test_adaptyv/predictions.csv" 
 
 # Set to True for log(Kd) or dG (where -9 is better than -5)
 # Set to False for pKd or Affinity Score (where 9 is better than 5)
