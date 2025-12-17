@@ -27,7 +27,7 @@ input_csv: "data/raw/test_data.csv"
 # OUTPUTS
 # ==============================================================================
 # The results will be saved to: inference_results/{input_filename}/predictions.csv
-base_results_dir: "inference_results"
+base_results_dir: "inference_output"
 output_filename: "predictions.csv"
 
 # ==============================================================================
