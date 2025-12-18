@@ -50,12 +50,8 @@ class DMSModule(pl.LightningModule):
 
         self.model = get_peft_model(self.base_model, peft_config)
         self.loss_fn = nn.MSELoss()
-
-    def training_step(self, batch, batch_idx):
-        # --- STRATEGY ---
-        # Phase 1: Mutant (Binder) vs Wildtype (Target)
-        # Compatible with both 'concat' and 'cross_attn' models
-        
+    
+    def forward(self, batch):
         # We access base_model directly to ensure argument mapping works
         preds = self.model.base_model(
             binder_ids=batch['mut_ids'], 
@@ -63,22 +59,17 @@ class DMSModule(pl.LightningModule):
             target_ids=batch['wt_ids'], 
             target_mask=batch['wt_mask']
         )
-        
-        preds = preds.squeeze(-1) 
+        return preds.squeeze(-1) 
+
+    def training_step(self, batch, batch_idx):
+        preds = self(batch)
         loss = self.loss_fn(preds, batch['labels'])
-        
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        preds = self.model.base_model(
-            binder_ids=batch['mut_ids'], 
-            binder_mask=batch['mut_mask'],
-            target_ids=batch['wt_ids'], 
-            target_mask=batch['wt_mask']
-        )
-        loss = self.loss_fn(preds.squeeze(-1), batch['labels'])
-        
+        preds = self(batch)
+        loss = self.loss_fn(preds, batch['labels'])
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 

@@ -7,8 +7,8 @@ import os
 # ================= CONFIGURATION =================
 STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv" # Structural scores (ipSAE, pDockQ, etc.)
 GT_CSV = "data/test/test_adaptyv.csv"                           # Ground Truth (id, log_Aff)
-PRED_AFF_CSV = "inference_results/combined_esm2_650M_concat_phase2_from_scratch_2/test_adaptyv/predictions.csv"     # New Predictions (id, predicted_affinity)
-#PRED_AFF_CSV = "inference_results/combined_cleaned_from_pretrain_0/test_adaptyv/predictions.csv"     # New Predictions (id, predicted_affinity)
+#PRED_AFF_CSV = "inference_results/combined_esm2_650M_concat_phase2_from_scratch_2/test_adaptyv/predictions.csv"     # New Predictions (id, predicted_affinity)
+PRED_AFF_CSV = "inference_output/cleaned_from_pretrain_1/test_adaptyv/predictions.csv"     # New Predictions (id, predicted_affinity)
 OUTPUT_DIR = "analysis_output/enrichment_bar_plots"
 
 # Threshold for "True Binder" (e.g., log_Aff <= -6.0 is <1uM, <= -9.0 is <1nM)
