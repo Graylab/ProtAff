@@ -8,7 +8,7 @@ from omegaconf import DictConfig, OmegaConf
 from transformers import get_linear_schedule_with_warmup
 from src.models import build_model 
 
-class AffinityModule(pl.LightningModule):
+class PairAffinityModule(pl.LightningModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.cfg = cfg
@@ -18,8 +18,6 @@ class AffinityModule(pl.LightningModule):
         self.base_model = build_model(cfg)
         
         # 2. Setup PEFT (LoRA)
-        # We focus on the Concat/Unified modules: Projector + Head (Score only)
-        # Note: "head_cls" is removed from the default save list as we are doing regression only
         modules_to_save = ["projector", "norm_input", "head_score"]
         
         if cfg.model.lora.modules_to_save:
@@ -41,42 +39,73 @@ class AffinityModule(pl.LightningModule):
 
         self.model = get_peft_model(self.base_model, peft_config)
         
-        # 3. Loss Function
-        # We only use MSE Loss now.
-        self.mse_loss = nn.MSELoss() 
+        # 3. Loss Function (Ranking)
+        # MarginRankingLoss: max(0, -y * (x1 - x2) + margin)
+        # We default margin to 0.1 if not specified
+        self.margin = getattr(cfg.training, "margin", 0.1)
+        self.rank_loss = nn.MarginRankingLoss(margin=self.margin)
         
         # 4. Transfer Learning
         ckpt_path = cfg.get("pretrained_ckpt_path", None) 
         if ckpt_path:
             self._load_phase1_weights(ckpt_path)
 
-    def forward(self, batch):
+    def forward(self, input_ids, attention_mask):
+        """
+        Standard forward pass for a single batch of sequences.
+        Useful for inference to get a raw score.
+        """
         return self.model(
-            input_ids=batch['input_ids'], 
-            attention_mask=batch['attention_mask']
+            input_ids=input_ids, 
+            attention_mask=attention_mask
         )
 
     def training_step(self, batch, batch_idx):
-        # 1. Forward
-        pred_reg = self(batch)
+        # The collator provides two sets of inputs: "better" and "worse"
         
-        # 2. Unpack Labels (Regression only)
-        reg_labels = batch['reg_labels'] 
+        # 1. Forward Pass A (Better Samples)
+        scores_better = self(
+            input_ids=batch['better_input_ids'], 
+            attention_mask=batch['better_mask']
+        )
         
-        # 3. Compute Loss (Standard MSE)
-        loss = self.mse_loss(pred_reg, reg_labels)
+        # 2. Forward Pass B (Worse Samples)
+        # Shared weights (Siamese Network)
+        scores_worse = self(
+            input_ids=batch['worse_input_ids'], 
+            attention_mask=batch['worse_mask']
+        )
+        
+        # 3. Compute Loss
+        # Target is always 1.0 because Dataset guarantees Input A > Input B
+        target = torch.ones_like(scores_better)
+        
+        # Loss = max(0, -1 * (better - worse) + margin)
+        #      = max(0, margin - (better - worse))
+        loss = self.rank_loss(scores_better, scores_worse, target)
 
         # 4. Log
+        # We can also track accuracy: how often was better > worse?
+        accuracy = (scores_better > scores_worse).float().mean()
+        
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('train_acc', accuracy, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        
         return loss
 
     def validation_step(self, batch, batch_idx):
-        pred_reg = self(batch)
-        reg_labels = batch['reg_labels']
+        # Same logic as training
+        scores_better = self(batch['better_input_ids'], batch['better_mask'])
+        scores_worse = self(batch['worse_input_ids'], batch['worse_mask'])
         
-        loss = self.mse_loss(pred_reg, reg_labels)
+        target = torch.ones_like(scores_better)
+        loss = self.rank_loss(scores_better, scores_worse, target)
+        
+        accuracy = (scores_better > scores_worse).float().mean()
         
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('val_acc', accuracy, on_epoch=True, prog_bar=True, sync_dist=True)
+        
         return loss
 
     def configure_optimizers(self):

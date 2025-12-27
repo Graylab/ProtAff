@@ -1,4 +1,3 @@
-# configs/inference.yaml
 defaults:
   - _self_
   # 1. INHERIT MODEL CONFIG

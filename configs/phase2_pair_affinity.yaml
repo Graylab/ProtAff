@@ -1,0 +1,68 @@
+defaults:
+  - _self_
+  - model: esm_lora  
+
+# Task name (Informational for logging)
+task_name: "pair_affinity"
+
+# --- TRANSFER LEARNING ---
+# Path to the Phase 1 (DMS) adapter weights
+# e.g., "outputs/phase1_dms/2025-12-25/12-00-00/saved_model"
+pretrained_ckpt_path: null
+
+# Resume training from a crash (Load optimizer state)
+resume_checkpoint_path: null
+
+data:
+  # Standard paths
+  base_csv: "data/dummy/base_data.csv"
+  lookup_csv: "data/dummy/lookup_data.csv"
+  num_workers: 6
+  
+  # Pair Mining Strategy
+  pairs_per_sample: 2        # How many 'worse' examples to pair with every 'better' one
+  margin_threshold: 0.0      # Min log_Aff diff required to create a pair (ensures clear separation)
+  
+  # Sampling
+  balance_clusters: false     # Recommended: Upsample rare targets/clusters
+  weight_col: null           # Optional: Manual weights column in CSV
+
+training:
+  seed: 42
+
+  # Batch and Steps
+  # Note: Effective batch size = batch_size * 2 (since we process Better + Worse)
+  batch_size: 8              # Lowered slightly as we process 2x sequences per step
+  accumulate_grad_batches: 4 # Increased to maintain effective batch size
+  max_epochs: 10             # Ranking often takes longer to converge than regression
+
+  # Loss Function
+  margin: 0.1                # Margin for MarginRankingLoss (diff between scores must be > this)
+
+  # Optimizer
+  learning_rate: 5e-5        # Slightly lower LR is often better for ranking fine-tuning
+  weight_decay: 1e-2
+  warmup_ratio: 0.1
+
+  # Early Stopping
+  early_stopping: true
+  patience: 3
+
+  # Hardware
+  accelerator: "auto"
+  devices: "auto"
+  strategy: "auto"
+  precision: "bf16-mixed"
+
+  # Stability
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: "norm"
+  val_check_interval: 0.5    # Validate every half epoch
+
+  wandb:
+    project: "pair-affinity-finetune"
+
+# Standard Hydra Output
+hydra:
+  run:
+    dir: outputs/phase2_pair_affinity/${now:%Y-%m-%d}/${now:%H-%M-%S}

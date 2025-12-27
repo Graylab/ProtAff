@@ -16,8 +16,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, roc_auc_sco
 #CSV_PATH = "inference_output/combined_cleaned_90_from_scratch_0/test_adaptyv/predictions.csv" 
 #CSV_PATH = "inference_output/combined_cleaned_90_from_pretrain_2/test_adaptyv/predictions.csv" 
 #CSV_PATH = "inference_output/cleaned_from_scratch_0/test_adaptyv/predictions.csv" 
-#CSV_PATH = "inference_output/cleaned_from_pretrain_1/test_adaptyv/predictions.csv" 
-CSV_PATH = "inference_output/cleaned_r8_from_scratch_0/test_adaptyv/predictions.csv" 
+CSV_PATH = "inference_output/pair_decoys_from_scratch_0/test_adaptyv/predictions.csv" 
 
 # Set to True for log(Kd) or dG (where -9 is better than -5)
 # Set to False for pKd or Affinity Score (where 9 is better than 5)

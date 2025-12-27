@@ -1,9 +1,7 @@
-from .esm_cross_attn import ESMCrossAttentionClassifier
-from .esm_concat import ESMConcatModel
+from .esm_model import ESMConcatModel
 
 # Strict registry: Only valid architectures allowed
 MODEL_REGISTRY = {
-    "cross_attn": ESMCrossAttentionClassifier,
     "concat": ESMConcatModel
 }
 
@@ -11,8 +9,8 @@ def build_model(cfg):
     """
     Factory function to initialize the model.
     """
-    # Default to 'cross_attn' if not specified in config
-    arch = getattr(cfg.model, "arch", "cross_attn")
+    # Default to 'concat' since it is now the only option
+    arch = getattr(cfg.model, "arch", "concat")
     
     if arch not in MODEL_REGISTRY:
         raise ValueError(f"Unknown architecture '{arch}'. Available: {list(MODEL_REGISTRY.keys())}")

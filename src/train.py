@@ -10,13 +10,24 @@ from pytorch_lightning.loggers import WandbLogger
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-# Import your modules
+# --- IMPORT MODULES ---
+# Phase 1: DMS
 from src.datasets.dataset_dms import DMSDataModule
+from src.lightning.phase1_dms import DMSModule
+
+# Phase 2a: Affinity (Regression)
 from src.datasets.dataset_affinity import AffinityDataModule 
-from src.lightning.phase1_dms import DMSModule        
 from src.lightning.phase2_affinity import AffinityModule
 
+# Phase 2b: Pair Affinity (Ranking)
+from src.datasets.dataset_pair_affinity import PairAffinityDataModule
+from src.lightning.phase2_pair_affinity import PairAffinityModule
+
+
 class SaveHuggingFaceFormatCallback(Callback):
+    """
+    Saves the PEFT model directly to 'saved_model/' whenever a new best validation loss is achieved.
+    """
     def __init__(self, output_dir, tokenizer):
         self.output_dir = output_dir
         self.tokenizer = tokenizer
@@ -30,70 +41,72 @@ class SaveHuggingFaceFormatCallback(Callback):
 
         if current_val_loss < self.best_val_loss:
             self.best_val_loss = current_val_loss
-            # Save strictly inside the Hydra output directory
+            
+            # CHANGED: Save directly to "saved_model" (no _best suffix)
             save_path = os.path.join(self.output_dir, "saved_model")
-            print(f"\n[System] New Best Val Loss: {current_val_loss:.4f}. Saving...", flush=True)
-            # Access the underlying PEFT model
+            os.makedirs(save_path, exist_ok=True)
+
+            print(f"\n[System] New Best Val Loss: {current_val_loss:.4f}. Updating 'saved_model'...", flush=True)
+            
+            # Robust saving for nested PEFT models
             if hasattr(pl_module.model, "save_pretrained"):
                 pl_module.model.save_pretrained(save_path)
-            else:
-                # Fallback if structure is nested
+            elif hasattr(pl_module.model, "base_model") and hasattr(pl_module.model.base_model, "save_pretrained"):
                 pl_module.model.base_model.save_pretrained(save_path)
+            else:
+                print("[WARN] Could not find 'save_pretrained' method on model wrapper.")
                 
             self.tokenizer.save_pretrained(save_path)
 
+
 def get_task_modules(cfg):
     """
-    Factory to select the correct DataModule and LightningModule
-    based on the 'task_name' in config.
+    Factory: Returns (DataModule, LightningModule) based on cfg.task_name
     """
-    task = cfg.get("task_name", "dms") # Default to DMS if not set
+    task = cfg.get("task_name", "dms").lower()
     
     if task == "dms":
-        # Phase 1: Mutant vs Wildtype
+        print("[Factory] Loading Phase 1: DMS (Regression/Classification)")
         dm = DMSDataModule(cfg)
         model = DMSModule(cfg)
+        
     elif task == "affinity":
-        # Phase 2: Binder vs Target
+        print("[Factory] Loading Phase 2a: Affinity (Regression)")
         dm = AffinityDataModule(cfg)
         model = AffinityModule(cfg)
+        
+    elif task == "pair_affinity":
+        print("[Factory] Loading Phase 2b: Pair Affinity (Ranking)")
+        # Using the classes from your snippet
+        dm = PairAffinityDataModule(cfg)
+        model = PairAffinityModule(cfg)
+        
     else:
-        raise ValueError(f"Unknown task_name: {task}. Options: ['dms', 'affinity']")
+        raise ValueError(f"Unknown task_name: {task}. Options: ['dms', 'affinity', 'pair_affinity']")
     
     return dm, model
 
+
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig):
+    # 1. Reproducibility
     pl.seed_everything(cfg.training.seed, workers=True)
     
-    # 1. Get Explicit Absolute Output Path from Hydra
+    # 2. Output Paths
     hydra_out_dir = HydraConfig.get().runtime.output_dir
+    os.environ["WANDB_DIR"] = hydra_out_dir # Force WandB local logs here
     
-    # 2. Force WandB to save inside this directory
-    os.environ["WANDB_DIR"] = hydra_out_dir
-    
-    # Determine Task
-    task_name = cfg.get("task_name", "dms")
-
+    # 3. Initialize Task Modules
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
-        print(f"[System] Hydra Output Directory: {hydra_out_dir}")
-        print(f"[Config] Task: {task_name.upper()}")
+        print(f"[System] Hydra Output: {hydra_out_dir}")
         
-        # Log Logic Status
-        if cfg.get("resume_checkpoint_path"):
-            print(f"[Config] RESUMING STATE from: {cfg.resume_checkpoint_path}")
-        elif cfg.get("pretrained_ckpt_path"):
-             print(f"[Config] TRANSFER LEARNING from: {cfg.pretrained_ckpt_path}")
-        else:
-            print(f"[Config] Training from Scratch")
-
-    # 3. Init Data & Model (Dynamic)
     dm, model = get_task_modules(cfg)
 
-    # 4. Callbacks
+    # 4. Define Callbacks
+    # Filename includes accuracy if available (useful for ranking)
     checkpoint_cb = ModelCheckpoint(
         dirpath=os.path.join(hydra_out_dir, "checkpoints"),
-        filename=f"{task_name}-{{epoch:02d}}-{{val_loss:.4f}}",
+        filename=f"{cfg.task_name}-{{epoch:02d}}-{{val_loss:.4f}}",
         save_top_k=1,
         monitor="val_loss",
         mode="min",
@@ -109,20 +122,20 @@ def main(cfg: DictConfig):
     
     callbacks_list = [checkpoint_cb, hf_save_cb, lr_monitor]
 
-    # Add EarlyStopping if defined in config (Crucial for Phase 2)
+    # Early Stopping (Optional but recommended)
     if cfg.training.get("early_stopping", False):
-        es_patience = cfg.training.get("patience", 3)
-        callbacks_list.append(EarlyStopping(monitor="val_loss", patience=es_patience, mode="min"))
+        patience = cfg.training.get("patience", 3)
+        callbacks_list.append(EarlyStopping(monitor="val_loss", patience=patience, mode="min"))
 
     # 5. Logger
     wandb_logger = WandbLogger(
-        project=getattr(cfg.training.wandb, "project", f"{task_name}-project"),
+        project=getattr(cfg.training.wandb, "project", f"{cfg.task_name}-project"),
         save_dir=hydra_out_dir, 
-        name=f"{task_name}-{cfg.model.name}",
+        name=f"{cfg.task_name}-{cfg.model.name}",
         log_model=False,
     )
 
-    # 6. Trainer
+    # 6. Trainer Configuration
     trainer = pl.Trainer(
         accelerator=cfg.training.accelerator,
         devices=cfg.training.devices,
@@ -130,46 +143,46 @@ def main(cfg: DictConfig):
         max_epochs=cfg.training.max_epochs,
         logger=wandb_logger,
         callbacks=callbacks_list,
-        default_root_dir=hydra_out_dir, 
-        log_every_n_steps=10,
+        default_root_dir=hydra_out_dir,
+        
+        # Optimization Params
+        log_every_n_steps=cfg.training.get("log_every_n_steps", 10),
         accumulate_grad_batches=cfg.training.get("accumulate_grad_batches", 1),
         precision=cfg.training.get("precision", "16-mixed"),
         gradient_clip_val=cfg.training.get("gradient_clip_val", 1.0),
-        gradient_clip_algorithm=cfg.training.get("gradient_clip_algorithm", "norm"),
-        # Optimization for large datasets
-        limit_val_batches=cfg.training.get("limit_val_batches", None), 
-        val_check_interval=cfg.training.get("val_check_interval", 1.0)
+        
+        # Validation Frequency (useful for Ranking which is slow)
+        val_check_interval=cfg.training.get("val_check_interval", 1.0),
+        limit_val_batches=cfg.training.get("limit_val_batches", None)
     )
 
-    # --- RESUME LOGIC (For recovering crashed runs) ---
+    # 7. Checkpoint / Resume Logic
     ckpt_path = cfg.get("resume_checkpoint_path", None)
-    
     if ckpt_path:
         ckpt_path = hydra.utils.to_absolute_path(ckpt_path)
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
+        print(f"[System] Resuming training from: {ckpt_path}")
 
-    # 7. Start Training
+    # 8. Start Training
     trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path)
 
-    # 8. Final Export
+    # 9. Final Verification Export
     if trainer.is_global_zero:
         best_path = checkpoint_cb.best_model_path
         
-        # Fallback logic
         if not best_path and ckpt_path:
             best_path = ckpt_path
 
         if best_path:
-            print(f"[System] Loading best checkpoint for export: {best_path}")
-            # Load weights to CPU
+            print(f"\n[System] Loading best checkpoint for verification: {best_path}")
             ckpt = torch.load(best_path, map_location="cpu")
             model.load_state_dict(ckpt["state_dict"])
             
+            # CHANGED: Unified path "saved_model" (no _final suffix)
             final_path = os.path.join(hydra_out_dir, "saved_model")
-            print(f"[System] Final Export to: {final_path}")
+            print(f"[System] Final Verification Export to: {final_path}")
             
-            # Save PEFT model
             model.model.save_pretrained(final_path)
             dm.tokenizer.save_pretrained(final_path)
 

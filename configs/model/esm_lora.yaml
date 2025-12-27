@@ -1,14 +1,11 @@
 # configs/model/esm_lora.yaml
 name: "facebook/esm2_t33_650M_UR50D"
 arch: "concat"
-max_length: 1024
+max_length: 2048
 
 # Decoder Parameters (Simple/Standard)
-hidden_size: 128 
-nhead: 4          
-num_layers: 2
+d_model: 128
 dropout: 0.1
-pooling: "attention"
 
 # LoRA
 lora:

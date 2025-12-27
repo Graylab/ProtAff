@@ -12,32 +12,20 @@ class DMSModule(pl.LightningModule):
         self.cfg = cfg
         self.save_hyperparameters(OmegaConf.to_container(cfg, resolve=True))
         
-        # 1. Base Container (Factory: returns ESMCrossAttentionClassifier or ESMConcatModel)
+        # 1. Base Container
         self.base_model = build_model(cfg)
         
-        # 2. Setup PEFT (Conditional on Architecture)
-        arch = getattr(cfg.model, "arch", "cross_attn")
-
-        if arch == "concat":
-            # Concat Model: Only Projector and Head need saving
-            # No Decoders or Poolers exist in this architecture
-            custom_modules = ["projector", "norm_input", "head_score"]
-        else:
-            # Dual/Siamese Model: Save everything
-            custom_modules = ["projector", "norm_input", "task_encoder", 
-                              "decoder_b2t", "decoder_t2b", 
-                              "norm_pooled_b", "norm_pooled_t", 
-                              "head_score"]
-            if getattr(cfg.model, "pooling", "mean") == "attention":
-                custom_modules.extend(["pooler_b", "pooler_t"])
-
-        target_modules = OmegaConf.to_container(cfg.model.lora.target_modules)
+        # 2. Setup PEFT (LoRA)
+        # We focus on the Concat/Unified modules: Projector + Head (Score only)
+        custom_modules = ["projector", "norm_input", "head_score"]
         
-        # Ensure custom modules are in 'modules_to_save'
+        # Combine with config-defined modules
         modules_to_save = OmegaConf.to_container(cfg.model.lora.modules_to_save) if cfg.model.lora.modules_to_save else []
         for mod in custom_modules:
             if mod not in modules_to_save:
                 modules_to_save.append(mod)
+
+        target_modules = OmegaConf.to_container(cfg.model.lora.target_modules)
 
         peft_config = LoraConfig(
             r=cfg.model.lora.r, 
@@ -49,28 +37,42 @@ class DMSModule(pl.LightningModule):
         )
 
         self.model = get_peft_model(self.base_model, peft_config)
-        self.loss_fn = nn.MSELoss()
+        
+        # 3. Loss Functions
+        self.mse_loss = nn.MSELoss()
     
     def forward(self, batch):
-        # We access base_model directly to ensure argument mapping works
-        preds = self.model.base_model(
-            binder_ids=batch['mut_ids'], 
-            binder_mask=batch['mut_mask'],
-            target_ids=batch['wt_ids'], 
-            target_mask=batch['wt_mask']
-        )
-        return preds.squeeze(-1) 
+        # UPDATED: Use the unified input stream from DMSCollator
+        # The collator now provides [CLS] Mutant [EOS] Wildtype [EOS] in 'input_ids'
+        return self.model(
+            input_ids=batch['input_ids'], 
+            attention_mask=batch['attention_mask']
+        ) 
 
     def training_step(self, batch, batch_idx):
-        preds = self(batch)
-        loss = self.loss_fn(preds, batch['labels'])
+        # 1. Forward
+        pred_reg = self(batch)
+        
+        # 2. Unpack Labels
+        reg_labels = batch['reg_labels']
+        
+        # 3. Compute Losses
+        loss = self.mse_loss(pred_reg, reg_labels)
+        
+        # 5. Log
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        
         return loss
 
     def validation_step(self, batch, batch_idx):
-        preds = self(batch)
-        loss = self.loss_fn(preds, batch['labels'])
+        pred_reg = self(batch)
+        
+        reg_labels = batch['reg_labels']
+        
+        loss = self.mse_loss(pred_reg, reg_labels)
+        
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
+        
         return loss
 
     def configure_optimizers(self):
