@@ -108,11 +108,40 @@ def main(cfg: DictConfig):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[System] Device: {device}")
 
-    # Paths
-    exp_tag = cfg.get("tag", "default_run")
     input_path = Path(cfg.input_csv)
     
-    # --- OUTPUT PATH LOGIC (RESTORED) ---
+    # --- AUTO-TAG LOGIC (IMPROVED) ---
+    if cfg.get("tag"):
+        exp_tag = cfg.tag
+    else:
+        # Start with the full model path
+        path_obj = Path(cfg.model_path)
+        
+        # 1. If pointing to a file (e.g. adapter_model.bin), go to folder
+        if path_obj.is_file():
+            path_obj = path_obj.parent
+
+        # 2. If the folder name is generic, keep going up until we find a unique ID
+        # Common generic folders in Hydra/HF outputs
+        generic_names = ["saved_model", "checkpoints", "best_model", "last_model"]
+        
+        while path_obj.name in generic_names or path_obj.name.startswith("checkpoint-"):
+            path_obj = path_obj.parent
+            
+        # 3. Optional: If the structure is Hydra-style (Date/Time), combine them?
+        # Current path_obj is now ".../02-20-21"
+        # If the parent is a date like "2025-12-29", we can make the tag "2025-12-29_02-20-21"
+        # This reduces collision risk if you run experiments on different days.
+        parent_name = path_obj.parent.name
+        # Simple regex-free check: does parent look like a date (202X-XX-XX)?
+        if len(parent_name) == 10 and parent_name.count("-") == 2 and parent_name[0] == '2':
+             exp_tag = f"{parent_name}_{path_obj.name}"
+        else:
+             exp_tag = path_obj.name
+            
+    print(f"[System] Experiment Tag Inferred: {exp_tag}")
+
+    # --- OUTPUT PATH LOGIC ---
     if cfg.get("base_results_dir"):
         save_dir = Path(cfg.base_results_dir) / exp_tag / input_path.stem
     else:
@@ -120,6 +149,12 @@ def main(cfg: DictConfig):
         
     save_dir.mkdir(parents=True, exist_ok=True)
     output_path = save_dir / cfg.get("output_filename", "predictions.csv")
+    
+    # Check if output already exists to prevent silent overwrite
+    if output_path.exists():
+        print(f"[WARNING] Output file already exists: {output_path}")
+        print("Appending '_new' to filename to preserve old results.")
+        output_path = save_dir / f"{output_path.stem}_new{output_path.suffix}"
     # ------------------------------------
 
     print(f"[Model] Base Architecture: {cfg.model.name}")
@@ -172,8 +207,6 @@ def main(cfg: DictConfig):
                 attention_mask=batch['attention_mask']
             )
             
-            # ESMConcatModel returns a single tensor 'score'
-            # No tuple unpacking needed for this specific architecture
             flat_scores = outputs.reshape(-1).float().cpu().numpy().tolist()
             predictions_reg.extend(flat_scores)
 
@@ -182,6 +215,6 @@ def main(cfg: DictConfig):
     
     df.to_csv(output_path, index=False)
     print(f"[SUCCESS] Saved results to: {output_path}")
-
+    
 if __name__ == "__main__":
     main()

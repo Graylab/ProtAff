@@ -13,7 +13,7 @@ defaults:
 # ==============================================================================
 # INPUTS
 # ==============================================================================
-tag: none
+tag: null
 
 # Path to the FOLDER containing adapter_model.bin and adapter_config.json
 # (Generated at the end of training in outputs/DATE/TIME/saved_model)

@@ -1,22 +1,22 @@
+import sys
 import os
 import pandas as pd
 import numpy as np
+import scipy.stats as stats
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy import stats
-from sklearn.metrics import mean_squared_error, mean_absolute_error, roc_auc_score, average_precision_score, r2_score
+import argparse
+from sklearn.metrics import (
+    mean_squared_error, 
+    mean_absolute_error, 
+    r2_score,
+    roc_auc_score, 
+    average_precision_score
+)
 
-# --- CONFIGURATION ---
-
-# Path to your CSV
-#CSV_PATH = "inference_results/combined_esm2_650M_concat_phase2_from_scratch_5/test_adaptyv/predictions.csv" 
-#CSV_PATH = "inference_results/combined_cleaned_2/test_adaptyv/predictions.csv" 
-#CSV_PATH = "inference_results/combined_cleaned_from_pretrain_3/test_adaptyv/predictions.csv" 
-#CSV_PATH = "inference_results/combined_cleaned_90_from_scratch_0/test_adaptyv/predictions.csv" 
-#CSV_PATH = "inference_output/combined_cleaned_90_from_scratch_0/test_adaptyv/predictions.csv" 
-#CSV_PATH = "inference_output/combined_cleaned_90_from_pretrain_2/test_adaptyv/predictions.csv" 
-#CSV_PATH = "inference_output/cleaned_from_scratch_0/test_adaptyv/predictions.csv" 
-CSV_PATH = "inference_output/pair_decoys_from_scratch_0/test_adaptyv/predictions.csv" 
+# ---------------------
+# Configuration
+# ---------------------
 
 # Set to True for log(Kd) or dG (where -9 is better than -5)
 # Set to False for pKd or Affinity Score (where 9 is better than 5)
@@ -66,6 +66,8 @@ def calculate_enrichment_factor(y_true, y_pred, top_percent, binary_threshold):
     return selection_rate / background_rate
 
 def analyze_and_plot(csv_path):
+    print(f"\n[Analysis] Processing: {csv_path}")
+    
     # 1. Load Data
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"File not found: {csv_path}")
@@ -73,7 +75,7 @@ def analyze_and_plot(csv_path):
     df = pd.read_csv(csv_path)
     
     if "log_Aff" not in df.columns or "predicted_affinity" not in df.columns:
-        print(f"[Error] CSV must contain 'log_Aff' and 'predicted_affinity'.")
+        print(f"[Error] CSV must contain 'log_Aff' and 'predicted_affinity'. Found: {df.columns.tolist()}")
         return
 
     y_true = df["log_Aff"].values
@@ -207,4 +209,21 @@ def analyze_and_plot(csv_path):
     print(f"[Success] Plot saved to: {plot_path}")
 
 if __name__ == "__main__":
-    analyze_and_plot(CSV_PATH)
+    parser = argparse.ArgumentParser(description="Analyze inference results.")
+    parser.add_argument("path", type=str, help="Path to csv file OR directory containing predictions.csv")
+    
+    args = parser.parse_args()
+    
+    target_path = args.path
+    
+    # Auto-infer logic
+    if os.path.isdir(target_path):
+        # If it's a directory, assume the file is named "predictions.csv"
+        potential_file = os.path.join(target_path, "predictions.csv")
+        if os.path.exists(potential_file):
+            target_path = potential_file
+        else:
+            print(f"[Error] Directory provided but 'predictions.csv' not found in: {target_path}")
+            sys.exit(1)
+            
+    analyze_and_plot(target_path)

@@ -3,17 +3,15 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
+import sys
+import argparse
 
-# ================= CONFIGURATION =================
-STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv" # Structural scores (ipSAE, pDockQ, etc.)
-GT_CSV = "data/test/test_adaptyv.csv"                           # Ground Truth (id, log_Aff)
-#PRED_AFF_CSV = "inference_results/combined_esm2_650M_concat_phase2_from_scratch_2/test_adaptyv/predictions.csv"     # New Predictions (id, predicted_affinity)
-PRED_AFF_CSV = "inference_output/cleaned_from_pretrain_1/test_adaptyv/predictions.csv"     # New Predictions (id, predicted_affinity)
-OUTPUT_DIR = "analysis_output/enrichment_bar_plots"
+# ================= CONFIGURATION (DEFAULTS) =================
+DEFAULT_STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv" 
+DEFAULT_GT_CSV = "data/test/test_adaptyv.csv"                            
 
-# Threshold for "True Binder" (e.g., log_Aff <= -6.0 is <1uM, <= -9.0 is <1nM)
-BINDER_THRESHOLD = 3.0 
-SELECTED_AGG = 'min'  # Aggregation for structural scores
+# Aggregation for structural scores
+SELECTED_AGG = 'min'  
 
 # Define directionality: True if Higher Score = Better Binder
 METRIC_DIRECTIONS = {
@@ -24,14 +22,13 @@ METRIC_DIRECTIONS = {
     'LIS': True,
     'predicted_affinity': False # Usually Lower Kd/Energy is better
 }
+# =================================================
 
-def load_and_prep_data():
-    if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
-    
+def load_and_prep_data(pred_csv, gt_csv, struct_csv, binder_threshold):
     try:
-        struct_df = pd.read_csv(STRUCT_SCORES_CSV)
-        gt_df = pd.read_csv(GT_CSV)
-        pred_df = pd.read_csv(PRED_AFF_CSV)
+        struct_df = pd.read_csv(struct_csv)
+        gt_df = pd.read_csv(gt_csv)
+        pred_df = pd.read_csv(pred_csv)
     except FileNotFoundError as e:
         print(f"❌ Error: {e}")
         return None
@@ -49,7 +46,7 @@ def load_and_prep_data():
     merged = pd.merge(merged, pred_df[['id', 'predicted_affinity']], on='id', how='inner')
 
     # Define Ground Truth Binary Label
-    merged['is_binder'] = (merged['log_Aff'] <= BINDER_THRESHOLD).astype(int)
+    merged['is_binder'] = (merged['log_Aff'] <= binder_threshold).astype(int)
     
     return merged
 
@@ -91,7 +88,7 @@ def calculate_enrichment_stats(df):
 
     return pd.DataFrame(plot_data), base_rate
 
-def plot_grouped_bar(df_plot, base_rate):
+def plot_grouped_bar(df_plot, base_rate, output_dir):
     # Setup Scientific Style
     sns.set_theme(style="white", rc={"axes.grid": True, "grid.linestyle": "--", "grid.alpha": 0.3})
     plt.figure(figsize=(10, 6))
@@ -134,12 +131,40 @@ def plot_grouped_bar(df_plot, base_rate):
 
     plt.tight_layout()
     
-    out_file = os.path.join(OUTPUT_DIR, "validation_EnrichmentBarChart.png")
+    out_file = os.path.join(output_dir, "validation_EnrichmentBarChart.png")
     plt.savefig(out_file, dpi=300)
     print(f"✅ Saved plot to {out_file}")
 
 if __name__ == "__main__":
-    df = load_and_prep_data()
+    parser = argparse.ArgumentParser(description="Generate Enrichment Bar Plots.")
+    parser.add_argument("path", type=str, help="Path to predictions csv OR directory containing predictions.csv")
+    parser.add_argument("--gt", type=str, default=DEFAULT_GT_CSV, help="Path to Ground Truth CSV")
+    parser.add_argument("--struct", type=str, default=DEFAULT_STRUCT_SCORES_CSV, help="Path to Structural Scores CSV")
+    parser.add_argument("--threshold", type=float, default=3.0, help="Binder Threshold (log_Aff <= X is binder)")
+    
+    args = parser.parse_args()
+    
+    target_path = args.path
+    
+    # Auto-infer logic
+    if os.path.isdir(target_path):
+        potential_file = os.path.join(target_path, "predictions.csv")
+        if os.path.exists(potential_file):
+            target_path = potential_file
+        else:
+            print(f"❌ Error: Directory provided but 'predictions.csv' not found in: {target_path}")
+            sys.exit(1)
+            
+    # Derive output directory from the final file path
+    output_dir = os.path.dirname(target_path)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    print(f"[Analysis] Processing: {target_path}")
+    print(f"[Analysis] Output Dir: {output_dir}")
+
+    df = load_and_prep_data(target_path, args.gt, args.struct, args.threshold)
+    
     if df is not None:
         stats_df, random_rate = calculate_enrichment_stats(df)
-        plot_grouped_bar(stats_df, random_rate)
+        plot_grouped_bar(stats_df, random_rate, output_dir)

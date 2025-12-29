@@ -3,16 +3,15 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.metrics import average_precision_score, precision_recall_curve
 import os
+import sys
+import argparse
 
 # ================= CONFIGURATION =================
 GT_CSV = "data/binder_design/test_design.csv"                   # Ground Truth
-PRED_CSV = "inference_output/base_from_pretrain_3/test_binder/predictions.csv"
-OUTPUT_DIR = "analysis_output/ap_plots"
 
 METRICS_CONFIG = {
     'AF3 ipSAE': ('af3_ipSAE_min', False),                 # Higher is better
     'Predicted Affinity': ('predicted_affinity', True),    # Lower is better (negated)
-    #'Predicted Prob Binder': ('predicted_prob_binder', False) # Higher is better
 }
 
 PLOT_SETTINGS = {
@@ -35,7 +34,6 @@ def get_ap(y_true, y_scores):
         return 0.0
     return average_precision_score(y_true_clean, y_scores_clean)
 
-# --- NEW FUNCTION: Plot PR Curves ---
 def plot_global_pr_curve(merged_df, metrics_config, output_dir):
     """Plots a single figure with PR curves for all metrics (Global Pool)."""
     plt.figure(figsize=(10, 8))
@@ -81,16 +79,19 @@ def plot_global_pr_curve(merged_df, metrics_config, output_dir):
     out_path = os.path.join(output_dir, "global_pr_curve.png")
     plt.savefig(out_path, dpi=300)
     print(f"Saved Global PR Curve: {out_path}")
-    plt.show()
+    plt.close()
 
-def analyze_results():
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
+def analyze_results(pred_csv, output_dir):
+    print(f"\n[Analysis] Processing: {pred_csv}")
+    print(f"[Analysis] Output Dir:  {output_dir}")
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
     print("Loading data...")
     try:
         gt_df = pd.read_csv(GT_CSV)
-        pred_df = pd.read_csv(PRED_CSV)
+        pred_df = pd.read_csv(pred_csv)
     except FileNotFoundError as e:
         print(f"Error: {e}")
         return
@@ -104,10 +105,10 @@ def analyze_results():
     merged_df = gt_df.merge(pred_df[cols_to_merge], on='id', how='left')
     print(f"Merged {len(merged_df)} samples.")
 
-    # --- 1. GENERATE PR CURVES (New Step) ---
-    plot_global_pr_curve(merged_df, METRICS_CONFIG, OUTPUT_DIR)
+    # --- 1. GENERATE PR CURVES ---
+    plot_global_pr_curve(merged_df, METRICS_CONFIG, output_dir)
 
-    # --- 2. EXISTING AP BAR CHART LOGIC ---
+    # --- 2. AP BAR CHART LOGIC ---
     plot_data_list = []
     targets = merged_df['target_id'].unique()
     
@@ -152,18 +153,18 @@ def analyze_results():
 
     final_df = pd.concat([sorted_plot_df, pd.DataFrame(aggs)], ignore_index=True)
 
-    save_summary(final_df)
-    generate_plot(final_df)
+    save_summary(final_df, output_dir)
+    generate_plot(final_df, output_dir)
 
-def save_summary(df):
-    out_csv_path = os.path.join(OUTPUT_DIR, "ap_summary_full.csv")
+def save_summary(df, output_dir):
+    out_csv_path = os.path.join(output_dir, "ap_summary_full.csv")
     df.to_csv(out_csv_path, index=False)
     print(f"Saved summary CSV: {out_csv_path}")
 
-def generate_plot(final_df):
+def generate_plot(final_df, output_dir):
     setup_plotting()
     num_targets = len(final_df['target_id'].unique())
-    fig_height = max(6, num_targets * PLOT_SETTINGS['bar_height_per_target'] + 2) # Ensure min height
+    fig_height = max(6, num_targets * PLOT_SETTINGS['bar_height_per_target'] + 2) 
     
     plt.figure(figsize=(PLOT_SETTINGS['figsize_width'], fig_height))
     ax = sns.barplot(data=final_df, x='AP', y='target_id', hue='Method', 
@@ -180,10 +181,10 @@ def generate_plot(final_df):
     plt.legend(bbox_to_anchor=(1.02, 1), loc='upper left', title='Metric')
     plt.tight_layout()
 
-    out_plot_path = os.path.join(OUTPUT_DIR, 'ap_comparison_final.png')
+    out_plot_path = os.path.join(output_dir, 'ap_comparison_final.png')
     plt.savefig(out_plot_path, dpi=300)
     print(f"Saved Bar Plot: {out_plot_path}")
-    plt.show()
+    plt.close()
 
 def setup_plotting():
     sns.set_theme(style="whitegrid")
@@ -191,4 +192,24 @@ def setup_plotting():
     plt.rcParams.update({'font.family': 'sans-serif'})
 
 if __name__ == "__main__":
-    analyze_results()
+    parser = argparse.ArgumentParser(description="Analyze AP and PR curves.")
+    parser.add_argument("path", type=str, help="Path to csv file OR directory containing predictions.csv")
+    
+    args = parser.parse_args()
+    
+    target_path = args.path
+    
+    # Auto-infer logic
+    if os.path.isdir(target_path):
+        # If it's a directory, assume the file is named "predictions.csv"
+        potential_file = os.path.join(target_path, "predictions.csv")
+        if os.path.exists(potential_file):
+            target_path = potential_file
+        else:
+            print(f"[Error] Directory provided but 'predictions.csv' not found in: {target_path}")
+            sys.exit(1)
+            
+    # Derive output directory from the final file path
+    output_dir = os.path.dirname(target_path)
+    
+    analyze_results(target_path, output_dir)

@@ -3,29 +3,33 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from scipy import stats
 import os
+import sys
+import argparse
 
-# ================= CONFIGURATION =================
-STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv" # Structural scores (ipSAE, pDockQ, etc.)
-GT_CSV = "data/test/test_adaptyv.csv"                           # Ground Truth (id, log_Aff)
-#PRED_AFF_CSV = "inference_results/combined_cleaned_90_from_scratch_0/test_adaptyv/predictions.csv"     # New Predictions (id, predicted_affinity)
-PRED_AFF_CSV = "inference_output/cleaned_from_pretrain_1/test_adaptyv/predictions.csv"     # New Predictions (id, predicted_affinity)
-OUTPUT_DIR = "analysis_output/correlation_plots"
+# ================= CONFIGURATION (DEFAULTS) =================
+# These act as defaults if not provided via arguments
+DEFAULT_STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv" 
+DEFAULT_GT_CSV = "data/test/test_adaptyv.csv"                            
 
 STRUCT_METRICS = ['ipSAE', 'ipTM_af', 'pDockQ', 'pDockQ2', 'LIS']
 AGG_METHODS = ['max', 'min', 'mean', 'median']
 # =================================================
 
-def analyze_results():
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
+def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
+    print(f"\n[Analysis] Predictions: {pred_csv}")
+    print(f"[Analysis] Output Dir : {output_dir}")
+    print(f"[Analysis] Ground Truth: {gt_csv}")
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
     print("Loading data...")
     try:
-        struct_df = pd.read_csv(STRUCT_SCORES_CSV)
-        gt_df = pd.read_csv(GT_CSV)
-        aff_pred_df = pd.read_csv(PRED_AFF_CSV)
+        struct_df = pd.read_csv(struct_csv)
+        gt_df = pd.read_csv(gt_csv)
+        aff_pred_df = pd.read_csv(pred_csv)
     except FileNotFoundError as e:
-        print(f"Error: {e}")
+        print(f"[Error] File not found: {e}")
         return
 
     # Cleanup IDs
@@ -35,7 +39,10 @@ def analyze_results():
 
     # Aggregation
     print(f"Aggregating {len(struct_df)} structural models...")
-    grouped_df = struct_df.groupby('id')[STRUCT_METRICS].agg(AGG_METHODS)
+    # Filter only metrics that exist in the dataframe
+    available_metrics = [m for m in STRUCT_METRICS if m in struct_df.columns]
+    
+    grouped_df = struct_df.groupby('id')[available_metrics].agg(AGG_METHODS)
     grouped_df.columns = ['_'.join(col).strip() for col in grouped_df.columns.values]
     grouped_df = grouped_df.reset_index()
 
@@ -66,11 +73,13 @@ def analyze_results():
         
         # Define columns to plot
         plot_targets = []
-        for m in STRUCT_METRICS:
+        for m in available_metrics:
             plot_targets.append((f"{m}_{agg}", f"{m} ({agg})"))
         plot_targets.append(('neg_predicted_affinity', 'Predicted Affinity'))
 
+        # Limit to available axes
         for i, (col_name, label) in enumerate(plot_targets):
+            if i >= len(axes): break
             ax = axes[i]
             
             clean_data = merged_df[[col_name, 'neg_log_Aff']].dropna()
@@ -116,25 +125,20 @@ def analyze_results():
                     bbox=dict(facecolor=box_color, alpha=0.9, edgecolor='gray', boxstyle='round,pad=0.5'))
 
             # --- TITLES AND LABELS ---
-            # 1. Subplot Title (Just the Metric Name)
             ax.set_title(label, fontsize=22, fontweight='bold', pad=15)
             
-            # 2. Simplified X Label
             if "Predicted Affinity" in label:
                 xlabel = "Predicted -log_Aff"
             else:
                 xlabel = f"Predicted {label}"
             
             ax.set_xlabel(xlabel, fontsize=18, fontweight='bold')
-            
-            # 3. Simplified Y Label
             ax.set_ylabel("Ground Truth -log_Aff", fontsize=18, fontweight='bold')
             
             ax.grid(True, linestyle='--', alpha=0.5)
 
         # Output
-        # N is now in the FIGURE title
-        out_img_path = os.path.join(OUTPUT_DIR, f"correlation_{agg}_final.png")
+        out_img_path = os.path.join(output_dir, f"correlation_{agg}_final.png")
         fig.suptitle(f"Binder Selection Metrics ({agg.upper()} aggregation) | N={n_samples}", fontsize=26, fontweight='bold', y=0.99)
         
         plt.tight_layout()
@@ -143,18 +147,17 @@ def analyze_results():
         plt.close(fig)
 
     # 5. Save Summary
-    save_summary(all_stats)
+    save_summary(all_stats, output_dir)
 
-def save_summary(all_stats):
+def save_summary(all_stats, output_dir):
     stats_df = pd.DataFrame(all_stats)
-    out_csv_path = os.path.join(OUTPUT_DIR, "analysis_summary_full.csv")
+    out_csv_path = os.path.join(output_dir, "analysis_summary_full.csv")
     stats_df.to_csv(out_csv_path, index=False)
     
     # --- PLOTTING RANKING BARPLOT ---
     print("Generating Spearman ranking plot...")
     
     # 1. Deduplicate
-    # "Predicted Affinity" is calculated in every loop but is identical.
     plot_df = stats_df.drop_duplicates(subset=['Metric', 'Spearman_Rho']).copy()
     
     # 2. Sort High to Low
@@ -164,67 +167,54 @@ def save_summary(all_stats):
     plt.figure(figsize=(14, max(8, len(plot_df) * 0.6)))
     sns.set_style("whitegrid")
     
-    # 4. Create Horizontal Bar Plot (Uniform colors)
+    # 4. Create Horizontal Bar Plot
     ax = sns.barplot(
         data=plot_df,
         x="Spearman_Rho",
         y="Metric",
-        palette="viridis", # Uniform palette, no conditional coloring on bars
+        palette="viridis",
         edgecolor="0.2"
     )
     
     # 5. Add Value Labels to Bars
     for p in ax.patches:
         width = p.get_width()
-        # Positioning logic
         if width >= 0:
-            ha = 'left'
-            x_offset = 0.02
+            ha = 'left'; x_offset = 0.02
         else:
-            ha = 'right'
-            x_offset = -0.02
+            ha = 'right'; x_offset = -0.02
             
         ax.text(
             width + x_offset,
             p.get_y() + p.get_height() / 2,
             f'{width:.3f}',
-            ha=ha,
-            va='center',
-            fontsize=12,
-            fontweight='bold',
-            color='#333333'
+            ha=ha, va='center',
+            fontsize=12, fontweight='bold', color='#333333'
         )
 
-    # 6. Highlight "Predicted Affinity" Text on Y-Axis
+    # 6. Highlight "Predicted Affinity"
     for tick_label in ax.get_yticklabels():
         if "Predicted Affinity" in tick_label.get_text():
             tick_label.set_fontweight('bold')
-            tick_label.set_fontsize(16) # Make it slightly larger for emphasis
+            tick_label.set_fontsize(16)
         else:
             tick_label.set_fontweight('normal')
 
-    # 7. Adjust X-Axis to fit text (Wider)
+    # 7. Adjust X-Axis
     data_min = plot_df['Spearman_Rho'].min()
     data_max = plot_df['Spearman_Rho'].max()
-    
-    lower_bound = min(0, data_min)
-    upper_bound = max(0, data_max)
+    lower_bound = min(0, data_min); upper_bound = max(0, data_max)
     span = upper_bound - lower_bound
     if span == 0: span = 1.0
-        
-    # Add 25% padding to fit labels comfortably
     ax.set_xlim(lower_bound - (span * 0.25), upper_bound + (span * 0.25))
 
-    # 8. Styling and Titles
     plt.axvline(0, color='black', linewidth=1.5, linestyle='-') 
     plt.title("Spearman Correlation Ranking (High to Low)", fontsize=20, fontweight='bold', pad=20)
     plt.xlabel("Spearman Coefficient (Higher is Better)", fontsize=16, fontweight='bold')
     plt.ylabel("") 
     plt.xticks(fontsize=12)
-    # Note: yticks fontsize is handled in the highlight loop above
     
-    # 9. Save Plot
-    out_plot_path = os.path.join(OUTPUT_DIR, "spearman_ranking_barplot.png")
+    out_plot_path = os.path.join(output_dir, "spearman_ranking_barplot.png")
     plt.tight_layout()
     plt.savefig(out_plot_path, dpi=300)
     print(f"Saved ranking plot: {out_plot_path}")
@@ -242,7 +232,7 @@ def setup_plotting():
     sns.set_theme(style="whitegrid")
     plt.rcParams.update({
         'font.family': 'sans-serif',
-        'font.size': 16,              
+        'font.size': 16,               
         'axes.titlesize': 22,         
         'axes.labelsize': 18,         
         'xtick.labelsize': 16,
@@ -252,4 +242,25 @@ def setup_plotting():
     })
 
 if __name__ == "__main__":
-    analyze_results()
+    parser = argparse.ArgumentParser(description="Analyze Structural vs Predicted Correlations.")
+    parser.add_argument("path", type=str, help="Path to predictions csv OR directory containing predictions.csv")
+    parser.add_argument("--gt", type=str, default=DEFAULT_GT_CSV, help="Path to Ground Truth CSV")
+    parser.add_argument("--struct", type=str, default=DEFAULT_STRUCT_SCORES_CSV, help="Path to Structural Scores CSV")
+    
+    args = parser.parse_args()
+    
+    target_path = args.path
+    
+    # Auto-infer logic
+    if os.path.isdir(target_path):
+        potential_file = os.path.join(target_path, "predictions.csv")
+        if os.path.exists(potential_file):
+            target_path = potential_file
+        else:
+            print(f"[Error] Directory provided but 'predictions.csv' not found in: {target_path}")
+            sys.exit(1)
+            
+    # Derive output directory from the final file path
+    output_dir = os.path.dirname(target_path)
+    
+    analyze_results(target_path, output_dir, args.gt, args.struct)

@@ -4,38 +4,35 @@ import matplotlib.pyplot as plt
 from sklearn import metrics
 import numpy as np
 import os
+import sys
+import argparse
 
-# ================= CONFIGURATION =================
-STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv" # Structural scores (ipSAE, pDockQ, etc.)
-GT_CSV = "data/test/test_adaptyv.csv"                           # Ground Truth (id, log_Aff)
-#PRED_AFF_CSV = "inference_results/combined_esm2_650M_concat_phase2_from_scratch_2/test_adaptyv/predictions.csv"     # New Predictions (id, predicted_affinity)
-PRED_AFF_CSV = "inference_output/cleaned_from_pretrain_1/test_adaptyv/predictions.csv"     # New Predictions (id, predicted_affinity)
-OUTPUT_DIR = "analysis_output/roc_success_rate_plots"
+# ================= CONFIGURATION (DEFAULTS) =================
+DEFAULT_STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv" 
+DEFAULT_GT_CSV = "data/test/test_adaptyv.csv"                            
 
-# --- CRITICAL: DEFINING 'TRUE BINDERS' ---
-# What log_Aff value counts as a binder?
-# Example: If log_Aff is log10(Kd in Molar): -6 is 1uM, -9 is 1nM.
-# Set this to your specific project threshold. Lower log_Aff = Binder.
-BINDER_THRESHOLD = 3.0 
-
-# Aggregation to use for the Structural Scores (Standard is 'max' or 'mean')
-# We will use 'max' for this analysis (Best confident model)
+# Aggregation to use for the Structural Scores
 SELECTED_AGG = 'min' 
 
 STRUCT_METRICS = ['ipSAE', 'ipTM_af', 'pDockQ', 'pDockQ2', 'LIS']
 # =================================================
 
-def analyze_enrichment():
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
+def analyze_enrichment(pred_csv, output_dir, gt_csv, struct_csv, binder_threshold):
+    print(f"\n[Analysis] Predictions: {pred_csv}")
+    print(f"[Analysis] Output Dir : {output_dir}")
+    print(f"[Analysis] GT File    : {gt_csv}")
+    print(f"[Analysis] Threshold  : log_Aff <= {binder_threshold}")
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
     print("Loading data...")
     try:
-        struct_df = pd.read_csv(STRUCT_SCORES_CSV)
-        gt_df = pd.read_csv(GT_CSV)
-        aff_pred_df = pd.read_csv(PRED_AFF_CSV)
+        struct_df = pd.read_csv(struct_csv)
+        gt_df = pd.read_csv(gt_csv)
+        aff_pred_df = pd.read_csv(pred_csv)
     except FileNotFoundError as e:
-        print(f"Error: {e}")
+        print(f"[Error] File not found: {e}")
         return
 
     # Cleanup IDs
@@ -44,14 +41,17 @@ def analyze_enrichment():
     aff_pred_df['id'] = aff_pred_df['id'].astype(str).str.strip()
 
     # 1. Prepare Data
-    grouped_df = struct_df.groupby('id')[STRUCT_METRICS].agg(SELECTED_AGG).reset_index()
+    # Filter for available structural metrics
+    available_metrics = [m for m in STRUCT_METRICS if m in struct_df.columns]
+    
+    grouped_df = struct_df.groupby('id')[available_metrics].agg(SELECTED_AGG).reset_index()
     
     # Merge All
     merged_df = pd.merge(grouped_df, gt_df[['id', 'log_Aff']], on='id', how='inner')
     merged_df = pd.merge(merged_df, aff_pred_df[['id', 'predicted_affinity']], on='id', how='inner')
 
     # 2. Define Binary Class
-    merged_df['is_binder'] = (merged_df['log_Aff'] <= BINDER_THRESHOLD).astype(int)
+    merged_df['is_binder'] = (merged_df['log_Aff'] <= binder_threshold).astype(int)
     
     # Transform scores (Higher = Better)
     merged_df['neg_predicted_affinity'] = -1 * merged_df['predicted_affinity']
@@ -61,12 +61,11 @@ def analyze_enrichment():
     base_rate = num_binders / total_samples
 
     print(f"Total Samples: {total_samples}")
-    print(f"True Binders (log_Aff <= {BINDER_THRESHOLD}): {num_binders} ({base_rate:.1%} hit rate)")
+    print(f"True Binders (log_Aff <= {binder_threshold}): {num_binders} ({base_rate:.1%} hit rate)")
 
     # =================================================================
-    # --- NEW: Generate Confirmatory Scatter Plot ---
-    # This passes the prepared dataframe and your thresholds
-    plot_negated_affinity_scatter(merged_df, BINDER_THRESHOLD, OUTPUT_DIR)
+    # --- Generate Confirmatory Scatter Plot ---
+    plot_negated_affinity_scatter(merged_df, binder_threshold, output_dir)
     # =================================================================
     
     if num_binders == 0 or num_binders == total_samples:
@@ -75,11 +74,11 @@ def analyze_enrichment():
 
     # Prepare list of metrics
     eval_metrics = []
-    for m in STRUCT_METRICS:
+    for m in available_metrics:
         eval_metrics.append((f"{m} ({SELECTED_AGG})", m, True))
     eval_metrics.append(("Predicted Affinity", "neg_predicted_affinity", False))
 
-    # --- DEFINE RESEARCH PAPER COLORS (Okabe-Ito / High Contrast) ---
+    # --- DEFINE RESEARCH PAPER COLORS ---
     research_colors = [
         "#0072B2", # Blue
         "#009E73", # Bluish Green
@@ -98,7 +97,6 @@ def analyze_enrichment():
             # Highlight: Vermillion (Deep Red-Orange)
             color_map[label] = "#D55E00" 
         else:
-            # Cycle through the other research colors
             color_map[label] = research_colors[color_idx % len(research_colors)]
             color_idx += 1
 
@@ -130,9 +128,9 @@ def analyze_enrichment():
             'y_score': y_score
         })
 
-        print(f"{label:<25} | {auc:.3f}    | {ef_10:.2f}     | {ef_20:.2f}")
+        print(f"{label:<25} | {auc:.3f}    | {ef_10:.2f}      | {ef_20:.2f}")
 
-    # Standard Figure Size for both plots
+    # Standard Figure Size
     FIG_SIZE = (10, 7)
 
     # 4. PLOT 1: ROC Curves
@@ -159,23 +157,21 @@ def analyze_enrichment():
     plt.ylabel('True Positive Rate', fontweight='bold')
     plt.title(f'ROC Evaluation', fontweight='bold', pad=15)
     
-    # Legend Lower Right
     plt.legend(loc="lower right", frameon=True, framealpha=0.9, edgecolor='gray')
-    
     plt.grid(True, alpha=0.2, linestyle='-')
     
-    out_roc = os.path.join(OUTPUT_DIR, "validation_ROC.png")
+    out_roc = os.path.join(output_dir, "validation_ROC.png")
     plt.savefig(out_roc, dpi=300, bbox_inches='tight')
     print(f"\nSaved ROC Plot: {out_roc}")
     plt.close()
 
     # 5. PLOT 2: Success Rate (Precision) at Top N%
-    plot_success_rates(results, total_samples, base_rate, color_map, FIG_SIZE)
+    plot_success_rates(results, total_samples, base_rate, color_map, FIG_SIZE, output_dir)
     
     # 6. Save Summary Table
     df_res = pd.DataFrame(results)[['Metric', 'AUC', 'EF_10', 'EF_20']]
     df_res = df_res.sort_values(by='AUC', ascending=False)
-    df_res.to_csv(os.path.join(OUTPUT_DIR, "enrichment_summary.csv"), index=False)
+    df_res.to_csv(os.path.join(output_dir, "enrichment_summary.csv"), index=False)
 
 def calc_enrichment_factor(y_true, y_score, percentile):
     """Calculates Enrichment Factor at a specific top percentile"""
@@ -195,7 +191,7 @@ def calc_enrichment_factor(y_true, y_score, percentile):
     global_hit_rate = total_hits / n
     return precision_at_k / global_hit_rate
 
-def plot_success_rates(results, total_n, base_rate, color_map, fig_size):
+def plot_success_rates(results, total_n, base_rate, color_map, fig_size, output_dir):
     """Plots Hit Rate (Precision) vs Top % Screened"""
     plt.figure(figsize=fig_size)
     
@@ -229,13 +225,12 @@ def plot_success_rates(results, total_n, base_rate, color_map, fig_size):
     plt.ylabel("Precision (Success Rate)", fontweight='bold')
     plt.title("Enrichment Analysis", fontweight='bold', pad=15)
     
-    # Legend Lower Right (Inside plot)
     plt.legend(loc="lower right", frameon=True, framealpha=0.9, edgecolor='gray')
     
     plt.grid(True, axis='y', alpha=0.2)
     plt.tight_layout()
     
-    out_path = os.path.join(OUTPUT_DIR, "validation_SuccessRate.png")
+    out_path = os.path.join(output_dir, "validation_SuccessRate.png")
     plt.savefig(out_path, dpi=300, bbox_inches='tight')
     print(f"Saved Success Rate Plot: {out_path}")
     plt.close()
@@ -248,16 +243,13 @@ def plot_negated_affinity_scatter(df, binder_threshold, output_dir):
     print("\nGenerating Negated Affinity Scatter Plot (Higher is Better)...")
     
     # 1. Create Negated Columns (Higher = Better)
-    # We use .copy() to avoid SettingWithCopy warnings on the slice
     plot_df = df.copy()
     plot_df['neg_log_Aff'] = -1 * plot_df['log_Aff']
     plot_df['neg_pred_Aff'] = -1 * plot_df['predicted_affinity']
     
-    # New Threshold: If binder was log_Aff <= -6, now it is neg_log_Aff >= 6
     neg_binder_threshold = -1 * binder_threshold
 
-    # 2. Calculate Top N% Cutoffs (Sort Descending now)
-    # Since Higher is Better, we sort highest first
+    # 2. Calculate Top N% Cutoffs (Sort Descending)
     df_sorted = plot_df.sort_values(by='neg_pred_Aff', ascending=False)
     total_n = len(df_sorted)
     
@@ -283,41 +275,29 @@ def plot_negated_affinity_scatter(df, binder_threshold, output_dir):
     )
 
     # 4. Reference Lines
-    # A) Horizontal Line: Ground Truth Threshold
-    # Note: Binders are now ABOVE this line (>= threshold)
     plt.axhline(y=neg_binder_threshold, color='#CC79A7', linestyle='--', linewidth=2.5, 
-                label=f'GT Threshold (pKd ≥ {neg_binder_threshold})', zorder=1)
+                label=f'GT Threshold (pKd >= {neg_binder_threshold})', zorder=1)
 
-    # B) Vertical Lines: Predicted Cutoffs
-    # Note: Top candidates are to the RIGHT of these lines
     line_colors = ['#009E73', '#E69F00', '#56B4E9', '#333333'] 
     for i, (label, val) in enumerate(cutoff_map.items()):
         plt.axvline(x=val, color=line_colors[i], linestyle=':', linewidth=2, 
-                    label=f'{label} Cutoff (Score ≥ {val:.2f})', zorder=1)
+                    label=f'{label} Cutoff (Score >= {val:.2f})', zorder=1)
         
-        # Label at top
         plt.text(val, plt.gca().get_ylim()[1], f'  {label}', 
                  color=line_colors[i], fontsize=10, rotation=90, verticalalignment='top', zorder=3)
 
-    # 5. Highlight the "Golden Corner" (Top-Right)
-    # Area: Right of Top 5% cutoff AND Above GT Threshold
+    # 5. Highlight "Golden Corner"
     xmin, xmax = plt.gca().get_xlim()
     ymin, ymax = plt.gca().get_ylim()
-    
-    # Fill region: x=[cutoff, xmax], y=[threshold, ymax]
     top5_val = cutoff_map["Top 5%"]
     
-    # We use fill_between to shade the area where y >= threshold
-    # constrained by x >= top5_val
     plt.fill_between([top5_val, xmax], neg_binder_threshold, ymax, 
                      color='#009E73', alpha=0.1, zorder=0, label='Ideal Region')
 
-    # Titles
     plt.title("Predicted vs. Experimental Affinity (Negated Scale)", fontweight='bold', pad=20, fontsize=16)
-    plt.xlabel("Negative Predicted Affinity (Higher is Better) $\\rightarrow$", fontweight='bold', fontsize=14)
-    plt.ylabel("Negative Experimental log_Aff (Higher is Better) $\\rightarrow$", fontweight='bold', fontsize=14)
+    plt.xlabel("Negative Predicted Affinity (Higher is Better) ->", fontweight='bold', fontsize=14)
+    plt.ylabel("Negative Experimental log_Aff (Higher is Better) ->", fontweight='bold', fontsize=14)
 
-    # Legend Cleanup
     plt.legend(loc='upper left', frameon=True, framealpha=0.95, shadow=True)
     plt.grid(True, linestyle='-', alpha=0.3)
     plt.tight_layout()
@@ -338,7 +318,7 @@ def setup_plotting():
     plt.rcParams.update({
         'font.family': 'sans-serif',
         'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'Bitstream Vera Sans', 'sans-serif'],
-        'font.size': 12,              
+        'font.size': 12,               
         'axes.titlesize': 14,         
         'axes.labelsize': 12,         
         'xtick.labelsize': 11,
@@ -349,4 +329,26 @@ def setup_plotting():
     })
 
 if __name__ == "__main__":
-    analyze_enrichment()# =================================================
+    parser = argparse.ArgumentParser(description="Analyze Enrichment (ROC, Success Rate).")
+    parser.add_argument("path", type=str, help="Path to predictions csv OR directory containing predictions.csv")
+    parser.add_argument("--gt", type=str, default=DEFAULT_GT_CSV, help="Path to Ground Truth CSV")
+    parser.add_argument("--struct", type=str, default=DEFAULT_STRUCT_SCORES_CSV, help="Path to Structural Scores CSV")
+    parser.add_argument("--threshold", type=float, default=3.0, help="Binder Threshold (log_Aff <= X is binder)")
+    
+    args = parser.parse_args()
+    
+    target_path = args.path
+    
+    # Auto-infer logic
+    if os.path.isdir(target_path):
+        potential_file = os.path.join(target_path, "predictions.csv")
+        if os.path.exists(potential_file):
+            target_path = potential_file
+        else:
+            print(f"[Error] Directory provided but 'predictions.csv' not found in: {target_path}")
+            sys.exit(1)
+            
+    # Derive output directory from the final file path
+    output_dir = os.path.dirname(target_path)
+    
+    analyze_enrichment(target_path, output_dir, args.gt, args.struct, args.threshold)

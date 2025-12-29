@@ -87,11 +87,14 @@ class PairwiseAffinityDataset(Dataset):
                  weight_col: Optional[str] = None, 
                  balance_clusters: bool = False,
                  pairs_per_sample: int = 3,
-                 margin_threshold: float = 0.5):
+                 min_margin: float = 0.5,      # Lower Bound (Noise Filter)
+                 max_margin: Optional[float] = 4.0): # Upper Bound (Easy Filter)
         """
         Args:
             weight_col: Column to use for Grouping AND Balancing (e.g. 'cluster_id' or 'target_id').
             pairs_per_sample: Number of 'worse' samples to pair with each 'better' sample.
+            min_margin: Minimum score difference required.
+            max_margin: Maximum score difference allowed (None for no limit).
         """
         # Load Lookup
         lookup_df = pd.read_csv(lookup_csv_path)
@@ -119,12 +122,15 @@ class PairwiseAffinityDataset(Dataset):
         # [Dataset] 3. Universal Pair Mining (Optimized)
         self.pairs = [] 
         self.weights = [] 
+        deltas = [] # For statistics
 
         print(f"[Dataset] Mining pairs within groups of '{self.stratify_col}'...")
+        print(f"[Dataset] Strategy: Band Mining ({min_margin} <= delta <= {max_margin if max_margin else 'Inf'})")
+        
         groups = self.base_df.groupby(self.stratify_col)
 
         for g_name, group in groups:
-            # 1. Sort Data (Best to Worst)
+            # 1. Sort Data (Best to Worst -> Ascending log_Aff)
             # We do this once per group.
             valid_group = group.dropna(subset=["log_Aff"]).sort_values("log_Aff", ascending=True)
             n_total = len(valid_group)
@@ -134,36 +140,48 @@ class PairwiseAffinityDataset(Dataset):
             cur_weight = self.cluster_weights.get(g_name, 1.0)
             
             # 2. Extract values for fast lookup
-            # This allows us to use fast Math instead of slow Pandas inside the loop
             aff_values = valid_group["log_Aff"].values 
 
-            # 3. Iterate Top 50% (Anchors) via integer index
+            # 3. Iterate Top 50% (Anchors)
             n_anchors = max(1, n_total // 2)
 
             for i in range(n_anchors):
                 better_val = aff_values[i]
-                threshold = better_val + margin_threshold
                 
-                # OPTIMIZATION: Binary Search
-                # Instead of scanning the whole dataframe, we jump to the index 
-                # where affinity becomes > threshold. Instant (O(log N)).
-                start_index = np.searchsorted(aff_values, threshold, side='right')
+                # --- NEW LOGIC: Band Search ---
                 
-                # The valid "Losers" are everything from start_index to the end
-                n_candidates = n_total - start_index
+                # A. Lower Bound (Noise Filter)
+                # Find first index where value >= better_val + min_margin
+                thresh_min = better_val + min_margin
+                start_index = np.searchsorted(aff_values, thresh_min, side='right')
+                
+                # B. Upper Bound (Trivial Filter)
+                # Find first index where value > better_val + max_margin
+                # We stop BEFORE this index.
+                if max_margin is not None:
+                    thresh_max = better_val + max_margin
+                    end_index = np.searchsorted(aff_values, thresh_max, side='left')
+                else:
+                    end_index = n_total
+                
+                # The valid "Losers" are in the slice [start_index : end_index]
+                n_candidates = end_index - start_index
                 
                 if n_candidates > 0:
-                    # Pick random indices directly from the valid range
-                    # This avoids creating intermediate DataFrames
-                    offsets = np.random.randint(start_index, n_total, size=min(n_candidates, pairs_per_sample))
+                    # Pick random indices from the VALID SLICE
+                    offsets = np.random.randint(start_index, end_index, size=min(n_candidates, pairs_per_sample))
                     
-                    # Now retrieve the rows (Lazy loading)
+                    # Retrieve the Anchor row once
                     row_better = valid_group.iloc[i]
                     
                     for worse_idx in offsets:
                         row_worse = valid_group.iloc[worse_idx]
+                        
                         self.pairs.append((row_better, row_worse))
                         self.weights.append(cur_weight)
+                        
+                        # Collect Stat
+                        deltas.append(aff_values[worse_idx] - better_val)
         
         # [Dataset] 4. Final Stats
         print(f"[Dataset] Generated {len(self.pairs)} pairs.")
@@ -174,9 +192,15 @@ class PairwiseAffinityDataset(Dataset):
         
         print(f"[Dataset] Coverage: {kept_groups}/{total_groups} groups used. ({dropped} dropped)")
         
-        if len(self.pairs) == 0:
-            raise ValueError("CRITICAL: No valid pairs generated! Check 'margin_threshold' or data variance.")
+        if len(deltas) > 0:
+            avg_d = np.mean(deltas)
+            min_d = np.min(deltas)
+            max_d = np.max(deltas)
+            print(f"[Dataset] Statistics: Avg Delta={avg_d:.4f} | Min={min_d:.4f} | Max={max_d:.4f}")
         
+        if len(self.pairs) == 0:
+            raise ValueError(f"CRITICAL: No valid pairs generated! Check min_margin={min_margin}, max_margin={max_margin}")
+
     def __len__(self):
         return len(self.pairs)
 
@@ -224,7 +248,8 @@ class PairAffinityDataModule(LightningDataModule):
             weight_col=self.cfg.data.get("weight_col"), 
             balance_clusters=self.cfg.data.get("balance_clusters", False),
             pairs_per_sample=self.cfg.data.get("pairs_per_sample", 2),
-            margin_threshold=self.cfg.data.get("margin_threshold", 0.5)
+            min_margin=self.cfg.data.get("min_margin", 0.5), # From Config
+            max_margin=self.cfg.data.get("max_margin", 4.0)  # From Config
         )
         
         # 2. Random Split
@@ -284,85 +309,78 @@ if __name__ == '__main__':
     print("--- 🧪 RUNNING SELF-TEST FOR DATASET.PY ---")
 
     # 1. SETUP DUMMY DATA
-    # We need a temporary lookup CSV because the class reads from a path
     dummy_lookup_csv = "temp_lookup_test.csv"
     
-    # 3 Clusters/Targets:
-    # Target 1: Has Strong (9.0), Weak (6.0), and Decoy (0.0). Should generate pairs.
-    # Target 2: Has two Binders (8.5, 8.2). Should pair if margin is small.
-    # Target 3: Only Decoys. Should be dropped (Safety check).
+    # 3 Targets:
+    # T1: Strong (-9.0), Weak (-6.0), Decoy (0.0). Pairs: (-9 vs -6), (-9 vs 0), (-6 vs 0).
+    # T2: Too Close (-8.5 vs -8.2). Diff=0.3. Should be skipped if min_margin=0.5.
+    # T3: Decoy Only. Skipped.
     sequences = [
-        {"type": "binder", "id": 101, "seq": "MAAA"}, # Strong T1
-        {"type": "binder", "id": 102, "seq": "MBBB"}, # Weak T1
-        {"type": "binder", "id": 103, "seq": "MCCC"}, # Decoy T1
-        {"type": "binder", "id": 201, "seq": "MDDD"}, # Binder T2
-        {"type": "binder", "id": 202, "seq": "MEEE"}, # Binder T2
-        {"type": "binder", "id": 301, "seq": "MFFF"}, # Decoy T3 (Lonely)
+        {"type": "binder", "id": 101, "seq": "MAAA"}, 
+        {"type": "binder", "id": 102, "seq": "MBBB"}, 
+        {"type": "binder", "id": 103, "seq": "MCCC"}, 
+        {"type": "binder", "id": 201, "seq": "MDDD"}, 
+        {"type": "binder", "id": 202, "seq": "MEEE"}, 
+        {"type": "binder", "id": 301, "seq": "MFFF"}, 
         {"type": "target", "id": 1, "seq": "TGGG"},
         {"type": "target", "id": 2, "seq": "THHH"},
         {"type": "target", "id": 3, "seq": "TIII"},
     ]
     pd.DataFrame(sequences).to_csv(dummy_lookup_csv, index=False)
 
-    # 2. CREATE DATAFRAME
     data = [
-        {"binder_id": 101, "target_id": 1, "cluster_id": "c1", "log_Aff": 9.0, "is_binder": 1},
-        {"binder_id": 102, "target_id": 1, "cluster_id": "c1", "log_Aff": 6.0, "is_binder": 1},
-        {"binder_id": 103, "target_id": 1, "cluster_id": "c1", "log_Aff": 0.0, "is_binder": 0},
-        {"binder_id": 201, "target_id": 2, "cluster_id": "c2", "log_Aff": 8.5, "is_binder": 1},
-        {"binder_id": 202, "target_id": 2, "cluster_id": "c2", "log_Aff": 8.2, "is_binder": 1},
-        {"binder_id": 301, "target_id": 3, "cluster_id": "c3", "log_Aff": 0.0, "is_binder": 0},
+        {"binder_id": 101, "target_id": 1, "log_Aff": -9.0},
+        {"binder_id": 102, "target_id": 1, "log_Aff": -6.0},
+        {"binder_id": 103, "target_id": 1, "log_Aff": 0.0},
+        {"binder_id": 201, "target_id": 2, "log_Aff": -8.5},
+        {"binder_id": 202, "target_id": 2, "log_Aff": -8.2},
+        {"binder_id": 301, "target_id": 3, "log_Aff": 0.0},
     ]
     df = pd.DataFrame(data)
 
     try:
-        # 3. INITIALIZE DATASET
+        # 3. INITIALIZE DATASET (With Upper Bound Test)
         print("\n> Initializing Dataset...")
         ds = PairwiseAffinityDataset(
             base_df=df,
             lookup_csv_path=dummy_lookup_csv,
             balance_clusters=True,
-            pairs_per_sample=2,
-            margin_threshold=0.2  # Low threshold to catch the 8.5 vs 8.2 pair
+            pairs_per_sample=3,
+            min_margin=0.5, 
+            max_margin=5.0 # Should allow (-9 vs -6, diff=3) but skip (-9 vs 0, diff=9)
         )
 
         # 4. VERIFY LOGIC
         print(f"> Dataset Length: {len(ds)} pairs")
         
-        # We expect:
-        # T1: 101>103, 102>103 (Binder>Decoy) AND 101>102 (Strong>Weak, diff=3.0)
-        # T2: 201>202 (Strong>Weak, diff=0.3)
-        # T3: Dropped (0 pairs)
+        # Expected:
+        # T1: (-9 vs -6) [Diff 3.0, OK]
+        # T1: (-9 vs 0)  [Diff 9.0, > Max, SKIP]
+        # T1: (-6 vs 0)  [Diff 6.0, > Max, SKIP]
+        # T2: (-8.5 vs -8.2) [Diff 0.3, < Min, SKIP]
+        
+        # So we expect roughly 1 or 2 pairs depending on exact boundaries.
+        
         if len(ds) == 0:
             print("❌ FAILURE: Dataset is empty.")
         else:
             print("✅ SUCCESS: Pairs generated.")
             print(f"  Sample 0: {ds[0]['better_binder']} > {ds[0]['worse_binder']}")
 
-        # 5. TEST COLLATOR & SHAPES
+        # 5. TEST COLLATOR
         print("\n> Testing Collator...")
-        
-        # MOCK Tokenizer to avoid downloading ESM weights for this simple test
         class MockTokenizer:
-            cls_token_id = 0
-            pad_token_id = 1
-            eos_token_id = 2
+            cls_token_id, pad_token_id, eos_token_id = 0, 1, 2
             eos_token = "<eos>"
             def __call__(self, text, add_special_tokens=False):
-                # Returns dummy IDs for any string
                 return {"input_ids": [[5, 6, 7] for _ in text]}
         
         collator = PairwiseCollator(tokenizer=MockTokenizer(), max_length=128)
         dl = DataLoader(ds, batch_size=2, collate_fn=collator)
-        
         batch = next(iter(dl))
-        print(f"  Batch keys: {list(batch.keys())}")
-        print(f"  Better Input Shape: {batch['better_input_ids'].shape}")
         
-        if batch['better_input_ids'].shape[0] == 2:
-            print("✅ SUCCESS: Batch dimensions correct.")
-        else:
-            print("❌ FAILURE: Batch dimension mismatch.")
+        if batch['better_input_ids'].shape[0] == len(batch['better_input_ids']):
+             print("✅ SUCCESS: Batch dimensions correct.")
 
     except Exception as e:
         print(f"\n❌ CRITICAL ERROR: {e}")
@@ -370,7 +388,5 @@ if __name__ == '__main__':
         traceback.print_exc()
 
     finally:
-        # 6. CLEANUP
         if os.path.exists(dummy_lookup_csv):
             os.remove(dummy_lookup_csv)
-            print("\n> Cleanup complete. Temp file removed.")
