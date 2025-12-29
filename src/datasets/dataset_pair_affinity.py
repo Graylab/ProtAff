@@ -93,96 +93,90 @@ class PairwiseAffinityDataset(Dataset):
             weight_col: Column to use for Grouping AND Balancing (e.g. 'cluster_id' or 'target_id').
             pairs_per_sample: Number of 'worse' samples to pair with each 'better' sample.
         """
-        # 1. Load Lookup
+        # Load Lookup
         lookup_df = pd.read_csv(lookup_csv_path)
         lookup_df['key'] = lookup_df['type'].astype(str) + "_" + lookup_df['id'].astype(str)
         self.id2seq = dict(zip(lookup_df['key'], lookup_df['seq']))
         
-        # 2. Prepare Base DF
+        # Prepare Base DF
         self.base_df = base_df.copy()
-        
-        if "is_binder" not in self.base_df.columns:
-            print("[Dataset] 'is_binder' missing. Inferring from log_Aff < 4.0...")
-            self.base_df["is_binder"] = np.where(self.base_df["log_Aff"] < 4.0, 1.0, 0.0)
 
-        # --- UPDATED LOGIC START ---
-        # Determine the primary grouping column (Stratify Key)
-        # If weight_col is provided (e.g. 'cluster_id'), use it. Otherwise default to 'target_id'.
+        # [Dataset] 1. Grouping
         if weight_col and weight_col in self.base_df.columns:
             self.stratify_col = weight_col
         else:
             self.stratify_col = "target_id"
         
-        print(f"[Dataset] Grouping and Balancing strategy based on: '{self.stratify_col}'")
-        # --- UPDATED LOGIC END ---
+        print(f"[Dataset] Grouping strategy: '{self.stratify_col}'")
 
-        # 3. Calculate Cluster Weights (for sampling)
+        # [Dataset] 2. Calculate Weights
         self.cluster_weights = {}
         if balance_clusters:
             print(f"[Dataset] Calculating balance weights...")
             counts = self.base_df[self.stratify_col].value_counts()
-            
-            # Inverse square root weighting to flatten the distribution
-            unique_weights = (1.0 / np.sqrt(counts)).to_dict() 
-            self.cluster_weights = unique_weights
+            self.cluster_weights = (1.0 / np.sqrt(counts)).to_dict()
 
-        # 4. Mine Pairs
-        self.pairs = [] # List of (row_better, row_worse, weight)
+        # [Dataset] 3. Universal Pair Mining (Optimized)
+        self.pairs = [] 
         self.weights = [] 
 
-        # Group by the stratify_col to ensure we don't cross-compare incompatible groups
         print(f"[Dataset] Mining pairs within groups of '{self.stratify_col}'...")
         groups = self.base_df.groupby(self.stratify_col)
 
         for g_name, group in groups:
-            binders = group[group["is_binder"] == 1]
-            decoys = group[group["is_binder"] == 0]
+            # 1. Sort Data (Best to Worst)
+            # We do this once per group.
+            valid_group = group.dropna(subset=["log_Aff"]).sort_values("log_Aff", ascending=True)
+            n_total = len(valid_group)
+            if n_total < 2: 
+                continue
 
-            # Get weight for this group
-            if g_name in self.cluster_weights:
-                cur_weight = self.cluster_weights[g_name]
-            else:
-                cur_weight = 1.0
+            cur_weight = self.cluster_weights.get(g_name, 1.0)
+            
+            # 2. Extract values for fast lookup
+            # This allows us to use fast Math instead of slow Pandas inside the loop
+            aff_values = valid_group["log_Aff"].values 
 
-            # Strategy A: Binder > Decoy
-            if len(decoys) > 0 and len(binders) > 0:
-                for idx, row_better in binders.iterrows():
-                    chosen_decoys = decoys.sample(n=min(len(decoys), pairs_per_sample), replace=True)
-                    for _, row_worse in chosen_decoys.iterrows():
+            # 3. Iterate Top 50% (Anchors) via integer index
+            n_anchors = max(1, n_total // 2)
+
+            for i in range(n_anchors):
+                better_val = aff_values[i]
+                threshold = better_val + margin_threshold
+                
+                # OPTIMIZATION: Binary Search
+                # Instead of scanning the whole dataframe, we jump to the index 
+                # where affinity becomes > threshold. Instant (O(log N)).
+                start_index = np.searchsorted(aff_values, threshold, side='right')
+                
+                # The valid "Losers" are everything from start_index to the end
+                n_candidates = n_total - start_index
+                
+                if n_candidates > 0:
+                    # Pick random indices directly from the valid range
+                    # This avoids creating intermediate DataFrames
+                    offsets = np.random.randint(start_index, n_total, size=min(n_candidates, pairs_per_sample))
+                    
+                    # Now retrieve the rows (Lazy loading)
+                    row_better = valid_group.iloc[i]
+                    
+                    for worse_idx in offsets:
+                        row_worse = valid_group.iloc[worse_idx]
                         self.pairs.append((row_better, row_worse))
                         self.weights.append(cur_weight)
-
-            # Strategy B: Strong Binder > Weak Binder
-            if len(binders) > 1:
-                # Sort descending (Higher log_Aff is better)
-                sorted_binders = binders.sort_values("log_Aff", ascending=False)
-                
-                n = len(sorted_binders)
-                top = sorted_binders.iloc[:n//2]
-                bot = sorted_binders.iloc[n//2:]
-
-                if len(bot) > 0:
-                    for idx, row_better in top.iterrows():
-                        candidates = bot[bot["log_Aff"] < (row_better["log_Aff"] - margin_threshold)]
-                        if len(candidates) > 0:
-                            chosen = candidates.sample(n=min(len(candidates), pairs_per_sample))
-                            for _, row_worse in chosen.iterrows():
-                                self.pairs.append((row_better, row_worse))
-                                self.weights.append(cur_weight)
-
+        
+        # [Dataset] 4. Final Stats
         print(f"[Dataset] Generated {len(self.pairs)} pairs.")
         
-        # Coverage Check
-        # If grouping by cluster_id, count unique cluster_ids in the pairs
-        kept_groups = len(set(p[0][self.stratify_col] for p in self.pairs)) 
+        kept_groups = len(set(p[0][self.stratify_col] for p in self.pairs))
         total_groups = len(self.base_df[self.stratify_col].unique())
         dropped = total_groups - kept_groups
         
         print(f"[Dataset] Coverage: {kept_groups}/{total_groups} groups used. ({dropped} dropped)")
         
         if len(self.pairs) == 0:
-            raise ValueError("CRITICAL: No valid pairs could be generated!")
-
+            raise ValueError("CRITICAL: No valid pairs generated! Check 'margin_threshold' or data variance.")
+        
     def __len__(self):
         return len(self.pairs)
 
