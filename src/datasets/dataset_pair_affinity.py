@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, List, Any, Tuple
 from omegaconf import DictConfig
 
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, random_split
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.nn.utils.rnn import pad_sequence
 from pytorch_lightning import LightningDataModule
 from transformers import EsmTokenizer
@@ -73,11 +73,17 @@ class PairwiseCollator:
         b_ids, b_mask = self._tokenize_batch(better_binders, better_targets)
         w_ids, w_mask = self._tokenize_batch(worse_binders, worse_targets)
 
+        # Stack the binary float labels (0.0 or 1.0) into a tensor of shape [Batch_Size]
+        better_labels = torch.stack([torch.tensor(x["better_label"], dtype=torch.float) for x in batch])
+        worse_labels = torch.stack([torch.tensor(x["worse_label"], dtype=torch.float) for x in batch])
+
         return {
             "better_input_ids": b_ids,
             "better_mask": b_mask,
             "worse_input_ids": w_ids,
-            "worse_mask": w_mask
+            "worse_mask": w_mask,
+            "better_labels": better_labels, 
+            "worse_labels": worse_labels
         }
 
 class PairwiseAffinityDataset(Dataset):
@@ -88,7 +94,7 @@ class PairwiseAffinityDataset(Dataset):
                  balance_clusters: bool = False,
                  pairs_per_sample: int = 3,
                  min_margin: float = 0.5,      # Lower Bound (Noise Filter)
-                 max_margin: Optional[float] = 4.0): # Upper Bound (Easy Filter)
+                 max_margin: Optional[float] = 6.0): # Upper Bound (Easy Filter)
         """
         Args:
             weight_col: Column to use for Grouping AND Balancing (e.g. 'cluster_id' or 'target_id').
@@ -115,7 +121,7 @@ class PairwiseAffinityDataset(Dataset):
         # [Dataset] 2. Calculate Weights
         self.cluster_weights = {}
         if balance_clusters:
-            print(f"[Dataset] Calculating balance weights...")
+            # print(f"[Dataset] Calculating balance weights...")
             counts = self.base_df[self.stratify_col].value_counts()
             self.cluster_weights = (1.0 / np.sqrt(counts)).to_dict()
 
@@ -125,13 +131,12 @@ class PairwiseAffinityDataset(Dataset):
         deltas = [] # For statistics
 
         print(f"[Dataset] Mining pairs within groups of '{self.stratify_col}'...")
-        print(f"[Dataset] Strategy: Band Mining ({min_margin} <= delta <= {max_margin if max_margin else 'Inf'})")
+        # print(f"[Dataset] Strategy: Band Mining ({min_margin} <= delta <= {max_margin if max_margin else 'Inf'})")
         
         groups = self.base_df.groupby(self.stratify_col)
 
         for g_name, group in groups:
             # 1. Sort Data (Best to Worst -> Ascending log_Aff)
-            # We do this once per group.
             valid_group = group.dropna(subset=["log_Aff"]).sort_values("log_Aff", ascending=True)
             n_total = len(valid_group)
             if n_total < 2: 
@@ -151,13 +156,10 @@ class PairwiseAffinityDataset(Dataset):
                 # --- NEW LOGIC: Band Search ---
                 
                 # A. Lower Bound (Noise Filter)
-                # Find first index where value >= better_val + min_margin
                 thresh_min = better_val + min_margin
                 start_index = np.searchsorted(aff_values, thresh_min, side='right')
                 
                 # B. Upper Bound (Trivial Filter)
-                # Find first index where value > better_val + max_margin
-                # We stop BEFORE this index.
                 if max_margin is not None:
                     thresh_max = better_val + max_margin
                     end_index = np.searchsorted(aff_values, thresh_max, side='left')
@@ -168,10 +170,8 @@ class PairwiseAffinityDataset(Dataset):
                 n_candidates = end_index - start_index
                 
                 if n_candidates > 0:
-                    # Pick random indices from the VALID SLICE
                     offsets = np.random.randint(start_index, end_index, size=min(n_candidates, pairs_per_sample))
                     
-                    # Retrieve the Anchor row once
                     row_better = valid_group.iloc[i]
                     
                     for worse_idx in offsets:
@@ -192,14 +192,8 @@ class PairwiseAffinityDataset(Dataset):
         
         print(f"[Dataset] Coverage: {kept_groups}/{total_groups} groups used. ({dropped} dropped)")
         
-        if len(deltas) > 0:
-            avg_d = np.mean(deltas)
-            min_d = np.min(deltas)
-            max_d = np.max(deltas)
-            print(f"[Dataset] Statistics: Avg Delta={avg_d:.4f} | Min={min_d:.4f} | Max={max_d:.4f}")
-        
         if len(self.pairs) == 0:
-            raise ValueError(f"CRITICAL: No valid pairs generated! Check min_margin={min_margin}, max_margin={max_margin}")
+            print(f"WARNING: No valid pairs generated for this split! Check min_margin={min_margin}")
 
     def __len__(self):
         return len(self.pairs)
@@ -219,6 +213,10 @@ class PairwiseAffinityDataset(Dataset):
             "better_target": self.id2seq.get(t_key_better, ""),
             "worse_binder": self.id2seq.get(b_key_worse, ""),
             "worse_target": self.id2seq.get(t_key_worse, ""),
+            
+            # --- Binary Labels for Classification ---
+            "better_label": float(row_better['is_binder']),
+            "worse_label": float(row_worse['is_binder'])
         }
     
     def get_weight(self, idx):
@@ -241,38 +239,62 @@ class PairAffinityDataModule(LightningDataModule):
         print(f"[DataModule] Loading base data from {self.cfg.data.base_csv}")
         base_df = pd.read_csv(self.cfg.data.base_csv)
         
-        # 1. Create Pairwise Dataset
-        full_dataset = PairwiseAffinityDataset(
-            base_df, 
-            self.cfg.data.lookup_csv, 
+        # --- 1. IDENTIFY SPLIT STRATEGY ---
+        # We want to split by 'weight_col' (e.g. cluster_id) to prevent leakage.
+        split_col = self.cfg.data.get("weight_col")
+        
+        if not split_col or split_col not in base_df.columns:
+            # Fallback if weight_col is not provided
+            split_col = "target_id"
+            print(f"[DataModule] 'weight_col' not valid. Splitting by '{split_col}'.")
+        else:
+            print(f"[DataModule] Stratified Split Strategy: Grouping by '{split_col}'.")
+
+        # --- 2. PERFORM GROUP SPLIT ---
+        # Get unique groups (e.g., list of clusters)
+        unique_groups = base_df[split_col].unique()
+        
+        # Shuffle groups for random splitting
+        rng = np.random.default_rng(self.cfg.training.seed)
+        rng.shuffle(unique_groups)
+        
+        n_total_groups = len(unique_groups)
+        n_val_groups = int(n_total_groups * 0.1) if n_total_groups >= 10 else 1
+        n_train_groups = n_total_groups - n_val_groups
+
+        # Assign groups to Train vs Val
+        val_groups = set(unique_groups[:n_val_groups])
+        train_groups = set(unique_groups[n_val_groups:])
+        
+        print(f"[DataModule] Splitting {n_total_groups} groups: {n_train_groups} Train Groups, {n_val_groups} Val Groups")
+
+        # Filter the DataFrame based on the groups
+        train_df = base_df[base_df[split_col].isin(train_groups)].copy()
+        val_df = base_df[base_df[split_col].isin(val_groups)].copy()
+
+        # --- 3. CREATE DATASETS ---
+        # Common arguments for both datasets
+        ds_kwargs = dict(
+            lookup_csv_path=self.cfg.data.lookup_csv, 
             weight_col=self.cfg.data.get("weight_col"), 
             balance_clusters=self.cfg.data.get("balance_clusters", False),
             pairs_per_sample=self.cfg.data.get("pairs_per_sample", 2),
-            min_margin=self.cfg.data.get("min_margin", 0.5), # From Config
-            max_margin=self.cfg.data.get("max_margin", 4.0)  # From Config
+            min_margin=self.cfg.data.get("min_margin", 0.5), 
+            max_margin=self.cfg.data.get("max_margin", 6.0)
         )
+
+        print(f"[DataModule] Building TRAIN dataset ({len(train_df)} rows)...")
+        self.train_dataset = PairwiseAffinityDataset(base_df=train_df, **ds_kwargs)
         
-        # 2. Random Split
-        total_len = len(full_dataset)
-        val_len = int(total_len * 0.1) if total_len >= 10 else 1
-        train_len = total_len - val_len
+        print(f"[DataModule] Building VAL dataset ({len(val_df)} rows)...")
+        self.val_dataset = PairwiseAffinityDataset(base_df=val_df, **ds_kwargs)
 
-        print(f"[DataModule] Performing Random Split on PAIRS: {train_len} Train, {val_len} Val")
-        self.train_dataset, self.val_dataset = random_split(
-            full_dataset, [train_len, val_len],
-            generator=torch.Generator().manual_seed(self.cfg.training.seed)
-        )
-
-        # 3. Setup Weighted Sampler
-        if len(full_dataset.weights) > 0:
+        # --- 4. SETUP SAMPLER (Train Only) ---
+        if len(self.train_dataset) > 0 and len(self.train_dataset.weights) > 0:
             print("[DataModule] Setting up WeightedRandomSampler for training...")
             
-            # Extract weights for the specific indices chosen by random_split
-            train_indices = self.train_dataset.indices
-            train_weights = torch.tensor(
-                [full_dataset.get_weight(i) for i in train_indices], 
-                dtype=torch.float
-            )
+            # Access weights directly from the dataset
+            train_weights = torch.tensor(self.train_dataset.weights, dtype=torch.float)
             
             self.sampler = WeightedRandomSampler(
                 weights=train_weights, 
@@ -311,10 +333,7 @@ if __name__ == '__main__':
     # 1. SETUP DUMMY DATA
     dummy_lookup_csv = "temp_lookup_test.csv"
     
-    # 3 Targets:
-    # T1: Strong (-9.0), Weak (-6.0), Decoy (0.0). Pairs: (-9 vs -6), (-9 vs 0), (-6 vs 0).
-    # T2: Too Close (-8.5 vs -8.2). Diff=0.3. Should be skipped if min_margin=0.5.
-    # T3: Decoy Only. Skipped.
+    # We create 3 Targets. 
     sequences = [
         {"type": "binder", "id": 101, "seq": "MAAA"}, 
         {"type": "binder", "id": 102, "seq": "MBBB"}, 
@@ -329,45 +348,43 @@ if __name__ == '__main__':
     pd.DataFrame(sequences).to_csv(dummy_lookup_csv, index=False)
 
     data = [
-        {"binder_id": 101, "target_id": 1, "log_Aff": -9.0},
-        {"binder_id": 102, "target_id": 1, "log_Aff": -6.0},
-        {"binder_id": 103, "target_id": 1, "log_Aff": 0.0},
-        {"binder_id": 201, "target_id": 2, "log_Aff": -8.5},
-        {"binder_id": 202, "target_id": 2, "log_Aff": -8.2},
-        {"binder_id": 301, "target_id": 3, "log_Aff": 0.0},
+        # T1 (Group C1)
+        {"binder_id": 101, "target_id": 1, "log_Aff": -9.0, "is_binder": 1.0, "cluster_id": "C1"},
+        {"binder_id": 102, "target_id": 1, "log_Aff": -6.0, "is_binder": 1.0, "cluster_id": "C1"},
+        {"binder_id": 103, "target_id": 1, "log_Aff": 5.0,  "is_binder": 0.0, "cluster_id": "C1"},
+        
+        # T2 (Group C2)
+        {"binder_id": 201, "target_id": 2, "log_Aff": -8.5, "is_binder": 1.0, "cluster_id": "C2"},
+        {"binder_id": 202, "target_id": 2, "log_Aff": -8.2, "is_binder": 1.0, "cluster_id": "C2"},
+        
+        # T3 (Group C3)
+        {"binder_id": 301, "target_id": 3, "log_Aff": 5.0,  "is_binder": 0.0, "cluster_id": "C3"}, 
     ]
     df = pd.DataFrame(data)
 
     try:
-        # 3. INITIALIZE DATASET (With Upper Bound Test)
-        print("\n> Initializing Dataset...")
+        # 3. VERIFY DATASET LOGIC DIRECTLY
+        print("\n> Initializing Single Dataset for Logic Check...")
         ds = PairwiseAffinityDataset(
             base_df=df,
             lookup_csv_path=dummy_lookup_csv,
             balance_clusters=True,
+            weight_col="cluster_id", # Test Using Cluster ID
             pairs_per_sample=3,
             min_margin=0.5, 
-            max_margin=5.0 # Should allow (-9 vs -6, diff=3) but skip (-9 vs 0, diff=9)
+            max_margin=5.0 
         )
 
-        # 4. VERIFY LOGIC
         print(f"> Dataset Length: {len(ds)} pairs")
-        
-        # Expected:
-        # T1: (-9 vs -6) [Diff 3.0, OK]
-        # T1: (-9 vs 0)  [Diff 9.0, > Max, SKIP]
-        # T1: (-6 vs 0)  [Diff 6.0, > Max, SKIP]
-        # T2: (-8.5 vs -8.2) [Diff 0.3, < Min, SKIP]
-        
-        # So we expect roughly 1 or 2 pairs depending on exact boundaries.
         
         if len(ds) == 0:
             print("❌ FAILURE: Dataset is empty.")
         else:
             print("✅ SUCCESS: Pairs generated.")
             print(f"  Sample 0: {ds[0]['better_binder']} > {ds[0]['worse_binder']}")
+            print(f"  Sample 0 Labels: Better={ds[0]['better_label']}, Worse={ds[0]['worse_label']}")
 
-        # 5. TEST COLLATOR
+        # 4. TEST COLLATOR
         print("\n> Testing Collator...")
         class MockTokenizer:
             cls_token_id, pad_token_id, eos_token_id = 0, 1, 2
@@ -381,6 +398,9 @@ if __name__ == '__main__':
         
         if batch['better_input_ids'].shape[0] == len(batch['better_input_ids']):
              print("✅ SUCCESS: Batch dimensions correct.")
+        
+        if 'better_labels' in batch:
+             print(f"✅ SUCCESS: Collator returned labels. Shape: {batch['better_labels'].shape}")
 
     except Exception as e:
         print(f"\n❌ CRITICAL ERROR: {e}")

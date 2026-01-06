@@ -48,9 +48,6 @@ class InferenceDataset(Dataset):
         }
 
 class InferenceCollator:
-    """
-    Handles: [CLS] Binder [EOS] Target [EOS]
-    """
     def __init__(self, tokenizer, max_length=1024):
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -110,30 +107,20 @@ def main(cfg: DictConfig):
 
     input_path = Path(cfg.input_csv)
     
-    # --- AUTO-TAG LOGIC (IMPROVED) ---
+    # --- AUTO-TAG LOGIC ---
     if cfg.get("tag"):
         exp_tag = cfg.tag
     else:
-        # Start with the full model path
         path_obj = Path(cfg.model_path)
-        
-        # 1. If pointing to a file (e.g. adapter_model.bin), go to folder
         if path_obj.is_file():
             path_obj = path_obj.parent
 
-        # 2. If the folder name is generic, keep going up until we find a unique ID
-        # Common generic folders in Hydra/HF outputs
         generic_names = ["saved_model", "checkpoints", "best_model", "last_model"]
         
         while path_obj.name in generic_names or path_obj.name.startswith("checkpoint-"):
             path_obj = path_obj.parent
             
-        # 3. Optional: If the structure is Hydra-style (Date/Time), combine them?
-        # Current path_obj is now ".../02-20-21"
-        # If the parent is a date like "2025-12-29", we can make the tag "2025-12-29_02-20-21"
-        # This reduces collision risk if you run experiments on different days.
         parent_name = path_obj.parent.name
-        # Simple regex-free check: does parent look like a date (202X-XX-XX)?
         if len(parent_name) == 10 and parent_name.count("-") == 2 and parent_name[0] == '2':
              exp_tag = f"{parent_name}_{path_obj.name}"
         else:
@@ -141,21 +128,31 @@ def main(cfg: DictConfig):
             
     print(f"[System] Experiment Tag Inferred: {exp_tag}")
 
-    # --- OUTPUT PATH LOGIC ---
+    # --- OUTPUT PATH LOGIC (DATASET -> VERSION) ---
     if cfg.get("base_results_dir"):
-        save_dir = Path(cfg.base_results_dir) / exp_tag / input_path.stem
+        result_root = Path(cfg.base_results_dir) / exp_tag
     else:
-        save_dir = Path("outputs/inference") / exp_tag / input_path.stem
+        # e.g. outputs/inference/2025-12-29_02-20-21
+        result_root = Path("outputs/inference") / exp_tag
         
+    base_folder_name = input_path.stem # e.g. "test_binder"
+    dataset_dir = result_root / base_folder_name
+    
+    # Find next available 'vX' folder, starting from v0
+    # Path: .../2025-12-29.../test_binder/v0/predictions.csv
+    counter = 0
+    while True:
+        save_dir = dataset_dir / f"v{counter}"
+        
+        if not save_dir.exists():
+            break
+        counter += 1
+            
     save_dir.mkdir(parents=True, exist_ok=True)
     output_path = save_dir / cfg.get("output_filename", "predictions.csv")
     
-    # Check if output already exists to prevent silent overwrite
-    if output_path.exists():
-        print(f"[WARNING] Output file already exists: {output_path}")
-        print("Appending '_new' to filename to preserve old results.")
-        output_path = save_dir / f"{output_path.stem}_new{output_path.suffix}"
-    # ------------------------------------
+    print(f"[System] Output Directory: {save_dir}")
+    # ---------------------------------------------
 
     print(f"[Model] Base Architecture: {cfg.model.name}")
     print(f"[Model] Loading Weights: {cfg.model_path}")
@@ -215,6 +212,6 @@ def main(cfg: DictConfig):
     
     df.to_csv(output_path, index=False)
     print(f"[SUCCESS] Saved results to: {output_path}")
-    
+
 if __name__ == "__main__":
     main()

@@ -44,6 +44,10 @@ class PairAffinityModule(pl.LightningModule):
         # We default margin to 0.1 if not specified
         self.margin = getattr(cfg.training, "margin", 0.1)
         self.rank_loss = nn.MarginRankingLoss(margin=self.margin)
+
+        # Used to anchor scores: "Binders" -> 1.0, "Non-Binders" -> 0.0
+        self.cls_loss = nn.BCEWithLogitsLoss()
+        self.cls_weight = getattr(cfg.training, "cls_weight", 0.5)
         
         # 4. Transfer Learning
         ckpt_path = cfg.get("pretrained_ckpt_path", None) 
@@ -61,49 +65,68 @@ class PairAffinityModule(pl.LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        # The collator provides two sets of inputs: "better" and "worse"
-        
         # 1. Forward Pass A (Better Samples)
         scores_better = self(
             input_ids=batch['better_input_ids'], 
             attention_mask=batch['better_mask']
         )
         
-        # 2. Forward Pass B (Worse Samples)
-        # Shared weights (Siamese Network)
         scores_worse = self(
             input_ids=batch['worse_input_ids'], 
             attention_mask=batch['worse_mask']
         )
         
-        # 3. Compute Loss
-        # Target is always 1.0 because Dataset guarantees Input A > Input B
-        target = torch.ones_like(scores_better)
-        
-        # Loss = max(0, -1 * (better - worse) + margin)
-        #      = max(0, margin - (better - worse))
-        loss = self.rank_loss(scores_better, scores_worse, target)
+        # A. Ranking Loss (Existing)
+        target_rank = torch.ones_like(scores_better)
+        loss_rank = self.rank_loss(scores_better, scores_worse, target_rank)
 
-        # 4. Log
-        # We can also track accuracy: how often was better > worse?
+        # B. Classification Loss (New)
+        loss_cls_better = self.cls_loss(scores_better.view(-1), batch['better_labels'])
+        loss_cls_worse = self.cls_loss(scores_worse.view(-1), batch['worse_labels'])
+        loss_cls = (loss_cls_better + loss_cls_worse) / 2.0
+        
+        # C. Total Loss
+        loss = loss_rank + (self.cls_weight * loss_cls)
+
+        # --- LOGGING UPDATES ---
         accuracy = (scores_better > scores_worse).float().mean()
         
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log('train_acc', accuracy, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train_loss_rank', loss_rank, on_epoch=True) # Monitor Rank split
+        self.log('train_loss_cls', loss_cls, on_epoch=True)   # Monitor Cls split
+        self.log('train_acc', accuracy, on_epoch=True, prog_bar=True)
         
         return loss
 
     def validation_step(self, batch, batch_idx):
-        # Same logic as training
-        scores_better = self(batch['better_input_ids'], batch['better_mask'])
-        scores_worse = self(batch['worse_input_ids'], batch['worse_mask'])
+        # 1. Forward Pass
+        scores_better = self(
+            input_ids=batch['better_input_ids'], 
+            attention_mask=batch['better_mask']
+        )
+        scores_worse = self(
+            input_ids=batch['worse_input_ids'], 
+            attention_mask=batch['worse_mask']
+        )
         
-        target = torch.ones_like(scores_better)
-        loss = self.rank_loss(scores_better, scores_worse, target)
+        # A. Ranking Loss
+        target_rank = torch.ones_like(scores_better)
+        loss_rank = self.rank_loss(scores_better, scores_worse, target_rank)
         
+        # B. Classification Loss
+        loss_cls_better = self.cls_loss(scores_better.view(-1), batch['better_labels'])
+        loss_cls_worse = self.cls_loss(scores_worse.view(-1), batch['worse_labels'])
+        loss_cls = (loss_cls_better + loss_cls_worse) / 2.0
+        
+        # C. Total Loss
+        loss = loss_rank + (self.cls_weight * loss_cls)
+        
+        # --- LOGGING UPDATES ---
         accuracy = (scores_better > scores_worse).float().mean()
         
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('val_loss_rank', loss_rank, on_epoch=True, sync_dist=True) # Monitor Rank split
+        self.log('val_loss_cls', loss_cls, on_epoch=True, sync_dist=True)   # Monitor Cls split
         self.log('val_acc', accuracy, on_epoch=True, prog_bar=True, sync_dist=True)
         
         return loss

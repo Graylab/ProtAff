@@ -26,8 +26,12 @@ training:
 
   # Optimizer
   learning_rate: 1e-4  
-  weight_decay: 1e-4
+  weight_decay: 1e-2
   warmup_ratio: 0.1
+
+  # Early Stopping
+  early_stopping: true
+  patience: 3
 
   # Hardware
   accelerator: "auto"
@@ -38,6 +42,7 @@ training:
   # Stability
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
+  val_check_interval: 0.25    # Validate every half epoch
 
   wandb:
     project: "dms-pretrain"

@@ -22,7 +22,7 @@ data:
   # Pair Mining Strategy
   pairs_per_sample: 2        # How many 'worse' examples to pair with every 'better' one
   min_margin: 0.5      # Min log_Aff diff required to create a pair (ensures clear separation)
-  max_margin: 4.0
+  max_margin: 8.0
   
   # Sampling
   balance_clusters: false     # Recommended: Upsample rare targets/clusters
@@ -39,6 +39,7 @@ training:
 
   # Loss Function
   margin: 0.1                # Margin for MarginRankingLoss (diff between scores must be > this)
+  cls_weight: 0.0
 
   # Optimizer
   learning_rate: 5e-5        # Slightly lower LR is often better for ranking fine-tuning
@@ -52,7 +53,7 @@ training:
   # Hardware
   accelerator: "auto"
   devices: "auto"
-  strategy: "auto"
+  strategy: "ddp_find_unused_parameters_true"
   precision: "bf16-mixed"
 
   # Stability
