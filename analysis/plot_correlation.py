@@ -7,13 +7,12 @@ import sys
 import argparse
 
 # ================= CONFIGURATION (DEFAULTS) =================
-# These act as defaults if not provided via arguments
 DEFAULT_STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv" 
-DEFAULT_GT_CSV = "data/test/test_adaptyv.csv"                            
+DEFAULT_GT_CSV = "data/test/test_adaptyv.csv"                       
 
 STRUCT_METRICS = ['ipSAE', 'ipTM_af', 'pDockQ', 'pDockQ2', 'LIS']
 AGG_METHODS = ['max', 'min', 'mean', 'median']
-# =================================================
+# ============================================================
 
 def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
     print(f"\n[Analysis] Predictions: {pred_csv}")
@@ -32,12 +31,12 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
         print(f"[Error] File not found: {e}")
         return
 
-    # Cleanup IDs
+    # Cleanup IDs (Standardize to string and strip whitespace)
     struct_df['id'] = struct_df['id'].astype(str).str.strip()
     gt_df['id'] = gt_df['id'].astype(str).str.strip()
     aff_pred_df['id'] = aff_pred_df['id'].astype(str).str.strip()
 
-    # Aggregation
+    # Aggregation of Structural Metrics
     print(f"Aggregating {len(struct_df)} structural models...")
     # Filter only metrics that exist in the dataframe
     available_metrics = [m for m in STRUCT_METRICS if m in struct_df.columns]
@@ -46,11 +45,13 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
     grouped_df.columns = ['_'.join(col).strip() for col in grouped_df.columns.values]
     grouped_df = grouped_df.reset_index()
 
-    # Merging
+    # Merging Dataframes
     merged_df = pd.merge(grouped_df, gt_df[['id', 'log_Aff']], on='id', how='inner')
     merged_df = pd.merge(merged_df, aff_pred_df[['id', 'predicted_affinity']], on='id', how='inner')
 
     # --- TRANSFORMATION (Higher = Stronger) ---
+    # We negate values so that higher scores indicate stronger binding, 
+    # aligning with typical structural metrics like pDockQ.
     merged_df['neg_log_Aff'] = -1 * merged_df['log_Aff']
     merged_df['neg_predicted_affinity'] = -1 * merged_df['predicted_affinity']
 
@@ -63,7 +64,7 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
 
     all_stats = []
 
-    # Loop Aggregations
+    # Loop through Aggregations
     for agg in AGG_METHODS:
         print(f"\n--- Processing Aggregation: {agg.upper()} ---")
         
@@ -71,13 +72,15 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
         fig, axes = plt.subplots(2, 3, figsize=(22, 16))
         axes = axes.flatten()
         
-        # Define columns to plot
+        # Define columns to plot for this specific aggregation
         plot_targets = []
         for m in available_metrics:
             plot_targets.append((f"{m}_{agg}", f"{m} ({agg})"))
+        
+        # Always include Predicted Affinity for comparison
         plot_targets.append(('neg_predicted_affinity', 'Predicted Affinity'))
 
-        # Limit to available axes
+        # Plotting Loop
         for i, (col_name, label) in enumerate(plot_targets):
             if i >= len(axes): break
             ax = axes[i]
@@ -92,6 +95,9 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
             pearson_r, p_val = stats.pearsonr(x, y)
             spearman_rho, s_p_val = stats.spearmanr(x, y)
 
+            # Store stats for Summary CSV
+            # Note: Predicted Affinity will be added multiple times here, 
+            # but we deduplicate before the bar plot.
             all_stats.append({
                 'Aggregation': agg,
                 'Metric': label,
@@ -101,7 +107,7 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
                 'N': len(x)
             })
 
-            # Plot
+            # Scatter Plot
             sns.regplot(
                 data=merged_df, 
                 x=col_name, 
@@ -112,10 +118,13 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
             )
 
             # --- ANNOTATION BOX ---
+            # Box color changes based on correlation direction
             box_color = '#e6fffa' if pearson_r > 0 else '#ffe6e6'
+            
+            # [FIX]: Unified precision to .3f to match Barplot
             stats_text = (
-                f"Pearson R = {pearson_r:.2f}\n"
-                f"Spearman $\\rho$ = {spearman_rho:.2f}\n"
+                f"Pearson R = {pearson_r:.3f}\n"
+                f"Spearman $\\rho$ = {spearman_rho:.3f}\n"
                 f"P-value = {p_val:.1e}"
             )
 
@@ -137,7 +146,7 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
             
             ax.grid(True, linestyle='--', alpha=0.5)
 
-        # Output
+        # Save Scatter Plot Figure
         out_img_path = os.path.join(output_dir, f"correlation_{agg}_final.png")
         fig.suptitle(f"Binder Selection Metrics ({agg.upper()} aggregation) | N={n_samples}", fontsize=26, fontweight='bold', y=0.99)
         
@@ -146,7 +155,7 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
         print(f"Saved plot: {out_img_path}")
         plt.close(fig)
 
-    # 5. Save Summary
+    # 5. Save Summary and Generate Bar Plot
     save_summary(all_stats, output_dir)
 
 def save_summary(all_stats, output_dir):
@@ -158,6 +167,7 @@ def save_summary(all_stats, output_dir):
     print("Generating Spearman ranking plot...")
     
     # 1. Deduplicate
+    # Since 'Predicted Affinity' was calculated in every loop iteration, we remove duplicates here.
     plot_df = stats_df.drop_duplicates(subset=['Metric', 'Spearman_Rho']).copy()
     
     # 2. Sort High to Low
@@ -176,9 +186,10 @@ def save_summary(all_stats, output_dir):
         edgecolor="0.2"
     )
     
-    # 5. Add Value Labels to Bars
+    # 5. Add Value Labels to Bars (Using .3f)
     for p in ax.patches:
         width = p.get_width()
+        # Determine label position based on bar direction (positive/negative)
         if width >= 0:
             ha = 'left'; x_offset = 0.02
         else:
@@ -187,12 +198,12 @@ def save_summary(all_stats, output_dir):
         ax.text(
             width + x_offset,
             p.get_y() + p.get_height() / 2,
-            f'{width:.3f}',
+            f'{width:.3f}', # [FIX]: Matches the precision in scatter plots
             ha=ha, va='center',
             fontsize=12, fontweight='bold', color='#333333'
         )
 
-    # 6. Highlight "Predicted Affinity"
+    # 6. Highlight "Predicted Affinity" in Y-axis labels
     for tick_label in ax.get_yticklabels():
         if "Predicted Affinity" in tick_label.get_text():
             tick_label.set_fontweight('bold')
@@ -200,7 +211,7 @@ def save_summary(all_stats, output_dir):
         else:
             tick_label.set_fontweight('normal')
 
-    # 7. Adjust X-Axis
+    # 7. Adjust X-Axis Limits for clarity
     data_min = plot_df['Spearman_Rho'].min()
     data_max = plot_df['Spearman_Rho'].max()
     lower_bound = min(0, data_min); upper_bound = max(0, data_max)
@@ -224,7 +235,7 @@ def save_summary(all_stats, output_dir):
     print("\n" + "="*50)
     print("RANKING: MOST IMPORTANT METRICS")
     print("="*50)
-    ranked = stats_df.sort_values(by="Spearman_Rho", ascending=False)
+    ranked = stats_df.drop_duplicates(subset=['Metric', 'Spearman_Rho']).sort_values(by="Spearman_Rho", ascending=False)
     print(ranked[['Aggregation', 'Metric', 'Spearman_Rho', 'P_Value']].head(10).to_string(index=False))
 
 def setup_plotting():
@@ -232,7 +243,7 @@ def setup_plotting():
     sns.set_theme(style="whitegrid")
     plt.rcParams.update({
         'font.family': 'sans-serif',
-        'font.size': 16,               
+        'font.size': 16,                
         'axes.titlesize': 22,         
         'axes.labelsize': 18,         
         'xtick.labelsize': 16,
@@ -251,7 +262,7 @@ if __name__ == "__main__":
     
     target_path = args.path
     
-    # Auto-infer logic
+    # Auto-infer file path if directory is provided
     if os.path.isdir(target_path):
         potential_file = os.path.join(target_path, "predictions.csv")
         if os.path.exists(potential_file):

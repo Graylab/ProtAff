@@ -2,11 +2,12 @@ import os
 import torch
 import numpy as np
 import pandas as pd
+import random
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 from omegaconf import DictConfig
 
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, random_split
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.nn.utils.rnn import pad_sequence
 from pytorch_lightning import LightningDataModule
 from transformers import EsmTokenizer
@@ -44,6 +45,7 @@ class ConcatCollator:
             
             if current_len > allowed_len:
                 excess = current_len - allowed_len
+                # Priority: Keep Binder intact, truncate Target
                 if len(t_ids) > excess:
                     t_ids = t_ids[:-excess]
                 else:
@@ -60,8 +62,8 @@ class ConcatCollator:
         batch_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id)
         batch_mask = pad_sequence(attention_mask_list, batch_first=True, padding_value=0)
 
-        # 5. Process Labels (Regression Only)
-        assert not any(np.isnan(f["log_Aff"]) for f in features), "Found unexpected NaN in data!"
+        # 5. Process Labels
+        # Labels are already normalized in the Dataset __getitem__
         reg_labels = [f["log_Aff"] for f in features]
 
         return {
@@ -71,55 +73,76 @@ class ConcatCollator:
         }
 
 class AffinityDataset(Dataset):
-    def __init__(self, base_df: pd.DataFrame, lookup_csv_path: str, weight_col: Optional[str] = None, balance_clusters: bool = False):
-        # 1. Load Lookup
+    def __init__(self, 
+                 base_df: pd.DataFrame, 
+                 lookup_csv_path: str, 
+                 weight_col: Optional[str] = None, 
+                 balance_clusters: bool = False,
+                 provided_stats: Optional[Tuple[float, float]] = None):
+        """
+        Args:
+            provided_stats: (mean, std) tuple. 
+                            If provided (Validation set), use these for normalization.
+                            If None (Training set), calculate from data.
+        """
+        
+        # 1. Load Lookup Table
         lookup_df = pd.read_csv(lookup_csv_path)
         lookup_df['key'] = lookup_df['type'].astype(str) + "_" + lookup_df['id'].astype(str)
         self.id2seq = dict(zip(lookup_df['key'], lookup_df['seq']))
         
-        # 2. Map IDs
+        # 2. Map IDs (DataFrame should already be filtered by DataModule)
         self.base_df = base_df.copy()
         self.base_df["binder_key"] = "binder_" + self.base_df["binder_id"].astype(str)
         self.base_df["target_key"] = "target_" + self.base_df["target_id"].astype(str)
         
-        # REMOVED: Backward Compatibility for 'is_binder'
-        # We now assume we strictly want to train on regression (log_Aff)
-
-        # -----------------------------------------------------------
-        # 3. Balancing Logic
-        # -----------------------------------------------------------
+        # 3. Balancing Logic (Optional)
         self.weights = None
         if balance_clusters:
-            # Prioritize 'cluster_id' if available
-            if "cluster_id" in self.base_df.columns:
-                stratify_col = "cluster_id"
+            if weight_col and weight_col in self.base_df.columns:
+                stratify_col = weight_col
             else:
-                stratify_col = weight_col if weight_col and weight_col in self.base_df.columns else "target_id"
+                stratify_col = "target_id"
             
-            print(f"[Dataset] Balancing training data based on: {stratify_col} (Dampened)")
-            
+            # Dampened weighting (inverse square root of frequency)
             counts = self.base_df[stratify_col].value_counts()
             freqs = self.base_df[stratify_col].map(counts)
-            
-            # Dampened Weighting (Square Root)
             self.weights = (1.0 / np.sqrt(freqs)).to_numpy(dtype=np.float32)
             
         elif weight_col and weight_col in self.base_df.columns:
             self.weights = pd.to_numeric(self.base_df[weight_col], errors='coerce').fillna(1.0).to_numpy(dtype=np.float32)
 
-        # 4. Convert Data to Dict
-        # REMOVED: "is_binder" from selection
+        # Convert to dictionary for faster access
         self.data = self.base_df[["binder_key", "target_key", "log_Aff"]].to_dict('records')
+
+        # -----------------------------------------------------------
+        # 4. Z-Score Statistics (Leakage Prevention)
+        # -----------------------------------------------------------
+        if provided_stats:
+            # Validation/Test set: Must use Training set statistics
+            self.mean, self.std = provided_stats
+            print(f"[Dataset] Using PROVIDED stats. Mean: {self.mean:.4f}, Std: {self.std:.4f}")
+        else:
+            # Training set: Calculate internal statistics
+            all_labels = self.base_df["log_Aff"].values
+            self.mean = float(np.mean(all_labels))
+            self.std = float(np.std(all_labels))
+            print(f"[Dataset] Calculated internal stats. Mean: {self.mean:.4f}, Std: {self.std:.4f}")
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         row = self.data[idx]
+        
+        raw_aff = float(row["log_Aff"])
+        # Apply Z-Score Normalization
+        norm_aff = (raw_aff - self.mean) / (self.std + 1e-8)
+
         return {
             "binder_seq": self.id2seq.get(row["binder_key"], ""),
             "target_seq": self.id2seq.get(row["target_key"], ""),
-            "log_Aff": float(row["log_Aff"]),   
+            "log_Aff": norm_aff,     
         }
     
     def get_weight(self, idx):
@@ -131,7 +154,6 @@ class AffinityDataModule(LightningDataModule):
         self.cfg = cfg
         self.tokenizer = EsmTokenizer.from_pretrained(cfg.model.name)
         self.num_workers = cfg.data.num_workers if cfg.data.num_workers is not None else os.cpu_count()
-        
         self.collate_fn = ConcatCollator(tokenizer=self.tokenizer, max_length=self.cfg.model.max_length)
         
         self.train_dataset = None
@@ -142,42 +164,62 @@ class AffinityDataModule(LightningDataModule):
         print(f"[DataModule] Loading base data from {self.cfg.data.base_csv}")
         base_df = pd.read_csv(self.cfg.data.base_csv)
         
-        # 1. Create ONE Full Dataset
-        full_dataset = AffinityDataset(
-            base_df, 
+        # -----------------------------------------------------------
+        # CRITICAL CHANGE: TARGET-BASED SPLIT (Unseen Targets)
+        # -----------------------------------------------------------
+        # 1. Identify Unique Targets
+        all_targets = base_df["target_id"].unique()
+        print(f"[DataModule] Found {len(all_targets)} unique targets.")
+
+        # 2. Shuffle and Split Targets (NOT rows)
+        # Ensures validation targets are completely unseen during training
+        rng = np.random.default_rng(self.cfg.training.seed)
+        rng.shuffle(all_targets)
+        
+        # 90% Train / 10% Validation split
+        split_idx = int(len(all_targets) * 0.9)
+        train_targets = set(all_targets[:split_idx])
+        val_targets = set(all_targets[split_idx:])
+        
+        print(f"[DataModule] Split: {len(train_targets)} Train Targets, {len(val_targets)} Validation Targets (UNSEEN).")
+        
+        # 3. Filter DataFrames based on Target Split
+        train_df = base_df[base_df["target_id"].isin(train_targets)].copy()
+        val_df = base_df[base_df["target_id"].isin(val_targets)].copy()
+        
+        print(f"[DataModule] Rows: {len(train_df)} Train, {len(val_df)} Val")
+
+        # -----------------------------------------------------------
+        # 4. Create Datasets (Pass Train Stats to Val)
+        # -----------------------------------------------------------
+        # Train Dataset (Calculates its own mean/std)
+        self.train_dataset = AffinityDataset(
+            train_df, 
             self.cfg.data.lookup_csv, 
             weight_col=self.cfg.data.get("weight_col"), 
-            balance_clusters=self.cfg.data.get("balance_clusters", False)
+            balance_clusters=self.cfg.data.get("balance_clusters", False),
+            provided_stats=None 
         )
         
-        # -----------------------------------------------------------
-        # 2. RANDOM SPLIT
-        # -----------------------------------------------------------
-        total_len = len(full_dataset)
-        val_len = int(total_len * 0.1) if total_len >= 10 else 1
-        train_len = total_len - val_len
-
-        print(f"[DataModule] Performing Random Split: {train_len} Train, {val_len} Val")
-        self.train_dataset, self.val_dataset = random_split(
-            full_dataset, [train_len, val_len],
-            generator=torch.Generator().manual_seed(self.cfg.training.seed)
+        # Extract stats from Train to ensure consistency
+        train_stats = (self.train_dataset.mean, self.train_dataset.std)
+        
+        # Val Dataset (Uses Train stats)
+        self.val_dataset = AffinityDataset(
+            val_df, 
+            self.cfg.data.lookup_csv, 
+            balance_clusters=False, 
+            provided_stats=train_stats
         )
 
         # -----------------------------------------------------------
-        # 3. SETUP SAMPLER
+        # 5. Setup Sampler (For Train only)
         # -----------------------------------------------------------
-        if full_dataset.weights is not None:
+        if self.train_dataset.weights is not None:
             print("[DataModule] Setting up WeightedRandomSampler for training...")
-            
-            # Since self.train_dataset is a Subset, we need to map indices back to the full dataset
-            train_weights = torch.tensor(
-                [full_dataset.get_weight(i) for i in self.train_dataset.indices], 
-                dtype=torch.float
-            )
-            
             self.sampler = WeightedRandomSampler(
-                weights=train_weights, 
-                num_samples=len(train_weights), 
+                weights=self.train_dataset.weights, 
+                num_samples=len(self.train_dataset), 
                 replacement=True
             )
 
@@ -188,7 +230,7 @@ class AffinityDataModule(LightningDataModule):
             collate_fn=self.collate_fn, 
             num_workers=self.num_workers, 
             sampler=self.sampler, 
-            shuffle=(self.sampler is None), 
+            shuffle=(self.sampler is None), # Shuffle only if no sampler is used
             pin_memory=True
         )
 
@@ -198,5 +240,6 @@ class AffinityDataModule(LightningDataModule):
             batch_size=self.cfg.training.batch_size, 
             collate_fn=self.collate_fn, 
             num_workers=self.num_workers, 
+            shuffle=False, # Validation set should not be shuffled
             pin_memory=True
         )
