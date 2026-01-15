@@ -16,7 +16,7 @@ class DMSModule(pl.LightningModule):
         self.base_model = build_model(cfg)
         
         # 2. Setup PEFT (LoRA)
-        # We focus on the Concat/Unified modules: Projector + Head (Score only)
+        # We focus on the modules: Projector + Head (Score only)
         custom_modules = ["projector", "norm_input", "head_score"]
         
         # Combine with config-defined modules
@@ -39,33 +39,42 @@ class DMSModule(pl.LightningModule):
         self.model = get_peft_model(self.base_model, peft_config)
         
         # 3. Loss Functions
+        # Pure Regression: Measures how close the predicted stability score is to the DMS truth
         self.mse_loss = nn.MSELoss()
     
-    def forward(self, batch):
-        # UPDATED: Use the unified input stream from DMSCollator
-        # The collator now provides [CLS] Mutant [EOS] Wildtype [EOS] in 'input_ids'
+    def forward(self, input_ids, attention_mask):
+        """
+        Standard forward pass. 
+        Matches Phase 2 signature for easy transfer.
+        """
         return self.model(
-            input_ids=batch['input_ids'], 
-            attention_mask=batch['attention_mask']
+            input_ids=input_ids, 
+            attention_mask=attention_mask
         ) 
 
     def training_step(self, batch, batch_idx):
         # 1. Forward
-        pred_reg = self(batch)
+        pred_reg = self(
+            input_ids=batch['input_ids'], 
+            attention_mask=batch['attention_mask']
+        )
         
         # 2. Unpack Labels
-        reg_labels = batch['reg_labels']
+        reg_labels = batch['reg_labels'] # Shape: [Batch, 1]
         
-        # 3. Compute Losses
+        # 3. Compute Loss (MSE)
         loss = self.mse_loss(pred_reg, reg_labels)
         
-        # 5. Log
+        # 4. Log
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         
         return loss
 
     def validation_step(self, batch, batch_idx):
-        pred_reg = self(batch)
+        pred_reg = self(
+            input_ids=batch['input_ids'], 
+            attention_mask=batch['attention_mask']
+        )
         
         reg_labels = batch['reg_labels']
         

@@ -4,7 +4,7 @@ arch: "concat"
 max_length: 2048
 
 # Decoder Parameters (Simple/Standard)
-d_model: 128
+d_model: 256
 dropout: 0.1
 
 # LoRA

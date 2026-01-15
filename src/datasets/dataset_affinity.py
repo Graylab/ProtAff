@@ -156,67 +156,72 @@ class AffinityDataModule(LightningDataModule):
         self.num_workers = cfg.data.num_workers if cfg.data.num_workers is not None else os.cpu_count()
         self.collate_fn = ConcatCollator(tokenizer=self.tokenizer, max_length=self.cfg.model.max_length)
         
+        # Primary control: use weight_col if provided, else fallback to target_id
+        self.weight_col = self.cfg.data.get("weight_col")
+        self.split_col = self.weight_col if self.weight_col is not None else "target_id"
+        
         self.train_dataset = None
         self.val_dataset = None
         self.sampler = None
 
     def setup(self, stage: Optional[str] = None):
-        print(f"[DataModule] Loading base data from {self.cfg.data.base_csv}")
+        print(f"[DataModule] Loading data from {self.cfg.data.base_csv}")
         base_df = pd.read_csv(self.cfg.data.base_csv)
         
-        # -----------------------------------------------------------
-        # CRITICAL CHANGE: TARGET-BASED SPLIT (Unseen Targets)
-        # -----------------------------------------------------------
-        # 1. Identify Unique Targets
-        all_targets = base_df["target_id"].unique()
-        print(f"[DataModule] Found {len(all_targets)} unique targets.")
+        if self.split_col not in base_df.columns:
+            raise KeyError(f"Split column '{self.split_col}' not found in CSV.")
 
-        # 2. Shuffle and Split Targets (NOT rows)
-        # Ensures validation targets are completely unseen during training
+        # 1. Count samples per group (ID or Cluster)
+        group_counts = base_df[self.split_col].value_counts()
+        
+        # 2. Define "Rich" vs "Poor" groups for stable validation
+        MIN_SAMPLES_FOR_VAL = self.cfg.training.get("min_samples_val", 10)
+        rich_groups = group_counts[group_counts >= MIN_SAMPLES_FOR_VAL].index.tolist()
+        poor_groups = group_counts[group_counts < MIN_SAMPLES_FOR_VAL].index.tolist()
+        
+        print(f"[DataModule] Splitting by: {self.split_col}")
+        print(f" -> Rich Groups: {len(rich_groups)}, Poor Groups: {len(poor_groups)}")
+        
+        # 3. Cluster-based Split (Novel Target Simulation)
         rng = np.random.default_rng(self.cfg.training.seed)
-        rng.shuffle(all_targets)
+        rng.shuffle(rich_groups)
         
-        # 90% Train / 10% Validation split
-        split_idx = int(len(all_targets) * 0.9)
-        train_targets = set(all_targets[:split_idx])
-        val_targets = set(all_targets[split_idx:])
+        split_idx = int(len(rich_groups) * self.cfg.training.get("train_val_split", 0.9))
+        if split_idx == len(rich_groups) and len(rich_groups) > 0: 
+            split_idx -= 1
         
-        print(f"[DataModule] Split: {len(train_targets)} Train Targets, {len(val_targets)} Validation Targets (UNSEEN).")
+        rich_train = set(rich_groups[:split_idx])
+        rich_val = set(rich_groups[split_idx:])
         
-        # 3. Filter DataFrames based on Target Split
-        train_df = base_df[base_df["target_id"].isin(train_targets)].copy()
-        val_df = base_df[base_df["target_id"].isin(val_targets)].copy()
+        # 4. Construct Final Sets
+        final_train_groups = rich_train.union(set(poor_groups))
+        final_val_groups = rich_val
+        
+        # 5. Filter DataFrame
+        train_df = base_df[base_df[self.split_col].isin(final_train_groups)].copy()
+        val_df = base_df[base_df[self.split_col].isin(final_val_groups)].copy()
         
         print(f"[DataModule] Rows: {len(train_df)} Train, {len(val_df)} Val")
 
-        # -----------------------------------------------------------
-        # 4. Create Datasets (Pass Train Stats to Val)
-        # -----------------------------------------------------------
-        # Train Dataset (Calculates its own mean/std)
+        # 6. Create Datasets (Dataset already uses weight_col for balancing)
         self.train_dataset = AffinityDataset(
             train_df, 
             self.cfg.data.lookup_csv, 
-            weight_col=self.cfg.data.get("weight_col"), 
-            balance_clusters=self.cfg.data.get("balance_clusters", False),
-            provided_stats=None 
+            weight_col=self.weight_col, 
+            balance_clusters=self.cfg.data.get("balance_clusters", False)
         )
         
-        # Extract stats from Train to ensure consistency
+        # Use Train stats for Val to prevent leakage
         train_stats = (self.train_dataset.mean, self.train_dataset.std)
-        
-        # Val Dataset (Uses Train stats)
         self.val_dataset = AffinityDataset(
             val_df, 
             self.cfg.data.lookup_csv, 
+            weight_col=self.weight_col,
             balance_clusters=False, 
             provided_stats=train_stats
         )
 
-        # -----------------------------------------------------------
-        # 5. Setup Sampler (For Train only)
-        # -----------------------------------------------------------
         if self.train_dataset.weights is not None:
-            print("[DataModule] Setting up WeightedRandomSampler for training...")
             self.sampler = WeightedRandomSampler(
                 weights=self.train_dataset.weights, 
                 num_samples=len(self.train_dataset), 
@@ -230,7 +235,7 @@ class AffinityDataModule(LightningDataModule):
             collate_fn=self.collate_fn, 
             num_workers=self.num_workers, 
             sampler=self.sampler, 
-            shuffle=(self.sampler is None), # Shuffle only if no sampler is used
+            shuffle=(self.sampler is None),
             pin_memory=True
         )
 
@@ -240,6 +245,6 @@ class AffinityDataModule(LightningDataModule):
             batch_size=self.cfg.training.batch_size, 
             collate_fn=self.collate_fn, 
             num_workers=self.num_workers, 
-            shuffle=False, # Validation set should not be shuffled
+            shuffle=False, 
             pin_memory=True
         )

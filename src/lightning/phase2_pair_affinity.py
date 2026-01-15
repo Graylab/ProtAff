@@ -39,15 +39,11 @@ class PairAffinityModule(pl.LightningModule):
 
         self.model = get_peft_model(self.base_model, peft_config)
         
-        # 3. Loss Function (Ranking)
-        # MarginRankingLoss: max(0, -y * (x1 - x2) + margin)
-        # We default margin to 0.1 if not specified
+        # 3. Loss Function (Ranking Only)
+        # MarginRankingLoss with y=-1 optimizes for input1 < input2
+        # This matches Log Kd logic (Better Binder = Lower Value)
         self.margin = getattr(cfg.training, "margin", 0.1)
         self.rank_loss = nn.MarginRankingLoss(margin=self.margin)
-
-        # Used to anchor scores: "Binders" -> 1.0, "Non-Binders" -> 0.0
-        self.cls_loss = nn.BCEWithLogitsLoss()
-        self.cls_weight = getattr(cfg.training, "cls_weight", 0.5)
         
         # 4. Transfer Learning
         ckpt_path = cfg.get("pretrained_ckpt_path", None) 
@@ -56,8 +52,7 @@ class PairAffinityModule(pl.LightningModule):
 
     def forward(self, input_ids, attention_mask):
         """
-        Standard forward pass for a single batch of sequences.
-        Useful for inference to get a raw score.
+        Standard forward pass. Returns predicted Log Kd (Lower is better).
         """
         return self.model(
             input_ids=input_ids, 
@@ -65,41 +60,35 @@ class PairAffinityModule(pl.LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        # 1. Forward Pass A (Better Samples)
+        # 1. Forward Pass
+        # scores_better: Should be LOWER (Stronger binding)
         scores_better = self(
             input_ids=batch['better_input_ids'], 
             attention_mask=batch['better_mask']
         )
         
+        # scores_worse: Should be HIGHER (Weaker binding)
         scores_worse = self(
             input_ids=batch['worse_input_ids'], 
             attention_mask=batch['worse_mask']
         )
         
-        # A. Ranking Loss (Existing)
-        target_rank = torch.ones_like(scores_better)
-        loss_rank = self.rank_loss(scores_better, scores_worse, target_rank)
+        # 2. Ranking Loss
+        # Target is -1.0 implies: Minimize scores_better - scores_worse
+        # i.e., Make scores_better smaller than scores_worse
+        target_rank = torch.full_like(scores_better, -1.0)
+        loss = self.rank_loss(scores_better, scores_worse, target_rank)
 
-        # B. Classification Loss (New)
-        loss_cls_better = self.cls_loss(scores_better.view(-1), batch['better_labels'])
-        loss_cls_worse = self.cls_loss(scores_worse.view(-1), batch['worse_labels'])
-        loss_cls = (loss_cls_better + loss_cls_worse) / 2.0
-        
-        # C. Total Loss
-        loss = loss_rank + (self.cls_weight * loss_cls)
-
-        # --- LOGGING UPDATES ---
-        accuracy = (scores_better > scores_worse).float().mean()
+        # --- LOGGING ---
+        # Accuracy: Percentage where Stronger Binder has Lower Kd
+        accuracy = (scores_better < scores_worse).float().mean()
         
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train_loss_rank', loss_rank, on_epoch=True) # Monitor Rank split
-        self.log('train_loss_cls', loss_cls, on_epoch=True)   # Monitor Cls split
         self.log('train_acc', accuracy, on_epoch=True, prog_bar=True)
         
         return loss
 
     def validation_step(self, batch, batch_idx):
-        # 1. Forward Pass
         scores_better = self(
             input_ids=batch['better_input_ids'], 
             attention_mask=batch['better_mask']
@@ -109,24 +98,14 @@ class PairAffinityModule(pl.LightningModule):
             attention_mask=batch['worse_mask']
         )
         
-        # A. Ranking Loss
-        target_rank = torch.ones_like(scores_better)
-        loss_rank = self.rank_loss(scores_better, scores_worse, target_rank)
+        # Target -1.0 -> Correct direction for Log Kd
+        target_rank = torch.full_like(scores_better, -1.0)
+        loss = self.rank_loss(scores_better, scores_worse, target_rank)
         
-        # B. Classification Loss
-        loss_cls_better = self.cls_loss(scores_better.view(-1), batch['better_labels'])
-        loss_cls_worse = self.cls_loss(scores_worse.view(-1), batch['worse_labels'])
-        loss_cls = (loss_cls_better + loss_cls_worse) / 2.0
-        
-        # C. Total Loss
-        loss = loss_rank + (self.cls_weight * loss_cls)
-        
-        # --- LOGGING UPDATES ---
-        accuracy = (scores_better > scores_worse).float().mean()
+        # Accuracy: Check if predicted Kd(Better) < predicted Kd(Worse)
+        accuracy = (scores_better < scores_worse).float().mean()
         
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log('val_loss_rank', loss_rank, on_epoch=True, sync_dist=True) # Monitor Rank split
-        self.log('val_loss_cls', loss_cls, on_epoch=True, sync_dist=True)   # Monitor Cls split
         self.log('val_acc', accuracy, on_epoch=True, prog_bar=True, sync_dist=True)
         
         return loss

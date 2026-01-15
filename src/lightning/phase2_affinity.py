@@ -6,6 +6,9 @@ from peft import get_peft_model, LoraConfig
 from peft.utils import load_peft_weights
 from omegaconf import DictConfig, OmegaConf
 from transformers import get_linear_schedule_with_warmup
+from torchmetrics.functional import spearman_corrcoef
+
+# Assuming this function returns an ESM2 model with a scalar regression head
 from src.models import build_model 
 
 class AffinityModule(pl.LightningModule):
@@ -17,32 +20,57 @@ class AffinityModule(pl.LightningModule):
         # 1. Base Container 
         self.base_model = build_model(cfg)
         
-        # 2. Setup PEFT (LoRA)
-        # We focus on the Concat/Unified modules: Projector + Head (Score only)
-        # Note: "head_cls" is removed from the default save list as we are doing regression only
+        # Define trainable head layers
         modules_to_save = ["projector", "norm_input", "head_score"]
         
-        if cfg.model.lora.modules_to_save:
+        # Append extra modules from config if they exist
+        if cfg.model.lora.get("modules_to_save", None):
              extra = OmegaConf.to_container(cfg.model.lora.modules_to_save)
              for m in extra:
                  if m not in modules_to_save:
                      modules_to_save.append(m)
 
-        target_modules = OmegaConf.to_container(cfg.model.lora.target_modules)
-        
-        peft_config = LoraConfig(
-            r=cfg.model.lora.r, 
-            lora_alpha=cfg.model.lora.alpha, 
-            target_modules=target_modules,
-            modules_to_save=modules_to_save, 
-            lora_dropout=cfg.model.lora.dropout, 
-            bias="none"
-        )
+        # 2. Setup Model Architecture
+        if cfg.model.lora.r > 0:
+            # LoRA Mode
+            print(f"[Model] Initializing LoRA (r={cfg.model.lora.r})...")
+            target_modules = OmegaConf.to_container(cfg.model.lora.target_modules)
+            
+            peft_config = LoraConfig(
+                r=cfg.model.lora.r, 
+                lora_alpha=cfg.model.lora.alpha, 
+                target_modules=target_modules,
+                modules_to_save=modules_to_save, 
+                lora_dropout=cfg.model.lora.dropout, 
+                bias="none"
+            )
+            self.model = get_peft_model(self.base_model, peft_config)
+            self.model.print_trainable_parameters()
 
-        self.model = get_peft_model(self.base_model, peft_config)
-        
+        else:
+            # Linear Probe Mode
+            print("[Model] Linear Probe Mode: LoRA Disabled (r=0).")
+            self.model = self.base_model
+            
+            # Freeze entire model first
+            for param in self.model.parameters():
+                param.requires_grad = False
+            
+            # Manually unfreeze head layers
+            trainable_params = 0
+            all_params = 0
+            
+            print("[Model] Manually unfreezing head layers:")
+            for name, param in self.model.named_parameters():
+                all_params += param.numel()
+                if any(layer in name for layer in modules_to_save):
+                    param.requires_grad = True
+                    trainable_params += param.numel()
+                    print(f"  -> Unfrozen: {name}")
+            
+            print(f"trainable params: {trainable_params:,} || all params: {all_params:,}")
+
         # 3. Loss Function
-        # We only use MSE Loss now.
         self.mse_loss = nn.MSELoss() 
         
         # 4. Transfer Learning
@@ -57,16 +85,11 @@ class AffinityModule(pl.LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        # 1. Forward
         pred_reg = self(batch)
-        
-        # 2. Unpack Labels (Regression only)
         reg_labels = batch['reg_labels'] 
         
-        # 3. Compute Loss (Standard MSE)
         loss = self.mse_loss(pred_reg, reg_labels)
 
-        # 4. Log
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
@@ -76,12 +99,19 @@ class AffinityModule(pl.LightningModule):
         
         loss = self.mse_loss(pred_reg, reg_labels)
         
+        # Scientific Validation Metric: Spearman Correlation
+        # This checks if the ranking of predicted affinities matches reality
+        # even if the absolute values are off.
+        spearman = spearman_corrcoef(pred_reg.squeeze(), reg_labels.squeeze())
+        
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('val_spearman', spearman, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
     def configure_optimizers(self):
+        # Filter to only optimize parameters that require gradients (LoRA + Head)
         optimizer = torch.optim.AdamW(
-            self.parameters(), 
+            filter(lambda p: p.requires_grad, self.parameters()), 
             lr=self.cfg.training.learning_rate, 
             weight_decay=self.cfg.training.weight_decay
         )
@@ -110,7 +140,7 @@ class AffinityModule(pl.LightningModule):
             print(f"[WARN] Path not found: {ckpt_path}. Training from scratch.")
             return
 
-        print(f"\n[INFO] Loading Phase 1 weights from {ckpt_path}")
+        print(f"\n[INFO] Loading weights from {ckpt_path}")
         try:
             raw_weights = load_peft_weights(ckpt_path, device="cpu")
             current_keys = list(self.model.state_dict().keys())
@@ -135,6 +165,7 @@ class AffinityModule(pl.LightningModule):
             else:
                 print("⚠️  No matching layers found.")
 
+            # Ensure gradients are enabled for LoRA/Head after loading
             for name, param in self.model.named_parameters():
                 if any(t in name for t in ["lora", "modules_to_save", "head", "projector"]): 
                     param.requires_grad = True
