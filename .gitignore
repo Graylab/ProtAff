@@ -6,3 +6,4 @@ slogs/
 inference_results/
 inference_output/
 analysis_output/
+weights/
