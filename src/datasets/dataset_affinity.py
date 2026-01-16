@@ -12,40 +12,37 @@ from torch.nn.utils.rnn import pad_sequence
 from pytorch_lightning import LightningDataModule
 from transformers import EsmTokenizer
 
+# ----------------------------------------------------------------------
+# 1. Collators (Concat vs Cross-Attention)
+# ----------------------------------------------------------------------
+
 @dataclass
 class ConcatCollator:
     """
-    Collator for 'Concat' architecture (Single Sample).
-    Joins sequences BEFORE padding.
-    Structure: [CLS] Binder [EOS] Target [EOS] [PAD] ...
+    Original 'Concat' Collator: [CLS] Binder [EOS] Target [EOS]
     """
     tokenizer: Any
     max_length: int = 2048
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        # 1. Prepare Raw Strings
         eos = self.tokenizer.eos_token
         binder_seqs = [str(f["binder_seq"]).replace(":", eos) for f in features]
         target_seqs = [str(f["target_seq"]).replace(":", eos) for f in features]
         
-        # 2. Tokenize WITHOUT padding/special tokens first
         b_encoded = self.tokenizer(binder_seqs, add_special_tokens=False)
         t_encoded = self.tokenizer(target_seqs, add_special_tokens=False)
         
         input_ids_list = []
         attention_mask_list = []
-        
         cls_id = self.tokenizer.cls_token_id
         eos_id = self.tokenizer.eos_token_id
         
-        # 3. Concatenate and Truncate
         for b_ids, t_ids in zip(b_encoded["input_ids"], t_encoded["input_ids"]):
             allowed_len = self.max_length - 3
             current_len = len(b_ids) + len(t_ids)
             
             if current_len > allowed_len:
                 excess = current_len - allowed_len
-                # Priority: Keep Binder intact, truncate Target
                 if len(t_ids) > excess:
                     t_ids = t_ids[:-excess]
                 else:
@@ -57,13 +54,8 @@ class ConcatCollator:
             input_ids_list.append(torch.tensor(full_ids, dtype=torch.long))
             attention_mask_list.append(torch.ones(len(full_ids), dtype=torch.long))
 
-        # 4. Pad the Batch
-        pad_id = self.tokenizer.pad_token_id
-        batch_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id)
+        batch_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         batch_mask = pad_sequence(attention_mask_list, batch_first=True, padding_value=0)
-
-        # 5. Process Labels
-        # Labels are already normalized in the Dataset __getitem__
         reg_labels = [f["log_Aff"] for f in features]
 
         return {
@@ -72,6 +64,50 @@ class ConcatCollator:
             "reg_labels": torch.tensor(reg_labels, dtype=torch.float32).unsqueeze(1),
         }
 
+@dataclass
+class CrossAttnCollator:
+    """
+    New 'Cross-Attention' Collator: Separate tensors for Binder and Target.
+    Outputs: binder_ids, binder_mask, target_ids, target_mask
+    """
+    tokenizer: Any
+    max_length: int = 2048
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # For Cross-Attention, we keep sequences separate
+        binder_seqs = [str(f["binder_seq"]) for f in features]
+        target_seqs = [str(f["target_seq"]) for f in features]
+        
+        # Split budget: each gets the max_length
+        b_enc = self.tokenizer(
+            binder_seqs, 
+            padding=True, 
+            truncation=True, 
+            max_length=self.max_length, 
+            return_tensors="pt"
+        )
+        t_enc = self.tokenizer(
+            target_seqs, 
+            padding=True, 
+            truncation=True, 
+            max_length=self.max_length, 
+            return_tensors="pt"
+        )
+        
+        reg_labels = [f["log_Aff"] for f in features]
+
+        return {
+            "binder_ids": b_enc["input_ids"],
+            "binder_mask": b_enc["attention_mask"],
+            "target_ids": t_enc["input_ids"],
+            "target_mask": t_enc["attention_mask"],
+            "reg_labels": torch.tensor(reg_labels, dtype=torch.float32).unsqueeze(1),
+        }
+
+# ----------------------------------------------------------------------
+# 2. Dataset
+# ----------------------------------------------------------------------
+
 class AffinityDataset(Dataset):
     def __init__(self, 
                  base_df: pd.DataFrame, 
@@ -79,32 +115,18 @@ class AffinityDataset(Dataset):
                  weight_col: Optional[str] = None, 
                  balance_clusters: bool = False,
                  provided_stats: Optional[Tuple[float, float]] = None):
-        """
-        Args:
-            provided_stats: (mean, std) tuple. 
-                            If provided (Validation set), use these for normalization.
-                            If None (Training set), calculate from data.
-        """
         
-        # 1. Load Lookup Table
         lookup_df = pd.read_csv(lookup_csv_path)
         lookup_df['key'] = lookup_df['type'].astype(str) + "_" + lookup_df['id'].astype(str)
         self.id2seq = dict(zip(lookup_df['key'], lookup_df['seq']))
         
-        # 2. Map IDs (DataFrame should already be filtered by DataModule)
         self.base_df = base_df.copy()
         self.base_df["binder_key"] = "binder_" + self.base_df["binder_id"].astype(str)
         self.base_df["target_key"] = "target_" + self.base_df["target_id"].astype(str)
         
-        # 3. Balancing Logic (Optional)
         self.weights = None
         if balance_clusters:
-            if weight_col and weight_col in self.base_df.columns:
-                stratify_col = weight_col
-            else:
-                stratify_col = "target_id"
-            
-            # Dampened weighting (inverse square root of frequency)
+            stratify_col = weight_col if (weight_col and weight_col in self.base_df.columns) else "target_id"
             counts = self.base_df[stratify_col].value_counts()
             freqs = self.base_df[stratify_col].map(counts)
             self.weights = (1.0 / np.sqrt(freqs)).to_numpy(dtype=np.float32)
@@ -112,18 +134,12 @@ class AffinityDataset(Dataset):
         elif weight_col and weight_col in self.base_df.columns:
             self.weights = pd.to_numeric(self.base_df[weight_col], errors='coerce').fillna(1.0).to_numpy(dtype=np.float32)
 
-        # Convert to dictionary for faster access
         self.data = self.base_df[["binder_key", "target_key", "log_Aff"]].to_dict('records')
 
-        # -----------------------------------------------------------
-        # 4. Z-Score Statistics (Leakage Prevention)
-        # -----------------------------------------------------------
         if provided_stats:
-            # Validation/Test set: Must use Training set statistics
             self.mean, self.std = provided_stats
             print(f"[Dataset] Using PROVIDED stats. Mean: {self.mean:.4f}, Std: {self.std:.4f}")
         else:
-            # Training set: Calculate internal statistics
             all_labels = self.base_df["log_Aff"].values
             self.mean = float(np.mean(all_labels))
             self.std = float(np.std(all_labels))
@@ -134,9 +150,7 @@ class AffinityDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.data[idx]
-        
         raw_aff = float(row["log_Aff"])
-        # Apply Z-Score Normalization
         norm_aff = (raw_aff - self.mean) / (self.std + 1e-8)
 
         return {
@@ -144,9 +158,10 @@ class AffinityDataset(Dataset):
             "target_seq": self.id2seq.get(row["target_key"], ""),
             "log_Aff": norm_aff,     
         }
-    
-    def get_weight(self, idx):
-        return self.weights[idx] if self.weights is not None else 1.0
+
+# ----------------------------------------------------------------------
+# 3. DataModule
+# ----------------------------------------------------------------------
 
 class AffinityDataModule(LightningDataModule):
     def __init__(self, cfg: DictConfig):
@@ -154,9 +169,16 @@ class AffinityDataModule(LightningDataModule):
         self.cfg = cfg
         self.tokenizer = EsmTokenizer.from_pretrained(cfg.model.name)
         self.num_workers = cfg.data.num_workers if cfg.data.num_workers is not None else os.cpu_count()
-        self.collate_fn = ConcatCollator(tokenizer=self.tokenizer, max_length=self.cfg.model.max_length)
         
-        # Primary control: use weight_col if provided, else fallback to target_id
+        # Logic to switch Collator based on config
+        arch = self.cfg.model.get("arch", "concat")
+        if arch == "cross_attn":
+            print("[DataModule] Initializing CrossAttnCollator")
+            self.collate_fn = CrossAttnCollator(tokenizer=self.tokenizer, max_length=self.cfg.model.max_length)
+        else:
+            print("[DataModule] Initializing ConcatCollator")
+            self.collate_fn = ConcatCollator(tokenizer=self.tokenizer, max_length=self.cfg.model.max_length)
+        
         self.weight_col = self.cfg.data.get("weight_col")
         self.split_col = self.weight_col if self.weight_col is not None else "target_id"
         
@@ -165,24 +187,19 @@ class AffinityDataModule(LightningDataModule):
         self.sampler = None
 
     def setup(self, stage: Optional[str] = None):
-        print(f"[DataModule] Loading data from {self.cfg.data.base_csv}")
+        print(f"[DataModule] Split/Balance Column: {self.split_col}")
         base_df = pd.read_csv(self.cfg.data.base_csv)
         
         if self.split_col not in base_df.columns:
             raise KeyError(f"Split column '{self.split_col}' not found in CSV.")
 
-        # 1. Count samples per group (ID or Cluster)
+        # 1. Group-based splitting for Novel Target evaluation
         group_counts = base_df[self.split_col].value_counts()
-        
-        # 2. Define "Rich" vs "Poor" groups for stable validation
         MIN_SAMPLES_FOR_VAL = self.cfg.training.get("min_samples_val", 10)
         rich_groups = group_counts[group_counts >= MIN_SAMPLES_FOR_VAL].index.tolist()
         poor_groups = group_counts[group_counts < MIN_SAMPLES_FOR_VAL].index.tolist()
         
-        print(f"[DataModule] Splitting by: {self.split_col}")
-        print(f" -> Rich Groups: {len(rich_groups)}, Poor Groups: {len(poor_groups)}")
-        
-        # 3. Cluster-based Split (Novel Target Simulation)
+        # 2. Shuffle and split rich groups
         rng = np.random.default_rng(self.cfg.training.seed)
         rng.shuffle(rich_groups)
         
@@ -190,35 +207,22 @@ class AffinityDataModule(LightningDataModule):
         if split_idx == len(rich_groups) and len(rich_groups) > 0: 
             split_idx -= 1
         
-        rich_train = set(rich_groups[:split_idx])
-        rich_val = set(rich_groups[split_idx:])
+        train_groups = set(rich_groups[:split_idx]).union(set(poor_groups))
+        val_groups = set(rich_groups[split_idx:])
         
-        # 4. Construct Final Sets
-        final_train_groups = rich_train.union(set(poor_groups))
-        final_val_groups = rich_val
-        
-        # 5. Filter DataFrame
-        train_df = base_df[base_df[self.split_col].isin(final_train_groups)].copy()
-        val_df = base_df[base_df[self.split_col].isin(final_val_groups)].copy()
-        
-        print(f"[DataModule] Rows: {len(train_df)} Train, {len(val_df)} Val")
-
-        # 6. Create Datasets (Dataset already uses weight_col for balancing)
+        # 3. Construct Final Sets
         self.train_dataset = AffinityDataset(
-            train_df, 
+            base_df[base_df[self.split_col].isin(train_groups)].copy(), 
             self.cfg.data.lookup_csv, 
             weight_col=self.weight_col, 
             balance_clusters=self.cfg.data.get("balance_clusters", False)
         )
         
-        # Use Train stats for Val to prevent leakage
-        train_stats = (self.train_dataset.mean, self.train_dataset.std)
         self.val_dataset = AffinityDataset(
-            val_df, 
+            base_df[base_df[self.split_col].isin(val_groups)].copy(), 
             self.cfg.data.lookup_csv, 
             weight_col=self.weight_col,
-            balance_clusters=False, 
-            provided_stats=train_stats
+            provided_stats=(self.train_dataset.mean, self.train_dataset.std)
         )
 
         if self.train_dataset.weights is not None:
@@ -230,21 +234,14 @@ class AffinityDataModule(LightningDataModule):
 
     def train_dataloader(self):
         return DataLoader(
-            self.train_dataset, 
-            batch_size=self.cfg.training.batch_size, 
-            collate_fn=self.collate_fn, 
-            num_workers=self.num_workers, 
-            sampler=self.sampler, 
-            shuffle=(self.sampler is None),
-            pin_memory=True
+            self.train_dataset, batch_size=self.cfg.training.batch_size, 
+            collate_fn=self.collate_fn, num_workers=self.num_workers, 
+            sampler=self.sampler, shuffle=(self.sampler is None), pin_memory=True
         )
 
     def val_dataloader(self):
         return DataLoader(
-            self.val_dataset, 
-            batch_size=self.cfg.training.batch_size, 
-            collate_fn=self.collate_fn, 
-            num_workers=self.num_workers, 
-            shuffle=False, 
-            pin_memory=True
+            self.val_dataset, batch_size=self.cfg.training.batch_size, 
+            collate_fn=self.collate_fn, num_workers=self.num_workers, 
+            shuffle=False, pin_memory=True
         )

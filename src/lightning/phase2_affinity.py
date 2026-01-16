@@ -8,7 +8,7 @@ from omegaconf import DictConfig, OmegaConf
 from transformers import get_linear_schedule_with_warmup
 from torchmetrics.functional import spearman_corrcoef
 
-# Assuming this function returns an ESM2 model with a scalar regression head
+# Architecture factory
 from src.models import build_model 
 
 class AffinityModule(pl.LightningModule):
@@ -17,99 +17,88 @@ class AffinityModule(pl.LightningModule):
         self.cfg = cfg
         self.save_hyperparameters(OmegaConf.to_container(cfg, resolve=True))
         
-        # 1. Base Container 
+        # 1. Base Model Initialization
         self.base_model = build_model(cfg)
         
-        # Define trainable head layers
+        # 2. Trainable Modules Selection
+        # Modules unique to Cross-Attention are dynamically added
         modules_to_save = ["projector", "norm_input", "head_score"]
         
-        # Append extra modules from config if they exist
+        arch = cfg.model.get("arch", "concat")
+        if arch == "cross_attn":
+            modules_to_save.extend(["norm", "cross_attn"])
+        
         if cfg.model.lora.get("modules_to_save", None):
              extra = OmegaConf.to_container(cfg.model.lora.modules_to_save)
              for m in extra:
                  if m not in modules_to_save:
                      modules_to_save.append(m)
 
-        # 2. Setup Model Architecture
-        if cfg.model.lora.r > 0:
-            # LoRA Mode
-            print(f"[Model] Initializing LoRA (r={cfg.model.lora.r})...")
-            target_modules = OmegaConf.to_container(cfg.model.lora.target_modules)
-            
-            peft_config = LoraConfig(
-                r=cfg.model.lora.r, 
-                lora_alpha=cfg.model.lora.alpha, 
-                target_modules=target_modules,
-                modules_to_save=modules_to_save, 
-                lora_dropout=cfg.model.lora.dropout, 
-                bias="none"
-            )
-            self.model = get_peft_model(self.base_model, peft_config)
-            self.model.print_trainable_parameters()
+        # 3. LoRA Integration
+        # Maintains original variable mapping: cfg.model.lora.alpha
+        print(f"[Model] Initializing LoRA (r={cfg.model.lora.r}) for {arch}")
+        target_modules = OmegaConf.to_container(cfg.model.lora.target_modules)
+        
+        peft_config = LoraConfig(
+            r=cfg.model.lora.r, 
+            lora_alpha=cfg.model.lora.alpha, 
+            target_modules=target_modules,
+            modules_to_save=modules_to_save, 
+            lora_dropout=cfg.model.lora.dropout, 
+            bias="none"
+        )
+        
+        self.model = get_peft_model(self.base_model, peft_config)
+        self.model.print_trainable_parameters()
 
-        else:
-            # Linear Probe Mode
-            print("[Model] Linear Probe Mode: LoRA Disabled (r=0).")
-            self.model = self.base_model
-            
-            # Freeze entire model first
-            for param in self.model.parameters():
-                param.requires_grad = False
-            
-            # Manually unfreeze head layers
-            trainable_params = 0
-            all_params = 0
-            
-            print("[Model] Manually unfreezing head layers:")
-            for name, param in self.model.named_parameters():
-                all_params += param.numel()
-                if any(layer in name for layer in modules_to_save):
-                    param.requires_grad = True
-                    trainable_params += param.numel()
-                    print(f"  -> Unfrozen: {name}")
-            
-            print(f"trainable params: {trainable_params:,} || all params: {all_params:,}")
-
-        # 3. Loss Function
+        # 4. Loss Function
         self.mse_loss = nn.MSELoss() 
         
-        # 4. Transfer Learning
+        # 5. Pretrained Weights Loading
         ckpt_path = cfg.get("pretrained_ckpt_path", None) 
         if ckpt_path:
             self._load_phase1_weights(ckpt_path)
 
     def forward(self, batch):
-        return self.model(
-            input_ids=batch['input_ids'], 
-            attention_mask=batch['attention_mask']
-        )
+        """
+        Architecture-aware forward pass routing.
+        """
+        arch = self.cfg.model.get("arch", "concat")
+        
+        if arch == "cross_attn":
+            # Direct mapping to ESMCrossAttnModel.forward signature
+            return self.model(
+                binder_ids=batch['binder_ids'],
+                binder_mask=batch['binder_mask'],
+                target_ids=batch['target_ids'],
+                target_mask=batch['target_mask']
+            )
+        else:
+            # Standard ESMConcatModel.forward signature
+            return self.model(
+                input_ids=batch['input_ids'], 
+                attention_mask=batch['attention_mask']
+            )
 
     def training_step(self, batch, batch_idx):
-        pred_reg = self(batch)
-        reg_labels = batch['reg_labels'] 
-        
-        loss = self.mse_loss(pred_reg, reg_labels)
-
+        pred_reg = self.forward(batch)
+        loss = self.mse_loss(pred_reg, batch['reg_labels'])
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        pred_reg = self(batch)
+        pred_reg = self.forward(batch)
         reg_labels = batch['reg_labels']
-        
         loss = self.mse_loss(pred_reg, reg_labels)
         
-        # Scientific Validation Metric: Spearman Correlation
-        # This checks if the ranking of predicted affinities matches reality
-        # even if the absolute values are off.
-        spearman = spearman_corrcoef(pred_reg.squeeze(), reg_labels.squeeze())
+        # Scientific metric for Novel Target ranking
+        spearman = spearman_corrcoef(pred_reg.reshape(-1), reg_labels.reshape(-1))
         
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('val_spearman', spearman, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
     def configure_optimizers(self):
-        # Filter to only optimize parameters that require gradients (LoRA + Head)
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self.parameters()), 
             lr=self.cfg.training.learning_rate, 
@@ -117,8 +106,7 @@ class AffinityModule(pl.LightningModule):
         )
 
         total_steps = self.trainer.estimated_stepping_batches
-        warmup_ratio = getattr(self.cfg.training, "warmup_ratio", 0.1)
-        num_warmup_steps = int(total_steps * warmup_ratio)
+        num_warmup_steps = int(total_steps * getattr(self.cfg.training, "warmup_ratio", 0.1))
 
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
@@ -137,10 +125,10 @@ class AffinityModule(pl.LightningModule):
 
     def _load_phase1_weights(self, ckpt_path):
         if not os.path.exists(ckpt_path):
-            print(f"[WARN] Path not found: {ckpt_path}. Training from scratch.")
+            print(f"[WARN] Path not found: {ckpt_path}")
             return
 
-        print(f"\n[INFO] Loading weights from {ckpt_path}")
+        print(f"\n[INFO] Loading LoRA weights from Phase 1: {ckpt_path}")
         try:
             raw_weights = load_peft_weights(ckpt_path, device="cpu")
             current_keys = list(self.model.state_dict().keys())
@@ -151,23 +139,19 @@ class AffinityModule(pl.LightningModule):
                 return '.'.join([p for p in parts if p not in ignore])
 
             key_map = {normalize(k): k for k in current_keys}
-            
             final_weights = {}
             for k_raw, v_raw in raw_weights.items():
                 k_norm = normalize(k_raw)
                 if k_norm in key_map:
-                    target_key = key_map[k_norm]
-                    final_weights[target_key] = v_raw
+                    final_weights[key_map[k_norm]] = v_raw
             
             if final_weights:
                 self.model.load_state_dict(final_weights, strict=False)
-                print(f"✅ Loaded {len(final_weights)} layers.")
-            else:
-                print("⚠️  No matching layers found.")
-
-            # Ensure gradients are enabled for LoRA/Head after loading
+                print(f"✅ Loaded {len(final_weights)} matching layers.")
+            
+            # Re-verify gradient requirements for fine-tuning
             for name, param in self.model.named_parameters():
-                if any(t in name for t in ["lora", "modules_to_save", "head", "projector"]): 
+                if any(t in name for t in ["lora", "modules_to_save", "head", "projector", "cross_attn"]): 
                     param.requires_grad = True
 
         except Exception as e:

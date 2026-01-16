@@ -1,0 +1,17 @@
+# configs/model/esm_cross_attn.yaml
+name: "facebook/esm2_t33_650M_UR50D"
+arch: "cross_attn"
+max_length: 1024
+
+# Decoder Parameters (Simple/Standard)
+n_heads: 8
+d_model: 256
+dropout: 0.1
+
+# LoRA
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.1
+  target_modules: ["query", "key", "value"]
+  modules_to_save: []
