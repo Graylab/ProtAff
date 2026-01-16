@@ -18,7 +18,7 @@ METRICS_CONFIG = {
 PLOT_SETTINGS = {
     'figsize_width': 12,
     'bar_height_per_target': 1.0,
-    'font_scale': 1.4
+    'font_scale': 2.0
 }
 # =================================================
 

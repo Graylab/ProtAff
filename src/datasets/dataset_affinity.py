@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.nn.utils.rnn import pad_sequence
 from pytorch_lightning import LightningDataModule
 from transformers import EsmTokenizer
+from sklearn.model_selection import train_test_split
 
 # ----------------------------------------------------------------------
 # 1. Collators (Concat vs Cross-Attention)
@@ -193,33 +194,58 @@ class AffinityDataModule(LightningDataModule):
         if self.split_col not in base_df.columns:
             raise KeyError(f"Split column '{self.split_col}' not found in CSV.")
 
-        # 1. Group-based splitting for Novel Target evaluation
-        group_counts = base_df[self.split_col].value_counts()
-        MIN_SAMPLES_FOR_VAL = self.cfg.training.get("min_samples_val", 10)
-        rich_groups = group_counts[group_counts >= MIN_SAMPLES_FOR_VAL].index.tolist()
-        poor_groups = group_counts[group_counts < MIN_SAMPLES_FOR_VAL].index.tolist()
+        # Get split ratio from config (default to 0.9)
+        train_ratio = self.cfg.training.get("train_val_split", 0.9)
+        strategy = self.cfg.training.get("split_strategy", "random") # "random" or "group"
+        seed = self.cfg.training.seed
+
+        if strategy == "random":
+            print(f"--- Running RANDOM Split ({train_ratio*100}% Train) ---")
+            # Standard random split: ignores groups, samples are IID
+            train_df, val_df = train_test_split(
+                base_df,
+                train_size=train_ratio,
+                random_state=seed,
+                shuffle=True
+            )
         
-        # 2. Shuffle and split rich groups
-        rng = np.random.default_rng(self.cfg.training.seed)
-        rng.shuffle(rich_groups)
-        
-        split_idx = int(len(rich_groups) * self.cfg.training.get("train_val_split", 0.9))
-        if split_idx == len(rich_groups) and len(rich_groups) > 0: 
-            split_idx -= 1
-        
-        train_groups = set(rich_groups[:split_idx]).union(set(poor_groups))
-        val_groups = set(rich_groups[split_idx:])
-        
-        # 3. Construct Final Sets
+        elif strategy == "group":
+            print(f"--- Running GROUP Split (Novel Groups in Val) ---")
+            # Your original logic: validation only contains unseen clusters
+            group_counts = base_df[self.split_col].value_counts()
+            MIN_SAMPLES_FOR_VAL = self.cfg.training.get("min_samples_val", 10)
+            
+            rich_groups = group_counts[group_counts >= MIN_SAMPLES_FOR_VAL].index.tolist()
+            poor_groups = group_counts[group_counts < MIN_SAMPLES_FOR_VAL].index.tolist()
+            
+            rng = np.random.default_rng(seed)
+            rng.shuffle(rich_groups)
+            
+            split_idx = int(len(rich_groups) * train_ratio)
+            if split_idx == len(rich_groups) and len(rich_groups) > 0: 
+                split_idx -= 1
+                
+            train_groups = set(rich_groups[:split_idx]).union(set(poor_groups))
+            val_groups = set(rich_groups[split_idx:])
+            
+            train_df = base_df[base_df[self.split_col].isin(train_groups)].copy()
+            val_df = base_df[base_df[self.split_col].isin(val_groups)].copy()
+
+        else:
+            raise ValueError(f"Unknown split_strategy: {strategy}")
+
+        print(f"Final Counts -> Train: {len(train_df)}, Val: {len(val_df)}")
+
+        # 3. Construct Final Datasets
         self.train_dataset = AffinityDataset(
-            base_df[base_df[self.split_col].isin(train_groups)].copy(), 
+            train_df, 
             self.cfg.data.lookup_csv, 
             weight_col=self.weight_col, 
             balance_clusters=self.cfg.data.get("balance_clusters", False)
         )
         
         self.val_dataset = AffinityDataset(
-            base_df[base_df[self.split_col].isin(val_groups)].copy(), 
+            val_df, 
             self.cfg.data.lookup_csv, 
             weight_col=self.weight_col,
             provided_stats=(self.train_dataset.mean, self.train_dataset.std)

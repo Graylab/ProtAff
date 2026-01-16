@@ -20,6 +20,9 @@ data:
 
 training:
   seed: 42
+  
+  # Split
+  split_strategy: "random"
 
   # Batch and Steps
   batch_size: 16

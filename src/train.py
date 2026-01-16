@@ -34,7 +34,9 @@ class SaveHuggingFaceFormatCallback(Callback):
         self.best_val_loss = float('inf')
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        if not trainer.is_global_zero: return
+        # --- MINIMAL CHANGE: Prevent saving during sanity check ---
+        if not trainer.is_global_zero or trainer.sanity_checking: 
+            return
         
         current_val_loss = trainer.callback_metrics.get("val_loss")
         if current_val_loss is None: return
