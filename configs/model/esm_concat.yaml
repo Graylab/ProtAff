@@ -1,4 +1,4 @@
-# configs/model/esm_lora.yaml
+# configs/model/esm_concat.yaml
 name: "facebook/esm2_t33_650M_UR50D"
 arch: "concat"
 max_length: 2048

@@ -46,8 +46,8 @@ class ESMConcatModel(nn.Module):
 
 class ESMCrossAttnModel(nn.Module):
     """
-    Late Fusion: Decoupled encoding with explicit cross-attention bottleneck.
-    Mechanism: Binder (Query) maps to Target (Key/Value) independently.
+    Final Optimized Version: Uni-directional Late Fusion.
+    Features: Symmetric Pre-Norm, Masked Pooling, and Attention Map output.
     """
     def __init__(self, model_name, cfg: DictConfig):
         super().__init__()
@@ -58,7 +58,11 @@ class ESMCrossAttnModel(nn.Module):
         n_heads = getattr(cfg.model, "n_heads", 8)
         dropout = getattr(cfg.model, "dropout", 0.1)
 
-        # Cross-Attention for residue-residue interaction modeling
+        # Pre-attention normalization for both partners
+        self.norm_binder = nn.LayerNorm(hidden_dim)
+        self.norm_target = nn.LayerNorm(hidden_dim)
+
+        # Cross-Attention: Binder (Probe) acts on Target (Surface)
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=hidden_dim, 
             num_heads=n_heads, 
@@ -66,8 +70,9 @@ class ESMCrossAttnModel(nn.Module):
             dropout=dropout
         )
         
+        # Projection and Output Head
         self.projector = nn.Linear(hidden_dim, d_model)
-        self.norm = nn.LayerNorm(d_model)
+        self.norm_final = nn.LayerNorm(d_model)
         
         self.head_score = nn.Sequential(
             nn.Linear(d_model, d_model),
@@ -84,25 +89,38 @@ class ESMCrossAttnModel(nn.Module):
             if "esm" not in n and p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, binder_ids, binder_mask, target_ids, target_mask, **kwargs):
-        # Independent encoding of both partners
-        b_out = self.esm(input_ids=binder_ids, attention_mask=binder_mask).last_hidden_state
-        t_out = self.esm(input_ids=target_ids, attention_mask=target_mask).last_hidden_state
+    def forward(self, binder_ids, binder_mask, target_ids, target_mask, return_attn=False, **kwargs):
+        # 1. Independent ESM Encoding
+        # Result: (batch, seq_len, hidden_dim)
+        b_raw = self.esm(input_ids=binder_ids, attention_mask=binder_mask).last_hidden_state
+        t_raw = self.esm(input_ids=target_ids, attention_mask=target_mask).last_hidden_state
         
-        # Explicit interaction modeling via Cross-Attention
-        attn_output, _ = self.cross_attn(
-            b_out, 
-            t_out, 
-            t_out, 
-            key_padding_mask=~target_mask.bool() 
+        # 2. Symmetric Pre-Norm
+        # Ensures stable dot-products in the cross-attention layer
+        b_norm = self.norm_binder(b_raw)
+        t_norm = self.norm_target(t_raw)
+        
+        # 3. Cross-Attention (The Contact Map Logic)
+        # Query = Binder; Key/Value = Target
+        attn_output, attn_weights = self.cross_attn(
+            b_norm, 
+            t_norm, 
+            t_norm, 
+            key_padding_mask=~target_mask.bool(),
+            average_attn_weights=True # Extracts the interaction map
         )
         
-        # Masked pooling of interaction-enriched binder features
+        # 4. Masked Mean Pooling (Binder-side)
+        # We aggregate the binder tokens enriched with target information
         mask_expanded = binder_mask.unsqueeze(-1).expand(attn_output.size()).float()
         sum_embeddings = torch.sum(attn_output * mask_expanded, 1)
         sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
         pooled_feat = sum_embeddings / sum_mask
         
-        # Regression head outputting only the score
-        score = self.head_score(self.norm(self.projector(pooled_feat)))
+        # 5. Score Prediction
+        # 
+        score = self.head_score(self.norm_final(self.projector(pooled_feat)))
+        
+        if return_attn:
+            return score, attn_weights
         return score

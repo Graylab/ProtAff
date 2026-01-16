@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - model: esm_lora  
+  - model: esm_concat 
 
 # Task name
 task_name: "affinity"

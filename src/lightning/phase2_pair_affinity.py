@@ -14,34 +14,37 @@ class PairAffinityModule(pl.LightningModule):
         self.cfg = cfg
         self.save_hyperparameters(OmegaConf.to_container(cfg, resolve=True))
         
-        # 1. Base Container 
+        # 1. Base Model Initialization
         self.base_model = build_model(cfg)
         
         # 2. Setup PEFT (LoRA)
+        # Include Cross-Attention parameters in trainable modules if applicable
         modules_to_save = ["projector", "norm_input", "head_score"]
+        arch = cfg.model.get("arch", "concat")
         
-        if cfg.model.lora.modules_to_save:
+        if arch == "cross_attn":
+            modules_to_save.extend(["norm_binder", "norm_target", "cross_attn", "norm_final"])
+        
+        if cfg.model.lora.get("modules_to_save"):
              extra = OmegaConf.to_container(cfg.model.lora.modules_to_save)
              for m in extra:
                  if m not in modules_to_save:
                      modules_to_save.append(m)
 
-        target_modules = OmegaConf.to_container(cfg.model.lora.target_modules)
-        
         peft_config = LoraConfig(
             r=cfg.model.lora.r, 
             lora_alpha=cfg.model.lora.alpha, 
-            target_modules=target_modules,
+            target_modules=OmegaConf.to_container(cfg.model.lora.target_modules),
             modules_to_save=modules_to_save, 
             lora_dropout=cfg.model.lora.dropout, 
             bias="none"
         )
 
         self.model = get_peft_model(self.base_model, peft_config)
+        self.model.print_trainable_parameters()
         
-        # 3. Loss Function (Ranking Only)
-        # MarginRankingLoss with y=-1 optimizes for input1 < input2
-        # This matches Log Kd logic (Better Binder = Lower Value)
+        # 3. Ranking Loss
+        # target= -1.0 means we optimize for better_score < worse_score (Stronger binding = Lower Log Kd)
         self.margin = getattr(cfg.training, "margin", 0.1)
         self.rank_loss = nn.MarginRankingLoss(margin=self.margin)
         
@@ -50,90 +53,73 @@ class PairAffinityModule(pl.LightningModule):
         if ckpt_path:
             self._load_phase1_weights(ckpt_path)
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, batch_subset, prefix="better"):
         """
-        Standard forward pass. Returns predicted Log Kd (Lower is better).
+        Architecture-aware forward pass. 
+        batch_subset: either a concat batch or keys from a cross_attn batch.
         """
-        return self.model(
-            input_ids=input_ids, 
-            attention_mask=attention_mask
-        )
+        arch = self.cfg.model.get("arch", "concat")
+        
+        if arch == "cross_attn":
+            # Map prefixed keys from pairwise batch to ESMCrossAttnModel signature
+            return self.model(
+                binder_ids=batch_subset[f'{prefix}_binder_ids'],
+                binder_mask=batch_subset[f'{prefix}_binder_mask'],
+                target_ids=batch_subset[f'{prefix}_target_ids'],
+                target_mask=batch_subset[f'{prefix}_target_mask']
+            )
+        else:
+            # Map prefixed keys to ESMConcatModel signature
+            return self.model(
+                input_ids=batch_subset[f'{prefix}_input_ids'], 
+                attention_mask=batch_subset[f'{prefix}_mask']
+            )
 
     def training_step(self, batch, batch_idx):
-        # 1. Forward Pass
-        # scores_better: Should be LOWER (Stronger binding)
-        scores_better = self(
-            input_ids=batch['better_input_ids'], 
-            attention_mask=batch['better_mask']
-        )
+        # Forward pass for both candidates in the pair
+        scores_better = self.forward(batch, prefix="better")
+        scores_worse = self.forward(batch, prefix="worse")
         
-        # scores_worse: Should be HIGHER (Weaker binding)
-        scores_worse = self(
-            input_ids=batch['worse_input_ids'], 
-            attention_mask=batch['worse_mask']
-        )
-        
-        # 2. Ranking Loss
-        # Target is -1.0 implies: Minimize scores_better - scores_worse
-        # i.e., Make scores_better smaller than scores_worse
+        # Minimize (Better - Worse) to ensure Better is lower than Worse
         target_rank = torch.full_like(scores_better, -1.0)
         loss = self.rank_loss(scores_better, scores_worse, target_rank)
 
-        # --- LOGGING ---
-        # Accuracy: Percentage where Stronger Binder has Lower Kd
         accuracy = (scores_better < scores_worse).float().mean()
         
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log('train_acc', accuracy, on_epoch=True, prog_bar=True)
-        
         return loss
 
     def validation_step(self, batch, batch_idx):
-        scores_better = self(
-            input_ids=batch['better_input_ids'], 
-            attention_mask=batch['better_mask']
-        )
-        scores_worse = self(
-            input_ids=batch['worse_input_ids'], 
-            attention_mask=batch['worse_mask']
-        )
+        scores_better = self.forward(batch, prefix="better")
+        scores_worse = self.forward(batch, prefix="worse")
         
-        # Target -1.0 -> Correct direction for Log Kd
         target_rank = torch.full_like(scores_better, -1.0)
         loss = self.rank_loss(scores_better, scores_worse, target_rank)
         
-        # Accuracy: Check if predicted Kd(Better) < predicted Kd(Worse)
         accuracy = (scores_better < scores_worse).float().mean()
         
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('val_acc', accuracy, on_epoch=True, prog_bar=True, sync_dist=True)
-        
         return loss
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
-            self.parameters(), 
+            filter(lambda p: p.requires_grad, self.parameters()), 
             lr=self.cfg.training.learning_rate, 
             weight_decay=self.cfg.training.weight_decay
         )
 
         total_steps = self.trainer.estimated_stepping_batches
-        warmup_ratio = getattr(self.cfg.training, "warmup_ratio", 0.1)
-        num_warmup_steps = int(total_steps * warmup_ratio)
+        num_warmup_steps = int(total_steps * getattr(self.cfg.training, "warmup_ratio", 0.1))
 
         scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=total_steps
+            optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=total_steps
         )
 
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-                "frequency": 1
-            }
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"}
         }
 
     def _load_phase1_weights(self, ckpt_path):
@@ -152,22 +138,19 @@ class PairAffinityModule(pl.LightningModule):
                 return '.'.join([p for p in parts if p not in ignore])
 
             key_map = {normalize(k): k for k in current_keys}
-            
             final_weights = {}
             for k_raw, v_raw in raw_weights.items():
                 k_norm = normalize(k_raw)
                 if k_norm in key_map:
-                    target_key = key_map[k_norm]
-                    final_weights[target_key] = v_raw
+                    final_weights[key_map[k_norm]] = v_raw
             
             if final_weights:
                 self.model.load_state_dict(final_weights, strict=False)
                 print(f"✅ Loaded {len(final_weights)} layers.")
-            else:
-                print("⚠️  No matching layers found.")
-
+            
+            # Re-verify gradient requirements for fine-tuning
             for name, param in self.model.named_parameters():
-                if any(t in name for t in ["lora", "modules_to_save", "head", "projector"]): 
+                if any(t in name for t in ["lora", "modules_to_save", "head", "projector", "cross_attn"]): 
                     param.requires_grad = True
 
         except Exception as e:
