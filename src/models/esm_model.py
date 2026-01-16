@@ -118,7 +118,6 @@ class ESMCrossAttnModel(nn.Module):
         pooled_feat = sum_embeddings / sum_mask
         
         # 5. Score Prediction
-        # 
         score = self.head_score(self.norm_final(self.projector(pooled_feat)))
         
         if return_attn:
