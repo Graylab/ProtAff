@@ -12,7 +12,7 @@ from pytorch_lightning import LightningDataModule
 from transformers import EsmTokenizer
 
 # ======================================================================
-# 1. PAIRWISE COLLATOR (Strictly preserved)
+# 1. PAIRWISE COLLATOR
 # ======================================================================
 @dataclass
 class PairwiseCollator:
@@ -61,7 +61,7 @@ class PairwiseCollator:
         worse_b, worse_t = [x["worse_binder"] for x in batch], [x["worse_target"] for x in batch]
         deltas = torch.tensor([x["delta"] for x in batch], dtype=torch.float32)
 
-        if self.arch == "cross_attn":
+        if self.arch in ["cross_attn", "interaction_map"]:
             b_data = self._tokenize_batch_cross(better_b, better_t)
             w_data = self._tokenize_batch_cross(worse_b, worse_t)
             return {
@@ -81,7 +81,7 @@ class PairwiseCollator:
             }
 
 # ======================================================================
-# 2. HYBRID PAIRWISE DATASET (Rich Pockets + Singletons)
+# 2. HYBRID PAIRWISE DATASET (Target-Centric)
 # ======================================================================
 class PairwiseAffinityDataset(Dataset):
     def __init__(self, base_df, lookup_csv_path, pairs_per_sample=2, inter_pps=10, 
@@ -95,21 +95,21 @@ class PairwiseAffinityDataset(Dataset):
         num_df = base_df[base_df['log_Aff'].notna()].copy()
         
         # Identify Rich Pockets vs Singletons
-        counts = num_df.groupby(['target_id', 'source']).size().reset_index(name='pocket_size')
-        num_df = num_df.merge(counts, on=['target_id', 'source'])
+        counts = num_df.groupby('target_id').size().reset_index(name='pocket_size')
+        num_df = num_df.merge(counts, on='target_id')
+        print(f"[*] Raw Samples: {len(num_df):,}")
+        print(f"[*] Unique Targets: {num_df['target_id'].nunique():,}")
         
         self.b_better, self.t_better = [], []
         self.b_worse, self.t_worse = [], []
-        self.deltas, self.pair_sources = [], []
-        self.pair_types = []
+        self.deltas, self.pair_types = [], []
 
-        # --- PATH 1: Rich Pockets (Intra-Target Ranking) ---
+        # --- PATH 1: Intra-Target (Mutant Ranking) ---
         rich_df = num_df[num_df['pocket_size'] > 1]
-        for (t_id, s_id), group in rich_df.groupby(['target_id', 'source']):
+        for t_id, group in rich_df.groupby('target_id'):
             group = group.sort_values('log_Aff')
             affs, recs = group['log_Aff'].values, group.to_dict('records')
             n = len(recs)
-            
             starts = np.searchsorted(affs, affs + min_margin, side='right')
             valid_anchors = np.where(starts < n)[0]
             
@@ -122,40 +122,38 @@ class PairwiseAffinityDataset(Dataset):
             ranges = n - starts[valid_anchors]
             match_indices = (rand_floats * ranges[:, None]).astype(int) + starts[valid_anchors][:, None]
             
-            a_flat, m_flat = np.repeat(valid_anchors, pairs_per_sample), match_indices.flatten()
-            for a_idx, m_idx in zip(a_flat, m_flat):
-                if recs[a_idx]['binder_id'] == recs[m_idx]['binder_id']: continue
-                self._append_pair(recs[a_idx], recs[m_idx], s_id, is_specificity=False)
+            for a_idx, m_idxs in zip(valid_anchors, match_indices):
+                for m_idx in m_idxs:
+                    if recs[a_idx]['binder_id'] == recs[m_idx]['binder_id']: continue
+                    self._append_pair(recs[a_idx], recs[m_idx], is_specificity=False)
 
-        # --- PATH 2: Singletons (Inter-Target Specificity) ---
+        # --- PATH 2: Inter-Target (Global Specificity) ---
         singleton_df = num_df[num_df['pocket_size'] == 1]
-        for s_id, source_pool in singleton_df.groupby('source'):
-            recs = source_pool.to_dict('records')
-            n = len(recs)
-            if n < 2: continue
-            
+        recs = singleton_df.to_dict('records')
+        n = len(recs)
+        if n >= 2:
             for i in range(n):
                 competitors = [j for j in range(n) if recs[j]['target_id'] != recs[i]['target_id']]
                 if not competitors: continue
-                
-                take_n = min(len(competitors), inter_pps)
-                chosen_idxs = np.random.choice(competitors, take_n, replace=False)
+                chosen_idxs = np.random.choice(competitors, min(len(competitors), inter_pps), replace=False)
                 for c_idx in chosen_idxs:
-                    self._append_pair(recs[i], recs[c_idx], s_id, is_specificity=True)
+                    if recs[i]['log_Aff'] < recs[c_idx]['log_Aff']:
+                        self._append_pair(recs[i], recs[c_idx], is_specificity=True)
+                    else:
+                        self._append_pair(recs[c_idx], recs[i], is_specificity=True)
 
         p_df = pd.DataFrame({'type': self.pair_types})
         print(f"[*] Breakdown:\n{p_df['type'].value_counts().to_string()}")
-        print(f"[*] TOTAL: {len(self.b_better):,} Unique Pairs Generated")
+        print(f"[*] TOTAL PAIRS: {len(self.b_better):,}")
         print(f"{'='*60}\n")
 
-    def _append_pair(self, b_rec, w_rec, source, is_specificity=False):
+    def _append_pair(self, b_rec, w_rec, is_specificity=False):
         self.b_better.append(b_rec['binder_id'])
         self.t_better.append(b_rec['target_id'])
         self.b_worse.append(w_rec['binder_id'])
-        self.t_worse.append(b_rec['target_id'] if is_specificity else w_rec['target_id'])
-        self.pair_sources.append(source)
-        self.pair_types.append('inter_target' if is_specificity else 'intra_target')
+        self.t_worse.append(w_rec['target_id'])
         self.deltas.append(abs(w_rec['log_Aff'] - b_rec['log_Aff']))
+        self.pair_types.append('inter_target' if is_specificity else 'intra_target')
 
     def __len__(self): return len(self.b_better)
     def __getitem__(self, idx):
@@ -168,7 +166,7 @@ class PairwiseAffinityDataset(Dataset):
         }
 
 # ======================================================================
-# 3. PAIRWISE DATAMODULE (With Balanced Sampler)
+# 3. RELIABLE DATAMODULE
 # ======================================================================
 class PairAffinityDataModule(LightningDataModule):
     def __init__(self, cfg: DictConfig):
@@ -184,18 +182,26 @@ class PairAffinityDataModule(LightningDataModule):
 
     def setup(self, stage=None):
         base_df = pd.read_csv(self.cfg.data.base_csv)
-        sources = base_df['source'].unique()
-        np.random.seed(42)
-        np.random.shuffle(sources)
+        targets = base_df['target_id'].unique()
+        seed = self.cfg.training.get("seed", 42)
+        np.random.seed(seed)
+        np.random.shuffle(targets)
         
-        train_sources = sources[:int(len(sources) * 0.9)]
-        train_df = base_df[base_df['source'].isin(train_sources)]
-        val_df = base_df[~base_df['source'].isin(train_sources)]
+        split_idx = int(len(targets) * 0.9)
+        train_targets, val_targets = targets[:split_idx], targets[split_idx:]
+        
+        print(f"\n[DataModule] Split Strategy: Target-ID Group Split")
+        print(f"[DataModule] Train Targets: {len(train_targets)}, Val Targets: {len(val_targets)}")
+
+        train_df = base_df[base_df['target_id'].isin(train_targets)]
+        val_df = base_df[base_df['target_id'].isin(val_targets)]
 
         self.train_dataset = PairwiseAffinityDataset(
             train_df, self.cfg.data.lookup_csv, 
             pairs_per_sample=self.cfg.data.get("pairs_per_sample", 2),
-            inter_pps=10, min_margin=self.cfg.data.get("min_margin", 1.0),
+            inter_pps=self.cfg.data.get("inter_pps", 10),
+            min_margin=self.cfg.data.get("min_margin", 1.0),
+            max_anchors_per_target=self.cfg.data.get("max_anchors_per_target", 2000),
             split_name="TRAIN"
         )
         self.val_dataset = PairwiseAffinityDataset(
@@ -203,14 +209,19 @@ class PairAffinityDataModule(LightningDataModule):
             pairs_per_sample=2, inter_pps=5, split_name="VAL"
         )
         
-        # Source-Based Sampler Weights (1/sqrt(N))
-        p_series = pd.Series(self.train_dataset.pair_sources)
-        counts = p_series.value_counts().to_dict()
-        train_weights = p_series.apply(lambda x: 1.0 / np.sqrt(counts[x]))
+        # --- THE RELIABLE MATH: W = 1 / sqrt(Count(T1) + Count(T2)) ---
+        t_all = self.train_dataset.t_better + self.train_dataset.t_worse
+        target_counts = pd.Series(t_all).value_counts()
+        print(f"[Sampler] Top Targets Frequency: \n{target_counts.head(5).to_string()}")
         
-        self.sampler = WeightedRandomSampler(
-            weights=train_weights.values, num_samples=len(train_weights), replacement=True
-        )
+        counts_dict = target_counts.to_dict()
+        pair_weights = []
+        for i in range(len(self.train_dataset)):
+            t1, t2 = self.train_dataset.t_better[i], self.train_dataset.t_worse[i]
+            combined_freq = counts_dict[t1] + counts_dict[t2]
+            pair_weights.append(1.0 / np.sqrt(combined_freq))
+        
+        self.sampler = WeightedRandomSampler(weights=pair_weights, num_samples=len(pair_weights), replacement=True)
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.cfg.training.batch_size, 

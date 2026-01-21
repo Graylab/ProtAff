@@ -1,11 +1,10 @@
-# configs/model/esm_concat.yaml
+# configs/model/esm_interaction_map.yaml
 name: "facebook/esm2_t33_650M_UR50D"
-arch: "concat"
+arch: "interaction_map"
 max_length: 1024
 
 # Decoder Parameters (Simple/Standard)
 d_model: 256
-dropout: 0.1
 
 # LoRA
 lora:

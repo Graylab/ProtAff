@@ -123,3 +123,53 @@ class ESMCrossAttnModel(nn.Module):
         if return_attn:
             return score, attn_weights
         return score
+        
+class ESMInteractionMapModel(nn.Module):
+    """
+    Computes a scaled dot-product interaction map between Binder and Target.
+    Pooling: Masked Mean (Average Interaction Density).
+    """
+    def __init__(self, model_name, cfg):
+        super().__init__()
+        self.esm = EsmModel.from_pretrained(model_name)
+        hidden_dim = self.esm.config.hidden_size
+        d_model = getattr(cfg.model, "d_model", 128)
+
+        # Normalization for independent encodings
+        self.norm_binder = nn.LayerNorm(hidden_dim)
+        self.norm_target = nn.LayerNorm(hidden_dim)
+        
+        # Scaling factor: sqrt(D) to stabilize dot-product variance
+        self.register_buffer("scale", torch.tensor(hidden_dim ** 0.5))
+
+        self.head_score = nn.Sequential(
+            nn.Linear(1, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1)
+        )
+
+    def forward(self, binder_ids, binder_mask, target_ids, target_mask):
+        # 1. ESM Encoding
+        b_raw = self.esm(input_ids=binder_ids, attention_mask=binder_mask).last_hidden_state
+        t_raw = self.esm(input_ids=target_ids, attention_mask=target_mask).last_hidden_state
+        
+        # 2. Pre-Interaction Normalization
+        b_norm = self.norm_binder(b_raw) 
+        t_norm = self.norm_target(t_raw) 
+        
+        # 3. Scaled Dot-Product [B, N, M]
+        # (Binder @ Target.T) / sqrt(D)
+        interaction_matrix = torch.bmm(b_norm, t_norm.transpose(1, 2)) / self.scale
+        
+        # 4. 2D Masking (Exclude Padding)
+        mask_2d = torch.bmm(binder_mask.unsqueeze(2).float(), target_mask.unsqueeze(1).float())
+        
+        # 5. Masked Mean Pooling
+        # sum of valid interactions / count of valid pairs
+        sum_interaction = torch.sum(interaction_matrix * mask_2d, dim=(1, 2))
+        num_valid_pairs = torch.clamp(mask_2d.sum(dim=(1, 2)), min=1.0)
+        
+        avg_interaction = (sum_interaction / num_valid_pairs).unsqueeze(-1)
+        
+        # 6. Final Ranking Score
+        return self.head_score(avg_interaction)

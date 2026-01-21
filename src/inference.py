@@ -59,7 +59,7 @@ class InferenceCollator:
         binder_seqs = [x["binder_seq"].replace(":", eos) for x in batch]
         target_seqs = [x["target_seq"].replace(":", eos) for x in batch]
 
-        if self.arch == "cross_attn":
+        if self.arch in ["cross_attn", "interaction_map"]:
             # Decoupled tokenization for Late Fusion 
             b_enc = self.tokenizer(binder_seqs, padding=True, truncation=True, 
                                    max_length=self.max_length, return_tensors="pt")
@@ -143,7 +143,7 @@ def main(cfg: DictConfig):
         for batch in tqdm(dataloader):
             batch = {k: v.to(device) for k, v in batch.items()}
             
-            if arch == "cross_attn":
+            if arch in ["cross_attn", "interaction_map"]:
                 outputs = model(
                     binder_ids=batch['binder_ids'], binder_mask=batch['binder_mask'],
                     target_ids=batch['target_ids'], target_mask=batch['target_mask']

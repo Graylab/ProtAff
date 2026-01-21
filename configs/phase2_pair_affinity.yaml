@@ -21,7 +21,9 @@ data:
   
   # Pair Mining Strategy
   pairs_per_sample: 2        # How many 'worse' examples to pair with every 'better' one
+  inter_pps: 10
   min_margin: 1.0      # Min log_Aff diff required to create a pair (ensures clear separation)
+  max_anchors_per_target: 2000
   
 training:
   seed: 42

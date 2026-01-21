@@ -20,13 +20,18 @@ class AffinityModule(pl.LightningModule):
         # 1. Base Model Initialization
         self.base_model = build_model(cfg)
         
-        # 2. Trainable Modules Selection
-        # Modules unique to Cross-Attention are dynamically added
-        modules_to_save = ["projector", "norm_input", "head_score"]
-        
+        # 2. Setup PEFT (LoRA)
+        # We ensure the interaction-specific norms and head are trainable
+        modules_to_save = ["head_score"]
         arch = cfg.model.get("arch", "concat")
-        if arch == "cross_attn":
-            modules_to_save.extend(["norm", "cross_attn"])
+        
+        if arch == "interaction_map":
+            # Saves normalization layers for the independent ESM encodings
+            modules_to_save.extend(["norm_binder", "norm_target"])
+        elif arch == "cross_attn":
+            modules_to_save.extend(["norm_binder", "norm_target", "cross_attn", "norm_final", "projector"])
+        else: # concat
+            modules_to_save.extend(["projector", "norm_input"])
         
         if cfg.model.lora.get("modules_to_save", None):
              extra = OmegaConf.to_container(cfg.model.lora.modules_to_save)
@@ -65,7 +70,7 @@ class AffinityModule(pl.LightningModule):
         """
         arch = self.cfg.model.get("arch", "concat")
         
-        if arch == "cross_attn":
+        if arch in ["cross_attn", "interaction_map"]:
             # Direct mapping to ESMCrossAttnModel.forward signature
             return self.model(
                 binder_ids=batch['binder_ids'],

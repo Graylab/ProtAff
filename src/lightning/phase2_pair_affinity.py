@@ -18,13 +18,19 @@ class PairAffinityModule(pl.LightningModule):
         self.base_model = build_model(cfg)
         
         # 2. Setup PEFT (LoRA)
-        # Include Cross-Attention parameters in trainable modules if applicable
-        modules_to_save = ["projector", "norm_input", "head_score"]
+        # We ensure the interaction-specific norms and head are trainable
+        modules_to_save = ["head_score"]
         arch = cfg.model.get("arch", "concat")
         
-        if arch == "cross_attn":
-            modules_to_save.extend(["norm_binder", "norm_target", "cross_attn", "norm_final"])
+        if arch == "interaction_map":
+            # Saves normalization layers for the independent ESM encodings
+            modules_to_save.extend(["norm_binder", "norm_target"])
+        elif arch == "cross_attn":
+            modules_to_save.extend(["norm_binder", "norm_target", "cross_attn", "norm_final", "projector"])
+        else: # concat
+            modules_to_save.extend(["projector", "norm_input"])
         
+        # Merge with any extra modules requested in config
         if cfg.model.lora.get("modules_to_save"):
              extra = OmegaConf.to_container(cfg.model.lora.modules_to_save)
              for m in extra:
@@ -43,25 +49,23 @@ class PairAffinityModule(pl.LightningModule):
         self.model = get_peft_model(self.base_model, peft_config)
         self.model.print_trainable_parameters()
         
-        # 3. Ranking Loss
-        # target= -1.0 means we optimize for better_score < worse_score (Stronger binding = Lower Log Kd)
+        # 3. Ranking Loss (Lower score = Better)
         self.margin = getattr(cfg.training, "margin", 0.1)
         self.rank_loss = nn.MarginRankingLoss(margin=self.margin)
         
-        # 4. Transfer Learning
+        # 4. Phase-to-Phase Transfer
         ckpt_path = cfg.get("pretrained_ckpt_path", None) 
         if ckpt_path:
             self._load_phase1_weights(ckpt_path)
 
     def forward(self, batch_subset, prefix="better"):
         """
-        Architecture-aware forward pass. 
-        batch_subset: either a concat batch or keys from a cross_attn batch.
+        Architecture-aware forward pass supporting concat, cross_attn, and interaction_map.
         """
         arch = self.cfg.model.get("arch", "concat")
         
-        if arch == "cross_attn":
-            # Map prefixed keys from pairwise batch to ESMCrossAttnModel signature
+        if arch in ["cross_attn", "interaction_map"]:
+            # Both late-fusion models use independent binder/target inputs
             return self.model(
                 binder_ids=batch_subset[f'{prefix}_binder_ids'],
                 binder_mask=batch_subset[f'{prefix}_binder_mask'],
@@ -69,18 +73,18 @@ class PairAffinityModule(pl.LightningModule):
                 target_mask=batch_subset[f'{prefix}_target_mask']
             )
         else:
-            # Map prefixed keys to ESMConcatModel signature
+            # Concat model uses a single joint input
             return self.model(
                 input_ids=batch_subset[f'{prefix}_input_ids'], 
                 attention_mask=batch_subset[f'{prefix}_mask']
             )
 
     def training_step(self, batch, batch_idx):
-        # Forward pass for both candidates in the pair
         scores_better = self.forward(batch, prefix="better")
         scores_worse = self.forward(batch, prefix="worse")
         
-        # Minimize (Better - Worse) to ensure Better is lower than Worse
+        # Minimize (Better - Worse + Margin)
+        # target_rank = -1 ensures that Better is lower than Worse
         target_rank = torch.full_like(scores_better, -1.0)
         loss = self.rank_loss(scores_better, scores_worse, target_rank)
 
@@ -96,7 +100,6 @@ class PairAffinityModule(pl.LightningModule):
         
         target_rank = torch.full_like(scores_better, -1.0)
         loss = self.rank_loss(scores_better, scores_worse, target_rank)
-        
         accuracy = (scores_better < scores_worse).float().mean()
         
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
@@ -127,7 +130,7 @@ class PairAffinityModule(pl.LightningModule):
             print(f"[WARN] Path not found: {ckpt_path}. Training from scratch.")
             return
 
-        print(f"\n[INFO] Loading Phase 1 weights from {ckpt_path}")
+        print(f"\n[INFO] Loading Phase 1 (DMS) weights from {ckpt_path}")
         try:
             raw_weights = load_peft_weights(ckpt_path, device="cpu")
             current_keys = list(self.model.state_dict().keys())
@@ -146,11 +149,11 @@ class PairAffinityModule(pl.LightningModule):
             
             if final_weights:
                 self.model.load_state_dict(final_weights, strict=False)
-                print(f"✅ Loaded {len(final_weights)} layers.")
+                print(f"✅ Successfully transferred {len(final_weights)} DMS-trained layers.")
             
-            # Re-verify gradient requirements for fine-tuning
+            # Re-verify gradient requirements for the new architecture
             for name, param in self.model.named_parameters():
-                if any(t in name for t in ["lora", "modules_to_save", "head", "projector", "cross_attn"]): 
+                if any(t in name for t in ["lora", "modules_to_save", "head", "norm_binder", "norm_target"]): 
                     param.requires_grad = True
 
         except Exception as e:

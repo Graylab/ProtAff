@@ -163,7 +163,6 @@ class AffinityDataset(Dataset):
 # ----------------------------------------------------------------------
 # 3. DataModule
 # ----------------------------------------------------------------------
-
 class AffinityDataModule(LightningDataModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
@@ -171,9 +170,8 @@ class AffinityDataModule(LightningDataModule):
         self.tokenizer = EsmTokenizer.from_pretrained(cfg.model.name)
         self.num_workers = cfg.data.num_workers if cfg.data.num_workers is not None else os.cpu_count()
         
-        # Logic to switch Collator based on config
         arch = self.cfg.model.get("arch", "concat")
-        if arch == "cross_attn":
+        if arch in ["cross_attn", "interaction_map"]:
             print("[DataModule] Initializing CrossAttnCollator")
             self.collate_fn = CrossAttnCollator(tokenizer=self.tokenizer, max_length=self.cfg.model.max_length)
         else:
@@ -194,14 +192,12 @@ class AffinityDataModule(LightningDataModule):
         if self.split_col not in base_df.columns:
             raise KeyError(f"Split column '{self.split_col}' not found in CSV.")
 
-        # Get split ratio from config (default to 0.9)
         train_ratio = self.cfg.training.get("train_val_split", 0.9)
-        strategy = self.cfg.training.get("split_strategy", "random") # "random" or "group"
+        strategy = self.cfg.training.get("split_strategy", "random")
         seed = self.cfg.training.seed
 
         if strategy == "random":
             print(f"--- Running RANDOM Split ({train_ratio*100}% Train) ---")
-            # Standard random split: ignores groups, samples are IID
             train_df, val_df = train_test_split(
                 base_df,
                 train_size=train_ratio,
@@ -210,23 +206,25 @@ class AffinityDataModule(LightningDataModule):
             )
         
         elif strategy == "group":
-            print(f"--- Running GROUP Split (Novel Groups in Val) ---")
-            # Your original logic: validation only contains unseen clusters
-            group_counts = base_df[self.split_col].value_counts()
-            MIN_SAMPLES_FOR_VAL = self.cfg.training.get("min_samples_val", 10)
+            print(f"--- Running CUSTOM GROUP Split (Singletons to Train, Multi 9:1) ---")
             
-            rich_groups = group_counts[group_counts >= MIN_SAMPLES_FOR_VAL].index.tolist()
-            poor_groups = group_counts[group_counts < MIN_SAMPLES_FOR_VAL].index.tolist()
+            # 1. Count occurrences per target
+            counts = base_df[self.split_col].value_counts()
+            singletons = counts[counts == 1].index.tolist()
+            multi_sample = counts[counts > 1].index.tolist()
             
+            # 2. Shuffle multi-sample groups
             rng = np.random.default_rng(seed)
-            rng.shuffle(rich_groups)
+            rng.shuffle(multi_sample)
             
-            split_idx = int(len(rich_groups) * train_ratio)
-            if split_idx == len(rich_groups) and len(rich_groups) > 0: 
+            # 3. Split multi-sample groups 90/10
+            split_idx = int(len(multi_sample) * train_ratio)
+            # Guarantee at least one group for val if possible
+            if split_idx == len(multi_sample) and len(multi_sample) > 0:
                 split_idx -= 1
                 
-            train_groups = set(rich_groups[:split_idx]).union(set(poor_groups))
-            val_groups = set(rich_groups[split_idx:])
+            train_groups = set(multi_sample[:split_idx]).union(set(singletons))
+            val_groups = set(multi_sample[split_idx:])
             
             train_df = base_df[base_df[self.split_col].isin(train_groups)].copy()
             val_df = base_df[base_df[self.split_col].isin(val_groups)].copy()
