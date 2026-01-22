@@ -103,24 +103,37 @@ def main(cfg: DictConfig):
     arch = cfg.model.get("arch", "concat")
     print(f"[System] Device: {device} | Architecture: {arch}")
 
-    # Tagging and Path Logic (Maintained from your snippet)
+    # 1. Setup paths
     input_path = Path(cfg.input_csv)
-    if cfg.get("tag"): exp_tag = cfg.tag
-    else:
-        path_obj = Path(cfg.model_path)
-        if path_obj.is_file(): path_obj = path_obj.parent
-        generic_names = ["saved_model", "checkpoints", "best_model", "last_model"]
-        while path_obj.name in generic_names or path_obj.name.startswith("checkpoint-"):
-            path_obj = path_obj.parent
-        parent_name = path_obj.parent.name
-        exp_tag = f"{parent_name}_{path_obj.name}" if (len(parent_name) == 10 and parent_name[0] == '2') else path_obj.name
+    model_path = Path(cfg.model_path)
+    
+    # 2. Get the "time" folder name (e.g., 20-04-49)
+    path_obj = model_path
+    if path_obj.is_file(): path_obj = path_obj.parent
+    generic_names = ["saved_model", "checkpoints", "best_model", "last_model"]
+    while path_obj.name in generic_names or path_obj.name.startswith("checkpoint-"):
+        path_obj = path_obj.parent
+    
+    # This is the "time" folder (e.g., 20-04-49)
+    exp_tag = path_obj.name
 
-    result_root = Path(cfg.get("base_results_dir", "outputs/inference")) / exp_tag
-    dataset_dir = result_root / input_path.stem
+    # 3. Get the "Task/Date" part (e.g., phase2_affinity/2026-01-21)
+    # We find 'outputs', then take the next two folders
+    parts = model_path.parts
+    idx = parts.index("outputs")
+    model_rel_path = Path(*parts[idx+1 : idx+3])
+
+    # 4. Combine them: root / task / date / time / input_csv_name
+    result_root = Path(cfg.get("base_results_dir", "outputs/inference"))
+    dataset_dir = result_root / model_rel_path / exp_tag / input_path.stem
+    
+    # 5. Versioning (v0, v1...)
     counter = 0
-    while (dataset_dir / f"v{counter}").exists(): counter += 1
+    while (dataset_dir / f"v{counter}").exists(): 
+        counter += 1
     save_dir = dataset_dir / f"v{counter}"
     save_dir.mkdir(parents=True, exist_ok=True)
+    
     output_path = save_dir / cfg.get("output_filename", "predictions.csv")
 
     # Load Model

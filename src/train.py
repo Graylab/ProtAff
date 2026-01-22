@@ -34,7 +34,6 @@ class SaveHuggingFaceFormatCallback(Callback):
         self.best_val_loss = float('inf')
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        # --- MINIMAL CHANGE: Prevent saving during sanity check ---
         if not trainer.is_global_zero or trainer.sanity_checking: 
             return
         
@@ -44,13 +43,11 @@ class SaveHuggingFaceFormatCallback(Callback):
         if current_val_loss < self.best_val_loss:
             self.best_val_loss = current_val_loss
             
-            # CHANGED: Save directly to "saved_model" (no _best suffix)
             save_path = os.path.join(self.output_dir, "saved_model")
             os.makedirs(save_path, exist_ok=True)
 
             print(f"\n[System] New Best Val Loss: {current_val_loss:.4f}. Updating 'saved_model'...", flush=True)
             
-            # Robust saving for nested PEFT models
             if hasattr(pl_module.model, "save_pretrained"):
                 pl_module.model.save_pretrained(save_path)
             elif hasattr(pl_module.model, "base_model") and hasattr(pl_module.model.base_model, "save_pretrained"):
@@ -59,6 +56,59 @@ class SaveHuggingFaceFormatCallback(Callback):
                 print("[WARN] Could not find 'save_pretrained' method on model wrapper.")
                 
             self.tokenizer.save_pretrained(save_path)
+
+
+class TestEveryValidationCallback(Callback):
+    """
+    Runs test loop every time validation is run, works with val_check_interval.
+    """
+    def __init__(self, datamodule):
+        self.datamodule = datamodule
+        self._test_dataloader = None
+
+    def on_validation_end(self, trainer, pl_module):
+        # Skip sanity check
+        if trainer.sanity_checking:
+            return
+        
+        # Lazy init test dataloader
+        if self._test_dataloader is None:
+            self.datamodule.setup("test")
+            self._test_dataloader = self.datamodule.test_dataloader()
+        
+        # Manually run test loop
+        pl_module.eval()
+        test_losses = []
+        test_preds = []
+        test_labels = []
+        
+        with torch.no_grad():
+            for batch in self._test_dataloader:
+                # Move batch to device
+                batch = {k: v.to(pl_module.device) if isinstance(v, torch.Tensor) else v 
+                         for k, v in batch.items()}
+                
+                pred_reg = pl_module.forward(batch)
+                reg_labels = batch['reg_labels']
+                
+                loss = pl_module.mse_loss(pred_reg, reg_labels)
+                test_losses.append(loss)
+                test_preds.append(pred_reg)
+                test_labels.append(reg_labels)
+        
+        # Aggregate metrics
+        avg_loss = torch.stack(test_losses).mean()
+        all_preds = torch.cat(test_preds).reshape(-1)
+        all_labels = torch.cat(test_labels).reshape(-1)
+        
+        from torchmetrics.functional import spearman_corrcoef
+        spearman = spearman_corrcoef(all_preds, all_labels)
+        
+        # Log with same step as validation
+        pl_module.log('test_loss', avg_loss, prog_bar=True, sync_dist=True)
+        pl_module.log('test_spearman', spearman, prog_bar=True, sync_dist=True)
+        
+        pl_module.train()
 
 
 def get_task_modules(cfg):
@@ -79,7 +129,6 @@ def get_task_modules(cfg):
         
     elif task == "pair_affinity":
         print("[Factory] Loading Phase 2b: Pair Affinity (Ranking)")
-        # Using the classes from your snippet
         dm = PairAffinityDataModule(cfg)
         model = PairAffinityModule(cfg)
         
@@ -96,7 +145,7 @@ def main(cfg: DictConfig):
     
     # 2. Output Paths
     hydra_out_dir = HydraConfig.get().runtime.output_dir
-    os.environ["WANDB_DIR"] = hydra_out_dir # Force WandB local logs here
+    os.environ["WANDB_DIR"] = hydra_out_dir
     
     # 3. Initialize Task Modules
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
@@ -105,7 +154,6 @@ def main(cfg: DictConfig):
     dm, model = get_task_modules(cfg)
 
     # 4. Define Callbacks
-    # Filename includes accuracy if available (useful for ranking)
     checkpoint_cb = ModelCheckpoint(
         dirpath=os.path.join(hydra_out_dir, "checkpoints"),
         filename=f"{cfg.task_name}-{{epoch:02d}}-{{val_loss:.4f}}",
@@ -124,7 +172,13 @@ def main(cfg: DictConfig):
     
     callbacks_list = [checkpoint_cb, hf_save_cb, lr_monitor]
 
-    # Early Stopping (Optional but recommended)
+    # Test every validation (optional)
+    if cfg.training.get("test_every_val", False):
+        test_cb = TestEveryValidationCallback(datamodule=dm)
+        callbacks_list.append(test_cb)
+        print("[System] Test loop will run after each validation")
+
+    # Early Stopping
     if cfg.training.get("early_stopping", False):
         patience = cfg.training.get("patience", 3)
         callbacks_list.append(EarlyStopping(monitor="val_loss", patience=patience, mode="min"))
@@ -147,13 +201,11 @@ def main(cfg: DictConfig):
         callbacks=callbacks_list,
         default_root_dir=hydra_out_dir,
         
-        # Optimization Params
         log_every_n_steps=cfg.training.get("log_every_n_steps", 10),
         accumulate_grad_batches=cfg.training.get("accumulate_grad_batches", 1),
         precision=cfg.training.get("precision", "16-mixed"),
         gradient_clip_val=cfg.training.get("gradient_clip_val", 1.0),
         
-        # Validation Frequency (useful for Ranking which is slow)
         val_check_interval=cfg.training.get("val_check_interval", 1.0),
         limit_val_batches=cfg.training.get("limit_val_batches", None)
     )
@@ -181,7 +233,6 @@ def main(cfg: DictConfig):
             ckpt = torch.load(best_path, map_location="cpu")
             model.load_state_dict(ckpt["state_dict"])
             
-            # CHANGED: Unified path "saved_model" (no _final suffix)
             final_path = os.path.join(hydra_out_dir, "saved_model")
             print(f"[System] Final Verification Export to: {final_path}")
             

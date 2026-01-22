@@ -103,6 +103,22 @@ class AffinityModule(pl.LightningModule):
         self.log('val_spearman', spearman, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
+    def test_step(self, batch, batch_idx):
+        """
+        Test step for monitoring generalization to unseen targets.
+        This is run for diagnostic purposes only - not for model selection.
+        """
+        pred_reg = self.forward(batch)
+        reg_labels = batch['reg_labels']
+        loss = self.mse_loss(pred_reg, reg_labels)
+        
+        # Scientific metric for Novel Target ranking
+        spearman = spearman_corrcoef(pred_reg.reshape(-1), reg_labels.reshape(-1))
+        
+        self.log('test_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True, add_dataloader_idx=False)
+        self.log('test_spearman', spearman, on_epoch=True, prog_bar=True, sync_dist=True, add_dataloader_idx=False)
+        return loss
+
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self.parameters()), 

@@ -14,12 +14,14 @@ resume_checkpoint_path: null
 data:
   base_csv: "data/dummy/base_data.csv"
   lookup_csv: "data/dummy/lookup_data.csv"
+  test_csv: "data/test/test_adaptyv.csv"
   num_workers: 6
   weight_col: null
   balance_clusters: false
 
 training:
   seed: 42
+  test_every_val: true
   
   # Split
   split_strategy: "random"
@@ -30,7 +32,7 @@ training:
   max_epochs: 5
 
   # Optimizer
-  learning_rate: 5e-5  
+  learning_rate: 1e-5  
   weight_decay: 1e-2
   warmup_ratio: 0.1
 
@@ -45,7 +47,7 @@ training:
   # Hardware
   accelerator: "auto"
   devices: "auto"
-  strategy: "ddp_find_unused_parameters_true"
+  strategy: "ddp"
   precision: "bf16-mixed"
 
   # Stability

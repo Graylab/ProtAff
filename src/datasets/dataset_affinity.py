@@ -160,6 +160,43 @@ class AffinityDataset(Dataset):
             "log_Aff": norm_aff,     
         }
 
+
+class TestAffinityDataset(Dataset):
+    """
+    Test dataset that directly uses sequences from CSV.
+    Expected CSV format: id,binder_sequence,target_sequence,log_Aff
+    """
+    def __init__(self, 
+                 test_csv_path: str,
+                 provided_stats: Tuple[float, float]):
+        
+        self.test_df = pd.read_csv(test_csv_path)
+        
+        # Validate required columns
+        required_cols = ['binder_sequence', 'target_sequence', 'log_Aff']
+        missing = [col for col in required_cols if col not in self.test_df.columns]
+        if missing:
+            raise KeyError(f"Test CSV missing required columns: {missing}")
+        
+        self.mean, self.std = provided_stats
+        print(f"[TestDataset] Using PROVIDED stats. Mean: {self.mean:.4f}, Std: {self.std:.4f}")
+        print(f"[TestDataset] Loaded {len(self.test_df)} test samples")
+
+    def __len__(self):
+        return len(self.test_df)
+
+    def __getitem__(self, idx):
+        row = self.test_df.iloc[idx]
+        raw_aff = float(row["log_Aff"])
+        norm_aff = (raw_aff - self.mean) / (self.std + 1e-8)
+
+        return {
+            "binder_seq": str(row["binder_sequence"]),
+            "target_seq": str(row["target_sequence"]),
+            "log_Aff": norm_aff,
+        }
+
+
 # ----------------------------------------------------------------------
 # 3. DataModule
 # ----------------------------------------------------------------------
@@ -183,6 +220,7 @@ class AffinityDataModule(LightningDataModule):
         
         self.train_dataset = None
         self.val_dataset = None
+        self.test_dataset = None  # Add test dataset
         self.sampler = None
 
     def setup(self, stage: Optional[str] = None):
@@ -234,7 +272,7 @@ class AffinityDataModule(LightningDataModule):
 
         print(f"Final Counts -> Train: {len(train_df)}, Val: {len(val_df)}")
 
-        # 3. Construct Final Datasets
+        # 3. Construct Train/Val Datasets
         self.train_dataset = AffinityDataset(
             train_df, 
             self.cfg.data.lookup_csv, 
@@ -248,6 +286,18 @@ class AffinityDataModule(LightningDataModule):
             weight_col=self.weight_col,
             provided_stats=(self.train_dataset.mean, self.train_dataset.std)
         )
+
+        # 4. Construct Test Dataset (if provided)
+        test_csv = self.cfg.data.get("test_csv", None)
+        if test_csv and os.path.exists(test_csv):
+            print(f"[DataModule] Loading test set from: {test_csv}")
+            self.test_dataset = TestAffinityDataset(
+                test_csv_path=test_csv,
+                provided_stats=(self.train_dataset.mean, self.train_dataset.std)
+            )
+        else:
+            print("[DataModule] No test CSV provided or file not found - skipping test dataset")
+            self.test_dataset = None
 
         if self.train_dataset.weights is not None:
             self.sampler = WeightedRandomSampler(
@@ -268,4 +318,16 @@ class AffinityDataModule(LightningDataModule):
             self.val_dataset, batch_size=self.cfg.training.batch_size, 
             collate_fn=self.collate_fn, num_workers=self.num_workers, 
             shuffle=False, pin_memory=True
+        )
+
+    def test_dataloader(self):
+        if self.test_dataset is None:
+            return None
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.cfg.training.batch_size,
+            collate_fn=self.collate_fn,
+            num_workers=self.num_workers,
+            shuffle=False,
+            pin_memory=True
         )
