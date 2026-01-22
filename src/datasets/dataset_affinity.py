@@ -115,6 +115,7 @@ class AffinityDataset(Dataset):
                  lookup_csv_path: str, 
                  weight_col: Optional[str] = None, 
                  balance_clusters: bool = False,
+                 balance_power: float = 0.5,
                  provided_stats: Optional[Tuple[float, float]] = None):
         
         lookup_df = pd.read_csv(lookup_csv_path)
@@ -129,8 +130,28 @@ class AffinityDataset(Dataset):
         if balance_clusters:
             stratify_col = weight_col if (weight_col and weight_col in self.base_df.columns) else "target_id"
             counts = self.base_df[stratify_col].value_counts()
+            
+            # DIAGNOSTIC: Print imbalance stats
+            print(f"\n[Dataset] Imbalance Statistics for '{stratify_col}':")
+            print(f"  Total unique {stratify_col}s: {len(counts)}")
+            print(f"  Max samples per {stratify_col}: {counts.max()}")
+            print(f"  Min samples per {stratify_col}: {counts.min()}")
+            print(f"  Median samples: {counts.median()}")
+            print(f"  Mean samples: {counts.mean():.1f}")
+            print(f"  Imbalance ratio (max/min): {counts.max()/counts.min():.1f}x")
+            
             freqs = self.base_df[stratify_col].map(counts)
-            self.weights = (1.0 / np.sqrt(freqs)).to_numpy(dtype=np.float32)
+            
+            # Use configurable power for balancing strength
+            # balance_power=0.5 → sqrt (aggressive)
+            # balance_power=0.25 → 4th root (gentler)
+            # balance_power=0.0 → no balancing
+            self.weights = (1.0 / np.power(freqs, balance_power)).to_numpy(dtype=np.float32)
+            
+            # DIAGNOSTIC: Print weight stats
+            print(f"  Balance power: {balance_power}")
+            print(f"  Weight range: {self.weights.min():.4f} to {self.weights.max():.4f}")
+            print(f"  Weight ratio (max/min): {self.weights.max()/self.weights.min():.1f}x")
             
         elif weight_col and weight_col in self.base_df.columns:
             self.weights = pd.to_numeric(self.base_df[weight_col], errors='coerce').fillna(1.0).to_numpy(dtype=np.float32)
@@ -220,7 +241,7 @@ class AffinityDataModule(LightningDataModule):
         
         self.train_dataset = None
         self.val_dataset = None
-        self.test_dataset = None  # Add test dataset
+        self.test_dataset = None
         self.sampler = None
 
     def setup(self, stage: Optional[str] = None):
@@ -244,46 +265,70 @@ class AffinityDataModule(LightningDataModule):
             )
         
         elif strategy == "group":
-            print(f"--- Running CUSTOM GROUP Split (Singletons to Train, Multi 9:1) ---")
+            print(f"--- Running STRICT GROUP Split (Val has UNSEEN targets) ---")
             
             # 1. Count occurrences per target
             counts = base_df[self.split_col].value_counts()
-            singletons = counts[counts == 1].index.tolist()
-            multi_sample = counts[counts > 1].index.tolist()
             
-            # 2. Shuffle multi-sample groups
+            # Separate singletons and multi-sample targets
+            singleton_targets = counts[counts == 1].index.tolist()
+            multi_sample_targets = counts[counts > 1].index.tolist()
+            
+            print(f"  Total unique targets: {len(counts)}")
+            print(f"  Singleton targets (1 sample): {len(singleton_targets)}")
+            print(f"  Multi-sample targets (>1 sample): {len(multi_sample_targets)}")
+            
+            # 2. Shuffle multi-sample targets
             rng = np.random.default_rng(seed)
-            rng.shuffle(multi_sample)
+            rng.shuffle(multi_sample_targets)
             
-            # 3. Split multi-sample groups 90/10
-            split_idx = int(len(multi_sample) * train_ratio)
-            # Guarantee at least one group for val if possible
-            if split_idx == len(multi_sample) and len(multi_sample) > 0:
-                split_idx -= 1
-                
-            train_groups = set(multi_sample[:split_idx]).union(set(singletons))
-            val_groups = set(multi_sample[split_idx:])
+            # 3. Split multi-sample targets for train/val (NO OVERLAP)
+            # Val gets targets completely unseen in training
+            val_target_count = max(1, int(len(multi_sample_targets) * (1 - train_ratio)))
             
-            train_df = base_df[base_df[self.split_col].isin(train_groups)].copy()
-            val_df = base_df[base_df[self.split_col].isin(val_groups)].copy()
+            val_targets = set(multi_sample_targets[:val_target_count])
+            train_targets_multi = set(multi_sample_targets[val_target_count:])
+            
+            # 4. Add all singletons to training (can't split them)
+            train_targets = train_targets_multi.union(set(singleton_targets))
+            
+            # 5. Create dataframes based on target membership
+            train_df = base_df[base_df[self.split_col].isin(train_targets)].copy()
+            val_df = base_df[base_df[self.split_col].isin(val_targets)].copy()
+            
+            # 6. Verify no target overlap (CRITICAL!)
+            overlap = train_targets & val_targets
+            if len(overlap) > 0:
+                raise ValueError(f"ERROR: Train/Val target overlap detected: {overlap}")
+            
+            print(f"  ✓ Train targets: {len(train_targets)}")
+            print(f"    - Multi-sample: {len(train_targets_multi)}")
+            print(f"    - Singletons: {len(singleton_targets)}")
+            print(f"  ✓ Val targets: {len(val_targets)} (COMPLETELY UNSEEN in train)")
+            print(f"  ✓ Target overlap check: {len(overlap)} (MUST be 0)")
 
         else:
             raise ValueError(f"Unknown split_strategy: {strategy}")
 
-        print(f"Final Counts -> Train: {len(train_df)}, Val: {len(val_df)}")
+        print(f"Final Sample Counts -> Train: {len(train_df)}, Val: {len(val_df)}")
 
+        # Get balance_power from config (default 0.25 for gentler balancing)
+        balance_power = self.cfg.data.get("balance_power", 0.25)
+        
         # 3. Construct Train/Val Datasets
         self.train_dataset = AffinityDataset(
             train_df, 
             self.cfg.data.lookup_csv, 
             weight_col=self.weight_col, 
-            balance_clusters=self.cfg.data.get("balance_clusters", False)
+            balance_clusters=self.cfg.data.get("balance_clusters", False),
+            balance_power=balance_power
         )
         
         self.val_dataset = AffinityDataset(
             val_df, 
             self.cfg.data.lookup_csv, 
             weight_col=self.weight_col,
+            balance_clusters=False,  # NEVER balance validation!
             provided_stats=(self.train_dataset.mean, self.train_dataset.std)
         )
 
@@ -299,12 +344,16 @@ class AffinityDataModule(LightningDataModule):
             print("[DataModule] No test CSV provided or file not found - skipping test dataset")
             self.test_dataset = None
 
+        # 5. Setup weighted sampler if balancing enabled
         if self.train_dataset.weights is not None:
+            print(f"[DataModule] ✓ Using WeightedRandomSampler for {len(self.train_dataset.weights)} samples")
             self.sampler = WeightedRandomSampler(
                 weights=self.train_dataset.weights, 
                 num_samples=len(self.train_dataset), 
                 replacement=True
             )
+        else:
+            print(f"[DataModule] ✓ Using standard random shuffling (no sample weighting)")
 
     def train_dataloader(self):
         return DataLoader(

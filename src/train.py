@@ -7,6 +7,8 @@ from omegaconf import DictConfig
 from hydra.core.hydra_config import HydraConfig  
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor, EarlyStopping
 from pytorch_lightning.loggers import WandbLogger
+from torchmetrics.functional import spearman_corrcoef
+            
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -61,6 +63,7 @@ class SaveHuggingFaceFormatCallback(Callback):
 class TestEveryValidationCallback(Callback):
     """
     Runs test loop every time validation is run, works with val_check_interval.
+    Properly handles DDP by gathering results across all GPUs.
     """
     def __init__(self, datamodule):
         self.datamodule = datamodule
@@ -71,14 +74,19 @@ class TestEveryValidationCallback(Callback):
         if trainer.sanity_checking:
             return
         
+        # Skip if no test dataset
+        if self.datamodule.test_dataset is None:
+            return
+        
         # Lazy init test dataloader
         if self._test_dataloader is None:
             self.datamodule.setup("test")
             self._test_dataloader = self.datamodule.test_dataloader()
+            if self._test_dataloader is None:
+                return
         
         # Manually run test loop
         pl_module.eval()
-        test_losses = []
         test_preds = []
         test_labels = []
         
@@ -91,22 +99,31 @@ class TestEveryValidationCallback(Callback):
                 pred_reg = pl_module.forward(batch)
                 reg_labels = batch['reg_labels']
                 
-                loss = pl_module.mse_loss(pred_reg, reg_labels)
-                test_losses.append(loss)
                 test_preds.append(pred_reg)
                 test_labels.append(reg_labels)
         
-        # Aggregate metrics
-        avg_loss = torch.stack(test_losses).mean()
+        # Concatenate local results
         all_preds = torch.cat(test_preds).reshape(-1)
         all_labels = torch.cat(test_labels).reshape(-1)
         
-        from torchmetrics.functional import spearman_corrcoef
-        spearman = spearman_corrcoef(all_preds, all_labels)
+        # Gather across GPUs if using DDP
+        if trainer.world_size > 1:
+            all_preds = pl_module.all_gather(all_preds).reshape(-1)
+            all_labels = pl_module.all_gather(all_labels).reshape(-1)
         
-        # Log with same step as validation
-        pl_module.log('test_loss', avg_loss, prog_bar=True, sync_dist=True)
-        pl_module.log('test_spearman', spearman, prog_bar=True, sync_dist=True)
+        # Compute metrics (only on rank 0 to avoid duplicate logging)
+        if trainer.is_global_zero:
+            avg_loss = torch.nn.functional.mse_loss(all_preds, all_labels)
+            spearman = spearman_corrcoef(all_preds, all_labels)
+            
+            # Log directly to logger
+            if trainer.logger:
+                trainer.logger.log_metrics({
+                    'test_loss': avg_loss.item(),
+                    'test_spearman': spearman.item()
+                }, step=trainer.global_step)
+                
+            print(f"\n[Test] loss: {avg_loss.item():.4f}, spearman: {spearman.item():.4f}")
         
         pl_module.train()
 
