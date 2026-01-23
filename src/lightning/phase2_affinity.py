@@ -27,7 +27,7 @@ class AffinityModule(pl.LightningModule):
         
         if arch == "interaction_map":
             # Saves normalization layers for the independent ESM encodings
-            modules_to_save.extend(["norm_binder", "norm_target"])
+            modules_to_save.extend(["norm_binder", "norm_target", "cross_attn", "norm_final", "projector"])
         elif arch == "cross_attn":
             modules_to_save.extend(["norm_binder", "norm_target", "cross_attn", "norm_final", "projector"])
         else: # concat

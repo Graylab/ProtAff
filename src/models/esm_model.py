@@ -44,6 +44,7 @@ class ESMConcatModel(nn.Module):
         score = self.head_score(vec)
         return score
 
+
 class ESMCrossAttnModel(nn.Module):
     """
     Final Optimized Version: Uni-directional Late Fusion.
@@ -123,53 +124,87 @@ class ESMCrossAttnModel(nn.Module):
         if return_attn:
             return score, attn_weights
         return score
-        
+
+
 class ESMInteractionMapModel(nn.Module):
     """
-    Computes a scaled dot-product interaction map between Binder and Target.
-    Pooling: Masked Mean (Average Interaction Density).
+    CNN-Free Version: Regresses affinity strictly from the mean intensity 
+    of the Multi-Head Attention weights across the NxM interaction map.
     """
-    def __init__(self, model_name, cfg):
+    def __init__(self, model_name, cfg: DictConfig):
         super().__init__()
         self.esm = EsmModel.from_pretrained(model_name)
+        
         hidden_dim = self.esm.config.hidden_size
         d_model = getattr(cfg.model, "d_model", 128)
+        n_heads = getattr(cfg.model, "n_heads", 8)
+        dropout = getattr(cfg.model, "dropout", 0.1)
 
-        # Normalization for independent encodings
+        # Pre-attention normalization
         self.norm_binder = nn.LayerNorm(hidden_dim)
         self.norm_target = nn.LayerNorm(hidden_dim)
-        
-        # Scaling factor: sqrt(D) to stabilize dot-product variance
-        self.register_buffer("scale", torch.tensor(hidden_dim ** 0.5))
 
+        # Cross-Attention: Binder acts on Target
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim, 
+            num_heads=n_heads, 
+            batch_first=True,
+            dropout=dropout
+        )
+        
+        # Projection: Takes n_heads (intensities) and maps to d_model
+        self.projector = nn.Linear(n_heads, d_model)
+        self.norm_final = nn.LayerNorm(d_model)
+        
+        # Final Scoring Head
         self.head_score = nn.Sequential(
-            nn.Linear(1, d_model),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(d_model, 1)
         )
+        
+        self._init_weights()
 
-    def forward(self, binder_ids, binder_mask, target_ids, target_mask):
-        # 1. ESM Encoding
+    def _init_weights(self):
+        for n, p in self.named_parameters():
+            if "esm" not in n and p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, binder_ids, binder_mask, target_ids, target_mask, return_attn=False, **kwargs):
+        # 1. Independent ESM Encoding
         b_raw = self.esm(input_ids=binder_ids, attention_mask=binder_mask).last_hidden_state
         t_raw = self.esm(input_ids=target_ids, attention_mask=target_mask).last_hidden_state
         
-        # 2. Pre-Interaction Normalization
-        b_norm = self.norm_binder(b_raw) 
-        t_norm = self.norm_target(t_raw) 
+        # 2. Symmetric Pre-Norm
+        b_norm = self.norm_binder(b_raw)
+        t_norm = self.norm_target(t_raw)
         
-        # 3. Scaled Dot-Product [B, N, M]
-        # (Binder @ Target.T) / sqrt(D)
-        interaction_matrix = torch.bmm(b_norm, t_norm.transpose(1, 2)) / self.scale
+        # 3. Extract Interaction Map (Batch, Heads, N, M)
+        # average_attn_weights=False gives us individual head behavior
+        _, attn_weights = self.cross_attn(
+            b_norm, 
+            t_norm, 
+            t_norm, 
+            key_padding_mask=~target_mask.bool(),
+            average_attn_weights=False 
+        )
         
-        # 4. 2D Masking (Exclude Padding)
-        mask_2d = torch.bmm(binder_mask.unsqueeze(2).float(), target_mask.unsqueeze(1).float())
+        # 4. Spatial Masking & Intensity Pooling
+        # Clean NxM map from padding artifacts
+        mask_2d = (binder_mask.unsqueeze(-1) * target_mask.unsqueeze(1)).unsqueeze(1)
+        attn_map = attn_weights * mask_2d
         
-        # 5. Masked Mean Pooling
-        # sum of valid interactions / count of valid pairs
-        sum_interaction = torch.sum(interaction_matrix * mask_2d, dim=(1, 2))
-        num_valid_pairs = torch.clamp(mask_2d.sum(dim=(1, 2)), min=1.0)
+        # Pool NxM map to get 1 value per head (Batch, n_heads)
+        sum_weights = attn_map.sum(dim=(2, 3))
+        valid_cells = mask_2d.sum(dim=(2, 3)).clamp(min=1e-9)
+        head_intensity = sum_weights / valid_cells
         
-        avg_interaction = (sum_interaction / num_valid_pairs).unsqueeze(-1)
+        # 5. Project to d_model and Score
+        latent_vec = self.norm_final(self.projector(head_intensity))
+        score = self.head_score(latent_vec)
         
-        # 6. Final Ranking Score
-        return self.head_score(avg_interaction)
+        if return_attn:
+            return score, attn_weights
+        return score

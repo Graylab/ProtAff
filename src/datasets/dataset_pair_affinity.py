@@ -12,7 +12,70 @@ from pytorch_lightning import LightningDataModule
 from transformers import EsmTokenizer
 
 # ======================================================================
-# 1. PAIRWISE COLLATOR
+# 0. REGRESSION COLLATOR (For Test)
+# ======================================================================
+@dataclass
+class RegressionCollator:
+    """
+    Collator for regression test set - single samples (not pairs).
+    """
+    tokenizer: Any
+    arch: str = "concat"
+    max_length: int = 1024
+
+    def _tokenize_concat(self, binders: List[str], targets: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+        eos = self.tokenizer.eos_token
+        cls_id = self.tokenizer.cls_token_id
+        eos_id = self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id
+
+        binder_seqs = [str(b).replace(":", eos) for b in binders]
+        target_seqs = [str(t).replace(":", eos) for t in targets]
+
+        b_encoded = self.tokenizer(binder_seqs, add_special_tokens=False)["input_ids"]
+        t_encoded = self.tokenizer(target_seqs, add_special_tokens=False)["input_ids"]
+
+        input_ids_list, mask_list = [], []
+        for b_ids, t_ids in zip(b_encoded, t_encoded):
+            allowed_len = self.max_length - 3 
+            if len(b_ids) + len(t_ids) > allowed_len:
+                t_ids = t_ids[:max(0, allowed_len - len(b_ids))]
+                b_ids = b_ids[:allowed_len]
+            
+            full_ids = [cls_id] + b_ids + [eos_id] + t_ids + [eos_id]
+            input_ids_list.append(torch.tensor(full_ids, dtype=torch.long))
+            mask_list.append(torch.ones(len(full_ids), dtype=torch.long))
+
+        return (
+            pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id),
+            pad_sequence(mask_list, batch_first=True, padding_value=0)
+        )
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        binders = [x["binder_seq"] for x in batch]
+        targets = [x["target_seq"] for x in batch]
+        labels = torch.tensor([x["log_Aff"] for x in batch], dtype=torch.float32).unsqueeze(1)
+
+        if self.arch in ["cross_attn", "interaction_map"]:
+            b_enc = self.tokenizer(binders, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
+            t_enc = self.tokenizer(targets, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
+            return {
+                "binder_ids": b_enc["input_ids"],
+                "binder_mask": b_enc["attention_mask"],
+                "target_ids": t_enc["input_ids"],
+                "target_mask": t_enc["attention_mask"],
+                "reg_labels": labels
+            }
+        else:
+            input_ids, mask = self._tokenize_concat(binders, targets)
+            return {
+                "input_ids": input_ids,
+                "attention_mask": mask,
+                "reg_labels": labels
+            }
+
+# ======================================================================
+# 1. PAIRWISE COLLATOR (For Train/Val)
 # ======================================================================
 @dataclass
 class PairwiseCollator:
@@ -81,7 +144,7 @@ class PairwiseCollator:
             }
 
 # ======================================================================
-# 2. HYBRID PAIRWISE DATASET (Target-Centric)
+# 2. HYBRID PAIRWISE DATASET (Target-Centric) - For Train/Val
 # ======================================================================
 class PairwiseAffinityDataset(Dataset):
     def __init__(self, base_df, lookup_csv_path, pairs_per_sample=2, inter_pps=10, 
@@ -156,6 +219,7 @@ class PairwiseAffinityDataset(Dataset):
         self.pair_types.append('inter_target' if is_specificity else 'intra_target')
 
     def __len__(self): return len(self.b_better)
+    
     def __getitem__(self, idx):
         return {
             "better_binder": self.id2seq.get(f"binder_{self.b_better[idx]}", ""),
@@ -165,37 +229,142 @@ class PairwiseAffinityDataset(Dataset):
             "delta": self.deltas[idx]
         }
 
+
 # ======================================================================
-# 3. RELIABLE DATAMODULE
+# 3. TEST REGRESSION DATASET (Single Samples) - For Test
+# ======================================================================
+class TestRegressionDataset(Dataset):
+    """
+    Test dataset for regression evaluation (single samples, not pairs).
+    Expected format: binder_sequence, target_sequence, log_Aff
+    """
+    def __init__(self, test_csv_path: str, provided_stats: Tuple[float, float]):
+        self.test_df = pd.read_csv(test_csv_path)
+        
+        # Validate required columns
+        required_cols = ['binder_sequence', 'target_sequence', 'log_Aff']
+        missing = [col for col in required_cols if col not in self.test_df.columns]
+        if missing:
+            raise KeyError(f"Test CSV missing required columns: {missing}")
+        
+        self.mean, self.std = provided_stats
+        print(f"\n[TestDataset] Using PROVIDED stats. Mean: {self.mean:.4f}, Std: {self.std:.4f}")
+        print(f"[TestDataset] Loaded {len(self.test_df)} test samples")
+        print(f"[TestDataset] Unique targets: {self.test_df['target_sequence'].nunique()}")
+    
+    def __len__(self):
+        return len(self.test_df)
+    
+    def __getitem__(self, idx):
+        row = self.test_df.iloc[idx]
+        raw_aff = float(row["log_Aff"])
+        norm_aff = (raw_aff - self.mean) / (self.std + 1e-8)
+        
+        return {
+            "binder_seq": str(row["binder_sequence"]),
+            "target_seq": str(row["target_sequence"]),
+            "log_Aff": norm_aff
+        }
+
+
+# ======================================================================
+# 4. DATAMODULE WITH CLUSTER-BASED SPLITTING
 # ======================================================================
 class PairAffinityDataModule(LightningDataModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.cfg = cfg
         self.tokenizer = EsmTokenizer.from_pretrained(cfg.model.name)
+        
+        # Pairwise collator for train/val
         self.collate_fn = PairwiseCollator(
             tokenizer=self.tokenizer, 
             arch=cfg.model.get("arch", "concat"), 
             max_length=cfg.model.max_length
         )
+        
         self.num_workers = cfg.data.get("num_workers", 4)
+        
+        # Use weight_col for splitting (can be target_id or cluster_id)
+        self.weight_col = self.cfg.data.get("weight_col")
+        self.split_col = self.weight_col if self.weight_col is not None else "target_id"
+        
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
+        self.test_collate_fn = None
+        self.sampler = None
 
     def setup(self, stage=None):
         base_df = pd.read_csv(self.cfg.data.base_csv)
-        targets = base_df['target_id'].unique()
+        
+        if self.split_col not in base_df.columns:
+            raise KeyError(f"Split column '{self.split_col}' not found in CSV.")
+        
         seed = self.cfg.training.get("seed", 42)
-        np.random.seed(seed)
-        np.random.shuffle(targets)
+        train_ratio = self.cfg.training.get("train_val_split", 0.9)
+        strategy = self.cfg.training.get("split_strategy", "group")
         
-        split_idx = int(len(targets) * 0.9)
-        train_targets, val_targets = targets[:split_idx], targets[split_idx:]
+        print(f"\n[DataModule] Split/Balance Column: {self.split_col}")
         
-        print(f"\n[DataModule] Split Strategy: Target-ID Group Split")
-        print(f"[DataModule] Train Targets: {len(train_targets)}, Val Targets: {len(val_targets)}")
+        if strategy == "random":
+            # Random split (not recommended for generalization)
+            from sklearn.model_selection import train_test_split
+            train_df, val_df = train_test_split(
+                base_df, 
+                train_size=train_ratio, 
+                random_state=seed, 
+                shuffle=True
+            )
+            print(f"[DataModule] Split Strategy: Random")
+            
+        elif strategy == "group":
+            # Group-based split (by target_id or cluster_id)
+            print(f"[DataModule] Split Strategy: Group by {self.split_col}")
+            
+            # Get unique groups
+            unique_groups = base_df[self.split_col].unique()
+            
+            # Count samples per group
+            counts = base_df[self.split_col].value_counts()
+            singleton_groups = counts[counts == 1].index.tolist()
+            multi_sample_groups = counts[counts > 1].index.tolist()
+            
+            print(f"  Total unique {self.split_col}s: {len(unique_groups)}")
+            print(f"  Singleton {self.split_col}s (1 sample): {len(singleton_groups)}")
+            print(f"  Multi-sample {self.split_col}s (>1 sample): {len(multi_sample_groups)}")
+            
+            # Shuffle and split multi-sample groups
+            np.random.seed(seed)
+            np.random.shuffle(multi_sample_groups)
+            
+            val_group_count = max(1, int(len(multi_sample_groups) * (1 - train_ratio)))
+            val_groups = set(multi_sample_groups[:val_group_count])
+            train_groups_multi = set(multi_sample_groups[val_group_count:])
+            
+            # Add singletons to train
+            train_groups = train_groups_multi.union(set(singleton_groups))
+            
+            # Create splits
+            train_df = base_df[base_df[self.split_col].isin(train_groups)].copy()
+            val_df = base_df[base_df[self.split_col].isin(val_groups)].copy()
+            
+            # Verify no overlap
+            overlap = train_groups & val_groups
+            if len(overlap) > 0:
+                raise ValueError(f"ERROR: Train/Val {self.split_col} overlap: {overlap}")
+            
+            print(f"  ✓ Train {self.split_col}s: {len(train_groups)}")
+            print(f"    - Multi-sample: {len(train_groups_multi)}")
+            print(f"    - Singletons: {len(singleton_groups)}")
+            print(f"  ✓ Val {self.split_col}s: {len(val_groups)} (COMPLETELY UNSEEN)")
+            print(f"  ✓ Overlap check: {len(overlap)} (MUST be 0)")
+        else:
+            raise ValueError(f"Unknown split_strategy: {strategy}")
+        
+        print(f"  Train samples: {len(train_df)}, Val samples: {len(val_df)}")
 
-        train_df = base_df[base_df['target_id'].isin(train_targets)]
-        val_df = base_df[base_df['target_id'].isin(val_targets)]
-
+        # Create pairwise datasets for train/val
         self.train_dataset = PairwiseAffinityDataset(
             train_df, self.cfg.data.lookup_csv, 
             pairs_per_sample=self.cfg.data.get("pairs_per_sample", 2),
@@ -204,31 +373,144 @@ class PairAffinityDataModule(LightningDataModule):
             max_anchors_per_target=self.cfg.data.get("max_anchors_per_target", 2000),
             split_name="TRAIN"
         )
+        
         self.val_dataset = PairwiseAffinityDataset(
             val_df, self.cfg.data.lookup_csv, 
-            pairs_per_sample=2, inter_pps=5, split_name="VAL"
+            pairs_per_sample=2, 
+            inter_pps=5, 
+            split_name="VAL"
         )
         
-        # --- THE RELIABLE MATH: W = 1 / sqrt(Count(T1) + Count(T2)) ---
-        t_all = self.train_dataset.t_better + self.train_dataset.t_worse
-        target_counts = pd.Series(t_all).value_counts()
-        print(f"[Sampler] Top Targets Frequency: \n{target_counts.head(5).to_string()}")
+        # Load test dataset (REGRESSION format, not pairs!)
+        test_csv = self.cfg.data.get("test_csv", None)
+        if test_csv and os.path.exists(test_csv):
+            print(f"\n[DataModule] Loading REGRESSION test set from: {test_csv}")
+            
+            # Get normalization stats from training data (before pair generation)
+            train_stats_df = train_df[train_df['log_Aff'].notna()]
+            train_mean = float(train_stats_df['log_Aff'].mean())
+            train_std = float(train_stats_df['log_Aff'].std())
+            
+            print(f"[DataModule] Train normalization stats - Mean: {train_mean:.4f}, Std: {train_std:.4f}")
+            
+            self.test_dataset = TestRegressionDataset(
+                test_csv_path=test_csv,
+                provided_stats=(train_mean, train_std)
+            )
+            
+            # Create separate collator for test (regression format)
+            self.test_collate_fn = RegressionCollator(
+                tokenizer=self.tokenizer,
+                arch=self.cfg.model.get("arch", "concat"),
+                max_length=self.cfg.model.max_length
+            )
+        else:
+            print("\n[DataModule] No test CSV provided - skipping test dataset")
+            self.test_dataset = None
+            self.test_collate_fn = None
         
-        counts_dict = target_counts.to_dict()
-        pair_weights = []
-        for i in range(len(self.train_dataset)):
-            t1, t2 = self.train_dataset.t_better[i], self.train_dataset.t_worse[i]
-            combined_freq = counts_dict[t1] + counts_dict[t2]
-            pair_weights.append(1.0 / np.sqrt(combined_freq))
+        # Weighted sampling based on target/cluster frequency in pairs
+        balance_clusters = self.cfg.data.get("balance_clusters", False)
+        balance_power = self.cfg.data.get("balance_power", 0.5)
         
-        self.sampler = WeightedRandomSampler(weights=pair_weights, num_samples=len(pair_weights), replacement=True)
+        if balance_clusters:
+            print(f"\n[Sampler] Balancing enabled with power={balance_power}")
+            
+            # Get split column values for all targets in pairs
+            # Map target_id to split_col value (e.g., cluster_id)
+            target_to_group = base_df.set_index('target_id')[self.split_col].to_dict()
+            
+            # Count frequency of each group in training pairs
+            train_groups_in_pairs = []
+            for i in range(len(self.train_dataset)):
+                t1 = self.train_dataset.t_better[i]
+                t2 = self.train_dataset.t_worse[i]
+                
+                # Get group for each target
+                g1 = target_to_group.get(t1, t1)  # Fallback to target_id if not found
+                g2 = target_to_group.get(t2, t2)
+                
+                train_groups_in_pairs.extend([g1, g2])
+            
+            # Count group occurrences
+            group_counts = pd.Series(train_groups_in_pairs).value_counts()
+            print(f"  Top {self.split_col}s in pairs:")
+            print(group_counts.head(5).to_string())
+            
+            # Compute weights: 1 / (count(g1) + count(g2))^power
+            counts_dict = group_counts.to_dict()
+            pair_weights = []
+            
+            for i in range(len(self.train_dataset)):
+                t1 = self.train_dataset.t_better[i]
+                t2 = self.train_dataset.t_worse[i]
+                
+                g1 = target_to_group.get(t1, t1)
+                g2 = target_to_group.get(t2, t2)
+                
+                combined_freq = counts_dict.get(g1, 1) + counts_dict.get(g2, 1)
+                weight = 1.0 / np.power(combined_freq, balance_power)
+                pair_weights.append(weight)
+            
+            pair_weights = np.array(pair_weights, dtype=np.float32)
+            print(f"  Weight range: {pair_weights.min():.4f} to {pair_weights.max():.4f}")
+            print(f"  Weight ratio: {pair_weights.max()/pair_weights.min():.1f}x")
+            
+            self.sampler = WeightedRandomSampler(
+                weights=pair_weights, 
+                num_samples=len(pair_weights), 
+                replacement=True
+            )
+        else:
+            # Original sampler: balance by target frequency only
+            print(f"\n[Sampler] Using target-frequency balancing (legacy)")
+            t_all = self.train_dataset.t_better + self.train_dataset.t_worse
+            target_counts = pd.Series(t_all).value_counts()
+            print(f"  Top Targets in pairs:")
+            print(target_counts.head(5).to_string())
+            
+            counts_dict = target_counts.to_dict()
+            pair_weights = []
+            for i in range(len(self.train_dataset)):
+                t1 = self.train_dataset.t_better[i]
+                t2 = self.train_dataset.t_worse[i]
+                combined_freq = counts_dict[t1] + counts_dict[t2]
+                pair_weights.append(1.0 / np.sqrt(combined_freq))
+            
+            self.sampler = WeightedRandomSampler(
+                weights=pair_weights, 
+                num_samples=len(pair_weights), 
+                replacement=True
+            )
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.cfg.training.batch_size, 
-                          collate_fn=self.collate_fn, sampler=self.sampler, 
-                          num_workers=self.num_workers, pin_memory=True)
+        return DataLoader(
+            self.train_dataset, 
+            batch_size=self.cfg.training.batch_size, 
+            collate_fn=self.collate_fn, 
+            sampler=self.sampler, 
+            num_workers=self.num_workers, 
+            pin_memory=True
+        )
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.cfg.training.batch_size, 
-                          collate_fn=self.collate_fn, shuffle=False, 
-                          num_workers=self.num_workers, pin_memory=True)
+        return DataLoader(
+            self.val_dataset, 
+            batch_size=self.cfg.training.batch_size, 
+            collate_fn=self.collate_fn, 
+            shuffle=False, 
+            num_workers=self.num_workers, 
+            pin_memory=True
+        )
+    
+    def test_dataloader(self):
+        if self.test_dataset is None:
+            return None
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.cfg.training.batch_size,
+            collate_fn=self.test_collate_fn,  # Use regression collator!
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True
+        )

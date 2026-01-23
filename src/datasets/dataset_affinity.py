@@ -128,6 +128,7 @@ class AffinityDataset(Dataset):
         
         self.weights = None
         if balance_clusters:
+            # Use weight_col if provided, otherwise default to target_id
             stratify_col = weight_col if (weight_col and weight_col in self.base_df.columns) else "target_id"
             counts = self.base_df[stratify_col].value_counts()
             
@@ -143,18 +144,12 @@ class AffinityDataset(Dataset):
             freqs = self.base_df[stratify_col].map(counts)
             
             # Use configurable power for balancing strength
-            # balance_power=0.5 → sqrt (aggressive)
-            # balance_power=0.25 → 4th root (gentler)
-            # balance_power=0.0 → no balancing
             self.weights = (1.0 / np.power(freqs, balance_power)).to_numpy(dtype=np.float32)
             
             # DIAGNOSTIC: Print weight stats
             print(f"  Balance power: {balance_power}")
             print(f"  Weight range: {self.weights.min():.4f} to {self.weights.max():.4f}")
             print(f"  Weight ratio (max/min): {self.weights.max()/self.weights.min():.1f}x")
-            
-        elif weight_col and weight_col in self.base_df.columns:
-            self.weights = pd.to_numeric(self.base_df[weight_col], errors='coerce').fillna(1.0).to_numpy(dtype=np.float32)
 
         self.data = self.base_df[["binder_key", "target_key", "log_Aff"]].to_dict('records')
 
@@ -236,6 +231,7 @@ class AffinityDataModule(LightningDataModule):
             print("[DataModule] Initializing ConcatCollator")
             self.collate_fn = ConcatCollator(tokenizer=self.tokenizer, max_length=self.cfg.model.max_length)
         
+        # Use weight_col for both balancing AND splitting
         self.weight_col = self.cfg.data.get("weight_col")
         self.split_col = self.weight_col if self.weight_col is not None else "target_id"
         
@@ -265,61 +261,61 @@ class AffinityDataModule(LightningDataModule):
             )
         
         elif strategy == "group":
-            print(f"--- Running STRICT GROUP Split (Val has UNSEEN targets) ---")
+            print(f"--- Running STRICT GROUP Split (Val has UNSEEN {self.split_col}s) ---")
             
-            # 1. Count occurrences per target
+            # 1. Count occurrences per split column (could be target_id or cluster_id)
             counts = base_df[self.split_col].value_counts()
             
-            # Separate singletons and multi-sample targets
-            singleton_targets = counts[counts == 1].index.tolist()
-            multi_sample_targets = counts[counts > 1].index.tolist()
+            # Separate singletons and multi-sample groups
+            singleton_groups = counts[counts == 1].index.tolist()
+            multi_sample_groups = counts[counts > 1].index.tolist()
             
-            print(f"  Total unique targets: {len(counts)}")
-            print(f"  Singleton targets (1 sample): {len(singleton_targets)}")
-            print(f"  Multi-sample targets (>1 sample): {len(multi_sample_targets)}")
+            print(f"  Total unique {self.split_col}s: {len(counts)}")
+            print(f"  Singleton {self.split_col}s (1 sample): {len(singleton_groups)}")
+            print(f"  Multi-sample {self.split_col}s (>1 sample): {len(multi_sample_groups)}")
             
-            # 2. Shuffle multi-sample targets
+            # 2. Shuffle multi-sample groups
             rng = np.random.default_rng(seed)
-            rng.shuffle(multi_sample_targets)
+            rng.shuffle(multi_sample_groups)
             
-            # 3. Split multi-sample targets for train/val (NO OVERLAP)
-            # Val gets targets completely unseen in training
-            val_target_count = max(1, int(len(multi_sample_targets) * (1 - train_ratio)))
+            # 3. Split multi-sample groups for train/val (NO OVERLAP)
+            # Val gets groups completely unseen in training
+            val_group_count = max(1, int(len(multi_sample_groups) * (1 - train_ratio)))
             
-            val_targets = set(multi_sample_targets[:val_target_count])
-            train_targets_multi = set(multi_sample_targets[val_target_count:])
+            val_groups = set(multi_sample_groups[:val_group_count])
+            train_groups_multi = set(multi_sample_groups[val_group_count:])
             
             # 4. Add all singletons to training (can't split them)
-            train_targets = train_targets_multi.union(set(singleton_targets))
+            train_groups = train_groups_multi.union(set(singleton_groups))
             
-            # 5. Create dataframes based on target membership
-            train_df = base_df[base_df[self.split_col].isin(train_targets)].copy()
-            val_df = base_df[base_df[self.split_col].isin(val_targets)].copy()
+            # 5. Create dataframes based on group membership
+            train_df = base_df[base_df[self.split_col].isin(train_groups)].copy()
+            val_df = base_df[base_df[self.split_col].isin(val_groups)].copy()
             
-            # 6. Verify no target overlap (CRITICAL!)
-            overlap = train_targets & val_targets
+            # 6. Verify no group overlap (CRITICAL!)
+            overlap = train_groups & val_groups
             if len(overlap) > 0:
-                raise ValueError(f"ERROR: Train/Val target overlap detected: {overlap}")
+                raise ValueError(f"ERROR: Train/Val {self.split_col} overlap detected: {overlap}")
             
-            print(f"  ✓ Train targets: {len(train_targets)}")
-            print(f"    - Multi-sample: {len(train_targets_multi)}")
-            print(f"    - Singletons: {len(singleton_targets)}")
-            print(f"  ✓ Val targets: {len(val_targets)} (COMPLETELY UNSEEN in train)")
-            print(f"  ✓ Target overlap check: {len(overlap)} (MUST be 0)")
+            print(f"  ✓ Train {self.split_col}s: {len(train_groups)}")
+            print(f"    - Multi-sample: {len(train_groups_multi)}")
+            print(f"    - Singletons: {len(singleton_groups)}")
+            print(f"  ✓ Val {self.split_col}s: {len(val_groups)} (COMPLETELY UNSEEN in train)")
+            print(f"  ✓ {self.split_col} overlap check: {len(overlap)} (MUST be 0)")
 
         else:
             raise ValueError(f"Unknown split_strategy: {strategy}")
 
         print(f"Final Sample Counts -> Train: {len(train_df)}, Val: {len(val_df)}")
 
-        # Get balance_power from config (default 0.25 for gentler balancing)
+        # Get balance_power from config
         balance_power = self.cfg.data.get("balance_power", 0.25)
         
         # 3. Construct Train/Val Datasets
         self.train_dataset = AffinityDataset(
             train_df, 
             self.cfg.data.lookup_csv, 
-            weight_col=self.weight_col, 
+            weight_col=self.weight_col,  # Pass weight_col for balancing
             balance_clusters=self.cfg.data.get("balance_clusters", False),
             balance_power=balance_power
         )
@@ -327,7 +323,7 @@ class AffinityDataModule(LightningDataModule):
         self.val_dataset = AffinityDataset(
             val_df, 
             self.cfg.data.lookup_csv, 
-            weight_col=self.weight_col,
+            weight_col=self.weight_col,  # Pass weight_col for consistency
             balance_clusters=False,  # NEVER balance validation!
             provided_stats=(self.train_dataset.mean, self.train_dataset.std)
         )

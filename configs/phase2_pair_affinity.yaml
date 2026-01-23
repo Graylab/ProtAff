@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - model: esm_concat
+  - model: esm_cross_attn
 
 # Task name (Informational for logging)
 task_name: "pair_affinity"
@@ -17,8 +17,16 @@ data:
   # Standard paths
   base_csv: "data/extended/base_data.csv"
   lookup_csv: "data/extended/lookup_data.csv"
+  test_csv: "data/test/test_adaptyv.csv"     # Test data (format: id,binder_sequence,target_sequence,log_Aff)
+  
+  # DataLoader
   num_workers: 6
   
+  # Balancing configuration
+  balance_clusters: true                      # Enable weighted sampling by target_id
+  balance_power: 0.25                         # Balancing strength (0.25=gentle, 0.5=medium, 1.0=aggressive)
+  weight_col: null                            # Alternative weighting column (usually null)
+
   # Pair Mining Strategy
   pairs_per_sample: 2        # How many 'worse' examples to pair with every 'better' one
   inter_pps: 10
@@ -28,23 +36,34 @@ data:
 training:
   seed: 42
 
+  # Data splitting (CRITICAL: Val must have unseen targets for your task)
+  split_strategy: "group"                     # "group" = split by target_id (val has unseen targets)
+  train_val_split: 0.9                        # 90% targets for train, 10% for val
+
   # Batch and Steps
   # Note: Effective batch size = batch_size * 2 (since we process Better + Worse)
-  batch_size: 8              # Lowered slightly as we process 2x sequences per step
-  accumulate_grad_batches: 4 # Increased to maintain effective batch size
-  max_epochs: 10             # Ranking often takes longer to converge than regression
+  batch_size: 2              # Lowered slightly as we process 2x sequences per step
+  accumulate_grad_batches: 16 # Increased to maintain effective batch size
+  max_epochs: 15             # Ranking often takes longer to converge than regression
 
   # Loss Function
   margin: 0.1                # Margin for MarginRankingLoss (diff between scores must be > this)
 
   # Optimizer
   learning_rate: 5e-5        # Slightly lower LR is often better for ranking fine-tuning
-  weight_decay: 1e-2
+  weight_decay: 5e-2
   warmup_ratio: 0.1
+
+  # Model saving (MOST IMPORTANT!)
+  monitor_metric: "val_loss"              # Metric to monitor: "val_loss", "val_spearman", "test_spearman"
+  monitor_mode: "min"                         # "min" for loss, "max" for spearman/accuracy
 
   # Early Stopping
   early_stopping: true
-  patience: 3
+  early_stopping_patience: 3                  # Stop after N epochs without improvement
+
+  # Testing
+  test_every_val: true                        # Run test evaluation after each validation
 
   # Hardware
   accelerator: "auto"
@@ -56,6 +75,9 @@ training:
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
   val_check_interval: 0.5    # Validate every half epoch
+  
+  # Logging
+  log_every_n_steps: 50
 
   wandb:
     project: "pair-affinity-finetune"

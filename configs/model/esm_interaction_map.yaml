@@ -4,12 +4,14 @@ arch: "interaction_map"
 max_length: 1024
 
 # Decoder Parameters (Simple/Standard)
+n_heads: 8
 d_model: 256
+dropout: 0.3
 
 # LoRA
 lora:
-  r: 16
-  alpha: 32
-  dropout: 0.1
+  r: 8
+  alpha: 16
+  dropout: 0.3
   target_modules: ["query", "key", "value"]
   modules_to_save: []

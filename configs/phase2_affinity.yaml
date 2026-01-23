@@ -1,66 +1,97 @@
 defaults:
   - _self_
-  - model: esm_concat 
+  - model: esm_cross_attn
 
-# Task name
+# ==========================================
+# TASK CONFIGURATION
+# ==========================================
 task_name: "affinity"
 
-# --- TRANSFER LEARNING ---
+# ==========================================
+# CHECKPOINT PATHS
+# ==========================================
+# Pretrained model to load weights from (e.g., from Phase 1 DMS training)
 pretrained_ckpt_path: null
 
-# Resume path to a specific .ckpt file (e.g., "outputs/.../checkpoints/last.ckpt")
+# Resume training from a specific checkpoint (e.g., "outputs/.../checkpoints/last.ckpt")
 resume_checkpoint_path: null
 
+# ==========================================
+# DATA CONFIGURATION
+# ==========================================
 data:
-  base_csv: "data/dummy/base_data.csv"
-  lookup_csv: "data/dummy/lookup_data.csv"
-  test_csv: "data/test/test_adaptyv.csv"
-  num_workers: 6
-  weight_col: null
-  balance_clusters: false
-  balance_power: 0.25
-
-training:
-  seed: 42
-  test_every_val: true
+  # Data files
+  base_csv: "data/dummy/base_data.csv"       # Train/Val data with target_id column
+  lookup_csv: "data/dummy/lookup_data.csv"   # Sequence lookup table
+  test_csv: "data/test/test_adaptyv.csv"     # Test data (format: id,binder_sequence,target_sequence,log_Aff)
   
-  # Split
-  split_strategy: "group"
-  train_val_split: 0.9  
+  # DataLoader
+  num_workers: 6
+  
+  # Balancing configuration
+  balance_clusters: true                      # Enable weighted sampling by target_id
+  balance_power: 0.25                         # Balancing strength (0.25=gentle, 0.5=medium, 1.0=aggressive)
+  weight_col: null                            # Alternative weighting column (usually null)
+  
+  # Optional: Data filtering (uncomment to use)
+  # max_samples_per_target: 5000              # Cap maximum samples per target
+  # min_samples_per_target: 2                 # Remove targets with fewer samples
 
-  # Batch and Steps
+# ==========================================
+# TRAINING CONFIGURATION
+# ==========================================
+training:
+  # Reproducibility
+  seed: 42
+  
+  # Data splitting (CRITICAL: Val must have unseen targets for your task)
+  split_strategy: "group"                     # "group" = split by target_id (val has unseen targets)
+  train_val_split: 0.9                        # 90% targets for train, 10% for val
+  
+  # Batch configuration
   batch_size: 16
-  accumulate_grad_batches: 2
+  accumulate_grad_batches: 2                 # Effective batch size = 16 * 2 = 32
   max_epochs: 15
-
+  
   # Optimizer
-  learning_rate: 5e-5  
-  weight_decay: 5e-2
+  learning_rate: 5e-5
+  weight_decay: 5e-2                          # High weight decay for regularization
   warmup_ratio: 0.1
-
-  # Callback
-  monitor_metric: "val_loss"
-  monitor_mode: "min"
-
-  # Early Stopping
+  
+  # Model saving (MOST IMPORTANT!)
+  monitor_metric: "val_loss"              # Metric to monitor: "val_loss", "val_spearman", "test_spearman"
+  monitor_mode: "min"                         # "min" for loss, "max" for spearman/accuracy
+  
+  # Early stopping
   early_stopping: true
-  patience: 3
-
+  early_stopping_patience: 3                  # Stop after N epochs without improvement
+  
+  # Testing
+  test_every_val: true                        # Run test evaluation after each validation
+  
   # Hardware
-  accelerator: "auto"
-  devices: "auto"
-  strategy: "ddp"
-  precision: "bf16-mixed"
-
-  # Stability
+  accelerator: "auto"                         # "gpu", "cpu", or "auto"
+  devices: "auto"                             # Number of devices or "auto"
+  strategy: "ddp_find_unused_parameters_true" # Distributed strategy
+  precision: "bf16-mixed"                     # "16-mixed", "bf16-mixed", or "32"
+  
+  # Training stability
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
-  val_check_interval: 0.5    # Validate every half epoch
-
+  
+  # Validation frequency
+  val_check_interval: 0.5                     # Validate every 0.5 epochs
+  
+  # Logging
+  log_every_n_steps: 50
+  
+  # Wandb (unchanged)
   wandb:
     project: "affinity-finetune"
 
-# Standard Hydra Output
+# ==========================================
+# HYDRA OUTPUT CONFIGURATION (unchanged)
+# ==========================================
 hydra:
   run:
     dir: outputs/phase2_affinity/${now:%Y-%m-%d}/${now:%H-%M-%S}
