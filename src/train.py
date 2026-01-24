@@ -13,15 +13,19 @@ from torchmetrics.functional import spearman_corrcoef
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 # --- IMPORT MODULES ---
-# Phase 1: DMS
+# Phase 1: DMS (Regression)
 from src.datasets.dataset_dms import DMSDataModule
 from src.lightning.phase1_dms import DMSModule
 
-# Phase 2a: Affinity (Regression)
+# Phase 1: DMS (Ranking)
+from src.datasets.dataset_pair_dms import PairDMSDataModule
+from src.lightning.phase1_pair_dms import PairDMSModule
+
+# Phase 2: Affinity (Regression)
 from src.datasets.dataset_affinity import AffinityDataModule 
 from src.lightning.phase2_affinity import AffinityModule
 
-# Phase 2b: Pair Affinity (Ranking)
+# Phase 2: Pair Affinity (Ranking)
 from src.datasets.dataset_pair_affinity import PairAffinityDataModule
 from src.lightning.phase2_pair_affinity import PairAffinityModule
 
@@ -201,22 +205,27 @@ def get_task_modules(cfg):
     task = cfg.get("task_name", "dms").lower()
     
     if task == "dms":
-        print("[Factory] Loading Phase 1: DMS (Regression/Classification)")
+        print("[Factory] Loading Phase 1: DMS (Regression)")
         dm = DMSDataModule(cfg)
         model = DMSModule(cfg)
+
+    elif task == "pair_dms":
+        print("[Factory] Loading Phase 1: DMS (Pair Ranking)")
+        dm = PairDMSDataModule(cfg)
+        model = PairDMSModule(cfg)
         
     elif task == "affinity":
-        print("[Factory] Loading Phase 2a: Affinity (Regression)")
+        print("[Factory] Loading Phase 2: Affinity (Regression)")
         dm = AffinityDataModule(cfg)
         model = AffinityModule(cfg)
         
     elif task == "pair_affinity":
-        print("[Factory] Loading Phase 2b: Pair Affinity (Ranking)")
+        print("[Factory] Loading Phase 2: Pair Affinity (Ranking)")
         dm = PairAffinityDataModule(cfg)
         model = PairAffinityModule(cfg)
         
     else:
-        raise ValueError(f"Unknown task_name: {task}. Options: ['dms', 'affinity', 'pair_affinity']")
+        raise ValueError(f"Unknown task_name: {task}. Options: ['dms', 'pair_dms', 'affinity', 'pair_affinity']")
     
     return dm, model
 

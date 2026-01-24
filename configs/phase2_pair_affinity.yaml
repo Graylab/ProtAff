@@ -14,31 +14,34 @@ pretrained_ckpt_path: null
 resume_checkpoint_path: null
 
 data:
-  # Standard paths
-  base_csv: "data/extended/base_data.csv"
-  lookup_csv: "data/extended/lookup_data.csv"
-  test_csv: "data/test/test_adaptyv.csv"     # Test data (format: id,binder_sequence,target_sequence,log_Aff)
+  # --- Paths ---
+  base_csv: "data/combined/base_cleaned.csv"
+  lookup_csv: "data/combined/lookup_data.csv"
+  test_csv: "data/test/test_adaptyv.csv"
   
-  # DataLoader
-  num_workers: 6
-  
-  # Balancing configuration
-  balance_clusters: true                      # Enable weighted sampling by target_id
-  balance_power: 0.25                         # Balancing strength (0.25=gentle, 0.5=medium, 1.0=aggressive)
-  weight_col: null                            # Alternative weighting column (usually null)
-
-  # Pair Mining Strategy
-  pairs_per_sample: 2        # How many 'worse' examples to pair with every 'better' one
+  # --- Pair Mining ---
+  pairs_per_sample: 2
   inter_pps: 10
-  min_margin: 1.0      # Min log_Aff diff required to create a pair (ensures clear separation)
+  min_margin: 1.0
   max_anchors_per_target: 2000
   
+  # --- Negative Sampling ---
+  add_negatives: false
+  neg_per_positive: 5
+  neg_log_aff: 5.0
+  
+  # --- Sampling & Balancing ---
+  weight_col: null
+  balance_clusters: true
+  balance_power: 0.25
+  
+  # --- DataLoader ---
+  num_workers: 6
+
 training:
   seed: 42
-
-  # Data splitting (CRITICAL: Val must have unseen targets for your task)
-  split_strategy: "group"                     # "group" = split by target_id (val has unseen targets)
-  train_val_split: 0.9                        # 90% targets for train, 10% for val
+  split_strategy: "group"
+  train_val_split: 0.9
 
   # Batch and Steps
   # Note: Effective batch size = batch_size * 2 (since we process Better + Worse)
@@ -54,13 +57,13 @@ training:
   weight_decay: 5e-2
   warmup_ratio: 0.1
 
-  # Model saving (MOST IMPORTANT!)
+  # Model saving 
   monitor_metric: "val_loss"              # Metric to monitor: "val_loss", "val_spearman", "test_spearman"
   monitor_mode: "min"                         # "min" for loss, "max" for spearman/accuracy
 
   # Early Stopping
   early_stopping: true
-  early_stopping_patience: 3                  # Stop after N epochs without improvement
+  early_stopping_patience: 5                  # Stop after N epochs without improvement
 
   # Testing
   test_every_val: true                        # Run test evaluation after each validation
@@ -76,9 +79,6 @@ training:
   gradient_clip_algorithm: "norm"
   val_check_interval: 0.5    # Validate every half epoch
   
-  # Logging
-  log_every_n_steps: 50
-
   wandb:
     project: "pair-affinity-finetune"
 

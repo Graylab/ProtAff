@@ -58,7 +58,7 @@ training:
   weight_decay: 5e-2                          # High weight decay for regularization
   warmup_ratio: 0.1
   
-  # Model saving (MOST IMPORTANT!)
+  # Model saving 
   monitor_metric: "val_loss"              # Metric to monitor: "val_loss", "val_spearman", "test_spearman"
   monitor_mode: "min"                         # "min" for loss, "max" for spearman/accuracy
   
@@ -72,20 +72,14 @@ training:
   # Hardware
   accelerator: "auto"                         # "gpu", "cpu", or "auto"
   devices: "auto"                             # Number of devices or "auto"
-  strategy: "ddp_find_unused_parameters_true" # Distributed strategy
+  strategy: "auto" # Distributed strategy
   precision: "bf16-mixed"                     # "16-mixed", "bf16-mixed", or "32"
   
   # Training stability
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
-  
-  # Validation frequency
   val_check_interval: 0.5                     # Validate every 0.5 epochs
   
-  # Logging
-  log_every_n_steps: 50
-  
-  # Wandb (unchanged)
   wandb:
     project: "affinity-finetune"
 

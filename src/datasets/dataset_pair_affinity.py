@@ -145,30 +145,42 @@ class PairwiseCollator:
 
 # ======================================================================
 # 2. HYBRID PAIRWISE DATASET (Target-Centric) - For Train/Val
+#    With Negative Sampling for Binder vs Non-Binder discrimination
 # ======================================================================
 class PairwiseAffinityDataset(Dataset):
     def __init__(self, base_df, lookup_csv_path, pairs_per_sample=2, inter_pps=10, 
-                 min_margin=1.0, max_anchors_per_target=2000, split_name="DATASET"):
+                 min_margin=1.0, max_anchors_per_target=2000, split_name="DATASET",
+                 verbose=True,
+                 # Negative sampling parameters
+                 add_negatives=False,
+                 neg_per_positive=1,
+                 neg_log_aff=2.0):
+        
+        self.verbose = verbose
+        self.neg_log_aff = neg_log_aff
         
         lookup_df = pd.read_csv(lookup_csv_path)
         lookup_df['key'] = lookup_df['type'].astype(str) + "_" + lookup_df['id'].astype(str)
         self.id2seq = dict(zip(lookup_df['key'], lookup_df['seq']))
         
-        print(f"\n{'='*25} {split_name} GENERATION {'='*25}")
+        self._log(f"\n{'='*25} {split_name} GENERATION {'='*25}")
         num_df = base_df[base_df['log_Aff'].notna()].copy()
         
         # Identify Rich Pockets vs Singletons
         counts = num_df.groupby('target_id').size().reset_index(name='pocket_size')
         num_df = num_df.merge(counts, on='target_id')
-        print(f"[*] Raw Samples: {len(num_df):,}")
-        print(f"[*] Unique Targets: {num_df['target_id'].nunique():,}")
+        self._log(f"[*] Raw Samples: {len(num_df):,}")
+        self._log(f"[*] Unique Targets: {num_df['target_id'].nunique():,}")
         
         self.b_better, self.t_better = [], []
         self.b_worse, self.t_worse = [], []
         self.deltas, self.pair_types = [], []
 
         # --- PATH 1: Intra-Target (Mutant Ranking) ---
+        self._log(f"\n[*] Generating intra-target pairs...")
         rich_df = num_df[num_df['pocket_size'] > 1]
+        intra_count = 0
+        
         for t_id, group in rich_df.groupby('target_id'):
             group = group.sort_values('log_Aff')
             affs, recs = group['log_Aff'].values, group.to_dict('records')
@@ -179,7 +191,8 @@ class PairwiseAffinityDataset(Dataset):
             if len(valid_anchors) > max_anchors_per_target:
                 valid_anchors = np.random.choice(valid_anchors, max_anchors_per_target, replace=False)
             
-            if len(valid_anchors) == 0: continue
+            if len(valid_anchors) == 0: 
+                continue
             
             rand_floats = np.random.random((len(valid_anchors), pairs_per_sample))
             ranges = n - starts[valid_anchors]
@@ -187,38 +200,116 @@ class PairwiseAffinityDataset(Dataset):
             
             for a_idx, m_idxs in zip(valid_anchors, match_indices):
                 for m_idx in m_idxs:
-                    if recs[a_idx]['binder_id'] == recs[m_idx]['binder_id']: continue
-                    self._append_pair(recs[a_idx], recs[m_idx], is_specificity=False)
+                    if recs[a_idx]['binder_id'] == recs[m_idx]['binder_id']: 
+                        continue
+                    self._append_pair(recs[a_idx], recs[m_idx], pair_type='intra_target')
+                    intra_count += 1
+        
+        self._log(f"    Intra-target pairs: {intra_count:,}")
 
         # --- PATH 2: Inter-Target (Global Specificity) ---
+        self._log(f"\n[*] Generating inter-target pairs...")
         singleton_df = num_df[num_df['pocket_size'] == 1]
         recs = singleton_df.to_dict('records')
         n = len(recs)
+        inter_count = 0
+        
         if n >= 2:
             for i in range(n):
                 competitors = [j for j in range(n) if recs[j]['target_id'] != recs[i]['target_id']]
-                if not competitors: continue
+                if not competitors: 
+                    continue
                 chosen_idxs = np.random.choice(competitors, min(len(competitors), inter_pps), replace=False)
                 for c_idx in chosen_idxs:
                     if recs[i]['log_Aff'] < recs[c_idx]['log_Aff']:
-                        self._append_pair(recs[i], recs[c_idx], is_specificity=True)
+                        self._append_pair(recs[i], recs[c_idx], pair_type='inter_target')
                     else:
-                        self._append_pair(recs[c_idx], recs[i], is_specificity=True)
+                        self._append_pair(recs[c_idx], recs[i], pair_type='inter_target')
+                    inter_count += 1
+        
+        self._log(f"    Inter-target pairs: {inter_count:,}")
 
+        # --- PATH 3: Negative Pairs (Binder vs Non-Binder for same target) ---
+        if add_negatives:
+            self._add_negative_pairs(num_df, neg_per_positive)
+
+        # Summary
         p_df = pd.DataFrame({'type': self.pair_types})
-        print(f"[*] Breakdown:\n{p_df['type'].value_counts().to_string()}")
-        print(f"[*] TOTAL PAIRS: {len(self.b_better):,}")
-        print(f"{'='*60}\n")
+        self._log(f"\n[*] Pair Breakdown:")
+        if self.verbose:
+            print(p_df['type'].value_counts().to_string())
+        self._log(f"\n[*] TOTAL PAIRS: {len(self.b_better):,}")
+        self._log(f"{'='*60}\n")
 
-    def _append_pair(self, b_rec, w_rec, is_specificity=False):
+    def _add_negative_pairs(self, num_df, neg_per_positive):
+        """
+        Fast negative pair generation: sample randomly from all binders.
+        """
+        self._log(f"\n[*] Generating negative pairs...")
+        self._log(f"    Negatives per target: {neg_per_positive}")
+        self._log(f"    Assumed non-binder log_Aff: {self.neg_log_aff}")
+        
+        target_ids = num_df['target_id'].unique()
+        all_binders = num_df['binder_id'].unique()
+        n_binders = len(all_binders)
+        
+        if len(target_ids) < 2:
+            self._log(f"    Skipping: need at least 2 targets")
+            return
+        
+        # Get one representative true binder per target (strongest = lowest log_Aff)
+        best_idx = num_df.groupby('target_id')['log_Aff'].idxmin()
+        target_to_best = {rec['target_id']: rec for rec in num_df.loc[best_idx].to_dict('records')}
+        
+        # Target's true binders (for collision check)
+        target_to_binders = num_df.groupby('target_id')['binder_id'].apply(set).to_dict()
+        
+        self._log(f"    Sampling negatives for {len(target_ids):,} targets...")
+        neg_count = 0
+        
+        for tid in target_ids:
+            true_rec = target_to_best[tid]
+            true_binders = target_to_binders[tid]
+            
+            # Sample random binders (most won't be true binders since 300k >> per-target binders)
+            sampled = 0
+            attempts = 0
+            max_attempts = neg_per_positive * 3  # Allow some retries
+            
+            while sampled < neg_per_positive and attempts < max_attempts:
+                neg_bid = all_binders[np.random.randint(n_binders)]
+                attempts += 1
+                
+                # Skip if this binder actually binds this target
+                if neg_bid in true_binders:
+                    continue
+                
+                worse_rec = {
+                    'binder_id': neg_bid,
+                    'target_id': tid,
+                    'log_Aff': self.neg_log_aff
+                }
+                
+                self._append_pair(b_rec=true_rec, w_rec=worse_rec, pair_type='negative')
+                neg_count += 1
+                sampled += 1
+        
+        self._log(f"    Negative pairs: {neg_count:,}")
+
+    def _append_pair(self, b_rec, w_rec, pair_type: str):
         self.b_better.append(b_rec['binder_id'])
         self.t_better.append(b_rec['target_id'])
         self.b_worse.append(w_rec['binder_id'])
         self.t_worse.append(w_rec['target_id'])
         self.deltas.append(abs(w_rec['log_Aff'] - b_rec['log_Aff']))
-        self.pair_types.append('inter_target' if is_specificity else 'intra_target')
+        self.pair_types.append(pair_type)
 
-    def __len__(self): return len(self.b_better)
+    def _log(self, msg: str):
+        if self.verbose:
+            print(msg)
+
+    def __len__(self): 
+        return len(self.b_better)
     
     def __getitem__(self, idx):
         return {
@@ -238,7 +329,8 @@ class TestRegressionDataset(Dataset):
     Test dataset for regression evaluation (single samples, not pairs).
     Expected format: binder_sequence, target_sequence, log_Aff
     """
-    def __init__(self, test_csv_path: str, provided_stats: Tuple[float, float]):
+    def __init__(self, test_csv_path: str, provided_stats: Tuple[float, float], verbose: bool = True):
+        self.verbose = verbose
         self.test_df = pd.read_csv(test_csv_path)
         
         # Validate required columns
@@ -248,9 +340,13 @@ class TestRegressionDataset(Dataset):
             raise KeyError(f"Test CSV missing required columns: {missing}")
         
         self.mean, self.std = provided_stats
-        print(f"\n[TestDataset] Using PROVIDED stats. Mean: {self.mean:.4f}, Std: {self.std:.4f}")
-        print(f"[TestDataset] Loaded {len(self.test_df)} test samples")
-        print(f"[TestDataset] Unique targets: {self.test_df['target_sequence'].nunique()}")
+        self._log(f"\n[TestDataset] Using PROVIDED stats. Mean: {self.mean:.4f}, Std: {self.std:.4f}")
+        self._log(f"[TestDataset] Loaded {len(self.test_df)} test samples")
+        self._log(f"[TestDataset] Unique targets: {self.test_df['target_sequence'].nunique()}")
+    
+    def _log(self, msg: str):
+        if self.verbose:
+            print(msg)
     
     def __len__(self):
         return len(self.test_df)
@@ -295,6 +391,12 @@ class PairAffinityDataModule(LightningDataModule):
         self.test_collate_fn = None
         self.sampler = None
 
+    @property
+    def is_main_process(self) -> bool:
+        """Check if this is rank 0."""
+        rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+        return rank == 0
+
     def setup(self, stage=None):
         base_df = pd.read_csv(self.cfg.data.base_csv)
         
@@ -305,7 +407,8 @@ class PairAffinityDataModule(LightningDataModule):
         train_ratio = self.cfg.training.get("train_val_split", 0.9)
         strategy = self.cfg.training.get("split_strategy", "group")
         
-        print(f"\n[DataModule] Split/Balance Column: {self.split_col}")
+        if self.is_main_process:
+            print(f"\n[DataModule] Split/Balance Column: {self.split_col}")
         
         if strategy == "random":
             # Random split (not recommended for generalization)
@@ -316,11 +419,13 @@ class PairAffinityDataModule(LightningDataModule):
                 random_state=seed, 
                 shuffle=True
             )
-            print(f"[DataModule] Split Strategy: Random")
+            if self.is_main_process:
+                print(f"[DataModule] Split Strategy: Random")
             
         elif strategy == "group":
             # Group-based split (by target_id or cluster_id)
-            print(f"[DataModule] Split Strategy: Group by {self.split_col}")
+            if self.is_main_process:
+                print(f"[DataModule] Split Strategy: Group by {self.split_col}")
             
             # Get unique groups
             unique_groups = base_df[self.split_col].unique()
@@ -330,9 +435,10 @@ class PairAffinityDataModule(LightningDataModule):
             singleton_groups = counts[counts == 1].index.tolist()
             multi_sample_groups = counts[counts > 1].index.tolist()
             
-            print(f"  Total unique {self.split_col}s: {len(unique_groups)}")
-            print(f"  Singleton {self.split_col}s (1 sample): {len(singleton_groups)}")
-            print(f"  Multi-sample {self.split_col}s (>1 sample): {len(multi_sample_groups)}")
+            if self.is_main_process:
+                print(f"  Total unique {self.split_col}s: {len(unique_groups)}")
+                print(f"  Singleton {self.split_col}s (1 sample): {len(singleton_groups)}")
+                print(f"  Multi-sample {self.split_col}s (>1 sample): {len(multi_sample_groups)}")
             
             # Shuffle and split multi-sample groups
             np.random.seed(seed)
@@ -354,15 +460,17 @@ class PairAffinityDataModule(LightningDataModule):
             if len(overlap) > 0:
                 raise ValueError(f"ERROR: Train/Val {self.split_col} overlap: {overlap}")
             
-            print(f"  ✓ Train {self.split_col}s: {len(train_groups)}")
-            print(f"    - Multi-sample: {len(train_groups_multi)}")
-            print(f"    - Singletons: {len(singleton_groups)}")
-            print(f"  ✓ Val {self.split_col}s: {len(val_groups)} (COMPLETELY UNSEEN)")
-            print(f"  ✓ Overlap check: {len(overlap)} (MUST be 0)")
+            if self.is_main_process:
+                print(f"  ✓ Train {self.split_col}s: {len(train_groups)}")
+                print(f"    - Multi-sample: {len(train_groups_multi)}")
+                print(f"    - Singletons: {len(singleton_groups)}")
+                print(f"  ✓ Val {self.split_col}s: {len(val_groups)} (COMPLETELY UNSEEN)")
+                print(f"  ✓ Overlap check: {len(overlap)} (MUST be 0)")
         else:
             raise ValueError(f"Unknown split_strategy: {strategy}")
         
-        print(f"  Train samples: {len(train_df)}, Val samples: {len(val_df)}")
+        if self.is_main_process:
+            print(f"  Train samples: {len(train_df)}, Val samples: {len(val_df)}")
 
         # Create pairwise datasets for train/val
         self.train_dataset = PairwiseAffinityDataset(
@@ -371,31 +479,44 @@ class PairAffinityDataModule(LightningDataModule):
             inter_pps=self.cfg.data.get("inter_pps", 10),
             min_margin=self.cfg.data.get("min_margin", 1.0),
             max_anchors_per_target=self.cfg.data.get("max_anchors_per_target", 2000),
-            split_name="TRAIN"
+            split_name="TRAIN",
+            verbose=self.is_main_process,
+            # Negative sampling
+            add_negatives=self.cfg.data.get("add_negatives", False),
+            neg_per_positive=self.cfg.data.get("neg_per_positive", 1),
+            neg_log_aff=self.cfg.data.get("neg_log_aff", 2.0)
         )
         
         self.val_dataset = PairwiseAffinityDataset(
             val_df, self.cfg.data.lookup_csv, 
             pairs_per_sample=2, 
             inter_pps=5, 
-            split_name="VAL"
+            split_name="VAL",
+            verbose=self.is_main_process,
+            # Negative sampling for val too (for consistent evaluation)
+            add_negatives=self.cfg.data.get("add_negatives", False),
+            neg_per_positive=self.cfg.data.get("neg_per_positive", 1),
+            neg_log_aff=self.cfg.data.get("neg_log_aff", 2.0)
         )
         
         # Load test dataset (REGRESSION format, not pairs!)
         test_csv = self.cfg.data.get("test_csv", None)
         if test_csv and os.path.exists(test_csv):
-            print(f"\n[DataModule] Loading REGRESSION test set from: {test_csv}")
+            if self.is_main_process:
+                print(f"\n[DataModule] Loading REGRESSION test set from: {test_csv}")
             
             # Get normalization stats from training data (before pair generation)
             train_stats_df = train_df[train_df['log_Aff'].notna()]
             train_mean = float(train_stats_df['log_Aff'].mean())
             train_std = float(train_stats_df['log_Aff'].std())
             
-            print(f"[DataModule] Train normalization stats - Mean: {train_mean:.4f}, Std: {train_std:.4f}")
+            if self.is_main_process:
+                print(f"[DataModule] Train normalization stats - Mean: {train_mean:.4f}, Std: {train_std:.4f}")
             
             self.test_dataset = TestRegressionDataset(
                 test_csv_path=test_csv,
-                provided_stats=(train_mean, train_std)
+                provided_stats=(train_mean, train_std),
+                verbose=self.is_main_process
             )
             
             # Create separate collator for test (regression format)
@@ -405,20 +526,28 @@ class PairAffinityDataModule(LightningDataModule):
                 max_length=self.cfg.model.max_length
             )
         else:
-            print("\n[DataModule] No test CSV provided - skipping test dataset")
+            if self.is_main_process:
+                print("\n[DataModule] No test CSV provided - skipping test dataset")
             self.test_dataset = None
             self.test_collate_fn = None
         
-        # Weighted sampling based on target/cluster frequency in pairs
+        # Setup weighted sampler
+        self._setup_sampler(base_df)
+
+    def _setup_sampler(self, base_df: pd.DataFrame):
+        """Setup weighted sampler with optional balancing."""
         balance_clusters = self.cfg.data.get("balance_clusters", False)
         balance_power = self.cfg.data.get("balance_power", 0.5)
         
         if balance_clusters:
-            print(f"\n[Sampler] Balancing enabled with power={balance_power}")
+            if self.is_main_process:
+                print(f"\n[Sampler] Balancing enabled with power={balance_power}")
             
-            # Get split column values for all targets in pairs
-            # Map target_id to split_col value (e.g., cluster_id)
-            target_to_group = base_df.set_index('target_id')[self.split_col].to_dict()
+            # Handle the case where split_col IS target_id
+            if self.split_col == 'target_id':
+                target_to_group = {tid: tid for tid in base_df['target_id'].unique()}
+            else:
+                target_to_group = base_df.drop_duplicates('target_id').set_index('target_id')[self.split_col].to_dict()
             
             # Count frequency of each group in training pairs
             train_groups_in_pairs = []
@@ -426,16 +555,16 @@ class PairAffinityDataModule(LightningDataModule):
                 t1 = self.train_dataset.t_better[i]
                 t2 = self.train_dataset.t_worse[i]
                 
-                # Get group for each target
-                g1 = target_to_group.get(t1, t1)  # Fallback to target_id if not found
+                g1 = target_to_group.get(t1, t1)
                 g2 = target_to_group.get(t2, t2)
                 
                 train_groups_in_pairs.extend([g1, g2])
             
             # Count group occurrences
             group_counts = pd.Series(train_groups_in_pairs).value_counts()
-            print(f"  Top {self.split_col}s in pairs:")
-            print(group_counts.head(5).to_string())
+            if self.is_main_process:
+                print(f"  Top {self.split_col}s in pairs:")
+                print(group_counts.head(5).to_string())
             
             # Compute weights: 1 / (count(g1) + count(g2))^power
             counts_dict = group_counts.to_dict()
@@ -453,8 +582,9 @@ class PairAffinityDataModule(LightningDataModule):
                 pair_weights.append(weight)
             
             pair_weights = np.array(pair_weights, dtype=np.float32)
-            print(f"  Weight range: {pair_weights.min():.4f} to {pair_weights.max():.4f}")
-            print(f"  Weight ratio: {pair_weights.max()/pair_weights.min():.1f}x")
+            if self.is_main_process:
+                print(f"  Weight range: {pair_weights.min():.4f} to {pair_weights.max():.4f}")
+                print(f"  Weight ratio: {pair_weights.max()/pair_weights.min():.1f}x")
             
             self.sampler = WeightedRandomSampler(
                 weights=pair_weights, 
@@ -463,11 +593,13 @@ class PairAffinityDataModule(LightningDataModule):
             )
         else:
             # Original sampler: balance by target frequency only
-            print(f"\n[Sampler] Using target-frequency balancing (legacy)")
+            if self.is_main_process:
+                print(f"\n[Sampler] Using target-frequency balancing (legacy)")
             t_all = self.train_dataset.t_better + self.train_dataset.t_worse
             target_counts = pd.Series(t_all).value_counts()
-            print(f"  Top Targets in pairs:")
-            print(target_counts.head(5).to_string())
+            if self.is_main_process:
+                print(f"  Top Targets in pairs:")
+                print(target_counts.head(5).to_string())
             
             counts_dict = target_counts.to_dict()
             pair_weights = []
@@ -509,7 +641,7 @@ class PairAffinityDataModule(LightningDataModule):
         return DataLoader(
             self.test_dataset,
             batch_size=self.cfg.training.batch_size,
-            collate_fn=self.test_collate_fn,  # Use regression collator!
+            collate_fn=self.test_collate_fn,
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True

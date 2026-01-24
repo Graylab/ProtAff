@@ -3,7 +3,7 @@ defaults:
   - model: esm_cross_attn
 
 # Task name
-task_name: "dms"
+task_name: "pair_dms"
 
 # Resume path to a specific .ckpt file (e.g., "outputs/.../checkpoints/last.ckpt")
 resume_checkpoint_path: null
@@ -11,18 +11,27 @@ resume_checkpoint_path: null
 data:
   mutant_csv: "data/dummy_dms/mutants.csv"
   wt_csv: "data/dummy_dms/wildtypes.csv"
+  pairs_per_anchor: 3
+  min_margin: 0.3
+  max_pairs_per_protein: 2000
   crop_method: "smart"
+  invert_score: false
   num_workers: 6
-  weight_col: null
   balance_clusters: true
+  balance_power: 0.25  
 
 training:
   seed: 42
+  split_strategy: "group"
+  train_val_split: 0.9
 
   # Batch and Steps
-  batch_size: 16
-  accumulate_grad_batches: 2
+  batch_size: 2
+  accumulate_grad_batches: 16
   max_epochs: 5
+
+  # Loss Function
+  margin: 0.1                # Margin for MarginRankingLoss (diff between scores must be > this)
 
   # Optimizer
   learning_rate: 1e-4  
@@ -46,7 +55,7 @@ training:
   # Stability
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
-  val_check_interval: 0.25    
+  val_check_interval: 0.5    
 
   wandb:
     project: "dms-pretrain"
@@ -54,4 +63,4 @@ training:
 # Hydra handles the output path logic
 hydra:
   run:
-    dir: outputs/phase1_dms/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: outputs/phase1_pair_dms/${now:%Y-%m-%d}/${now:%H-%M-%S}
