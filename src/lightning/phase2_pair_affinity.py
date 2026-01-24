@@ -2,6 +2,8 @@ import os
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
+import numpy as np
+import pandas as pd
 from peft import get_peft_model, LoraConfig
 from peft.utils import load_peft_weights
 from omegaconf import DictConfig, OmegaConf
@@ -9,16 +11,17 @@ from transformers import get_linear_schedule_with_warmup
 from torchmetrics.functional import spearman_corrcoef
 from src.models import build_model 
 
+
 class PairAffinityModule(pl.LightningModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.cfg = cfg
         self.save_hyperparameters(OmegaConf.to_container(cfg, resolve=True))
         
-        # 1. Base Model Initialization
+        # 1. Base Model
         self.base_model = build_model(cfg)
         
-        # 2. Setup PEFT (LoRA)
+        # 2. PEFT Setup
         modules_to_save = ["head_score"]
         arch = cfg.model.get("arch", "concat")
         
@@ -26,14 +29,14 @@ class PairAffinityModule(pl.LightningModule):
             modules_to_save.extend(["norm_binder", "norm_target", "cross_attn", "norm_final", "projector"])
         elif arch == "cross_attn":
             modules_to_save.extend(["norm_binder", "norm_target", "cross_attn", "norm_final", "projector"])
-        else: # concat
+        else:
             modules_to_save.extend(["projector", "norm_input"])
         
         if cfg.model.lora.get("modules_to_save"):
-             extra = OmegaConf.to_container(cfg.model.lora.modules_to_save)
-             for m in extra:
-                 if m not in modules_to_save:
-                     modules_to_save.append(m)
+            extra = OmegaConf.to_container(cfg.model.lora.modules_to_save)
+            for m in extra:
+                if m not in modules_to_save:
+                    modules_to_save.append(m)
 
         peft_config = LoraConfig(
             r=cfg.model.lora.r, 
@@ -47,27 +50,26 @@ class PairAffinityModule(pl.LightningModule):
         self.model = get_peft_model(self.base_model, peft_config)
         self.model.print_trainable_parameters()
         
-        # 3. Ranking Loss (Lower score = Better) for TRAINING
+        # 3. Loss
         self.margin = getattr(cfg.training, "margin", 0.1)
         self.rank_loss = nn.MarginRankingLoss(margin=self.margin)
         
-        # 5. Phase-to-Phase Transfer
+        # 4. Validation storage for per-target Spearman
+        self.val_scores = []
+        self.val_target_ids = []
+        self.val_binder_ids = []
+        self.val_log_affs = []
+        
+        # 5. Phase transfer
         ckpt_path = cfg.get("pretrained_ckpt_path", None) 
         if ckpt_path:
             self._load_phase1_weights(ckpt_path)
 
     def forward(self, batch_subset, prefix="better"):
-        """
-        Architecture-aware forward pass supporting concat, cross_attn, and interaction_map.
-        For TEST: prefix is ignored, use direct batch keys.
-        """
         arch = self.cfg.model.get("arch", "concat")
-        
-        # Check if this is a test batch (has 'input_ids' or 'binder_ids' without prefix)
         is_test_batch = 'input_ids' in batch_subset or 'binder_ids' in batch_subset
         
         if is_test_batch:
-            # Test batch: single sample format (no prefix)
             if arch in ["cross_attn", "interaction_map"]:
                 return self.model(
                     binder_ids=batch_subset['binder_ids'],
@@ -81,7 +83,6 @@ class PairAffinityModule(pl.LightningModule):
                     attention_mask=batch_subset['attention_mask']
                 )
         else:
-            # Training/val batch: pairwise format (with prefix)
             if arch in ["cross_attn", "interaction_map"]:
                 return self.model(
                     binder_ids=batch_subset[f'{prefix}_binder_ids'],
@@ -99,11 +100,8 @@ class PairAffinityModule(pl.LightningModule):
         scores_better = self.forward(batch, prefix="better")
         scores_worse = self.forward(batch, prefix="worse")
         
-        # Minimize (Better - Worse + Margin)
-        # target_rank = -1 ensures that Better is lower than Worse
         target_rank = torch.full_like(scores_better, -1.0)
         loss = self.rank_loss(scores_better, scores_worse, target_rank)
-
         accuracy = (scores_better < scores_worse).float().mean()
         
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -120,7 +118,62 @@ class PairAffinityModule(pl.LightningModule):
         
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('val_acc', accuracy, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+        # Store for per-target Spearman
+        self.val_scores.extend(scores_better.detach().cpu().squeeze().tolist())
+        self.val_scores.extend(scores_worse.detach().cpu().squeeze().tolist())
+        self.val_target_ids.extend(batch['better_tid'])
+        self.val_target_ids.extend(batch['worse_tid'])
+        self.val_binder_ids.extend(batch['better_bid'])
+        self.val_binder_ids.extend(batch['worse_bid'])
+        self.val_log_affs.extend(batch['better_log_aff'].cpu().tolist())
+        self.val_log_affs.extend(batch['worse_log_aff'].cpu().tolist())
+        
         return loss
+
+    def on_validation_epoch_end(self):
+        if not self.val_scores:
+            return
+        
+        # Build dataframe for easier grouping
+        df = pd.DataFrame({
+            'score': self.val_scores,
+            'target_id': self.val_target_ids,
+            'binder_id': self.val_binder_ids,
+            'log_aff': self.val_log_affs
+        })
+        
+        # Deduplicate by (target_id, binder_id) - keep first occurrence
+        df = df.drop_duplicates(subset=['target_id', 'binder_id'], keep='first')
+        
+        # Compute per-target Spearman
+        target_spearmans = []
+        min_samples = 5
+        
+        for tid, group in df.groupby('target_id'):
+            if len(group) < min_samples:
+                continue
+            
+            scores = torch.tensor(group['score'].values)
+            affs = torch.tensor(group['log_aff'].values)
+            
+            sp = spearman_corrcoef(scores, affs)
+            if not torch.isnan(sp):
+                target_spearmans.append(sp.item())  # Convert to Python float
+        
+        if target_spearmans:
+            # Create tensor on correct device for DDP sync
+            avg_spearman = torch.tensor(np.mean(target_spearmans), device=self.device)
+            self.log('val_per_target_spearman', avg_spearman, prog_bar=True, sync_dist=True)
+            
+            if self.trainer.is_global_zero:
+                print(f"\n[Val] Per-target Spearman: {avg_spearman:.4f} (from {len(target_spearmans)} targets)")
+        
+        # Clear
+        self.val_scores.clear()
+        self.val_target_ids.clear()
+        self.val_binder_ids.clear()
+        self.val_log_affs.clear()
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
