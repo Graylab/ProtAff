@@ -33,7 +33,7 @@ data:
   balance_power: 0.25                         # Balancing strength (0.25=gentle, 0.5=medium, 1.0=aggressive)
   weight_col: null                            # Alternative weighting column (usually null)
   
-  # Optional: Data filtering (uncomment to use)
+  # Optionsqmeal: Data filtering (uncomment to use)
   # max_samples_per_target: 5000              # Cap maximum samples per target
   # min_samples_per_target: 2                 # Remove targets with fewer samples
 
@@ -49,8 +49,8 @@ training:
   train_val_split: 0.9                        # 90% targets for train, 10% for val
   
   # Batch configuration
-  batch_size: 16
-  accumulate_grad_batches: 2                 # Effective batch size = 16 * 2 = 32
+  batch_size: 8
+  accumulate_grad_batches: 4                 # Effective batch size = 16 * 2 = 32
   max_epochs: 15
   
   # Optimizer

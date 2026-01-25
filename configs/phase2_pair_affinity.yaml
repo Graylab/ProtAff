@@ -18,6 +18,7 @@ data:
   base_csv: "data/combined/base_cleaned.csv"
   lookup_csv: "data/combined/lookup_data.csv"
   test_csv: "data/test/test_adaptyv.csv"
+  binary_test_csv: "data/test/test_binary.csv"
   
   # --- Pair Mining ---
   pairs_per_sample: 2
@@ -53,8 +54,8 @@ training:
   margin: 0.1                # Margin for MarginRankingLoss (diff between scores must be > this)
 
   # Optimizer
-  learning_rate: 5e-5        # Slightly lower LR is often better for ranking fine-tuning
-  weight_decay: 5e-2
+  learning_rate: 1e-4        # Slightly lower LR is often better for ranking fine-tuning
+  weight_decay: 1e-2
   warmup_ratio: 0.1
 
   # Model saving 
@@ -67,6 +68,8 @@ training:
 
   # Testing
   test_every_val: true                        # Run test evaluation after each validation
+  test_binary_every_val: true
+  binary_test_every_n_epoch: 1
 
   # Hardware
   accelerator: "auto"

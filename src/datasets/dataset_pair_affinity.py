@@ -74,6 +74,7 @@ class RegressionCollator:
                 "reg_labels": labels
             }
 
+
 # ======================================================================
 # 1. PAIRWISE COLLATOR (For Train/Val)
 # ======================================================================
@@ -124,7 +125,7 @@ class PairwiseCollator:
         worse_b, worse_t = [x["worse_binder"] for x in batch], [x["worse_target"] for x in batch]
         deltas = torch.tensor([x["delta"] for x in batch], dtype=torch.float32)
 
-        # NEW: Extract target_ids and log_affs for per-target Spearman
+        # For per-target Spearman
         better_target_ids = [x["better_target_id"] for x in batch]
         worse_target_ids = [x["worse_target_id"] for x in batch]
         better_log_affs = torch.tensor([x["better_log_aff"] for x in batch], dtype=torch.float32)
@@ -141,7 +142,6 @@ class PairwiseCollator:
                 "worse_binder_ids": w_data["ids"], "worse_binder_mask": w_data["mask"],
                 "worse_target_ids": w_data["target_ids"], "worse_target_mask": w_data["target_mask"],
                 "delta": deltas,
-                # NEW: for per-target Spearman
                 "better_tid": better_target_ids,
                 "worse_tid": worse_target_ids,
                 "better_log_aff": better_log_affs,
@@ -156,7 +156,6 @@ class PairwiseCollator:
                 "better_input_ids": b_ids, "better_mask": b_mask,
                 "worse_input_ids": w_ids, "worse_mask": w_mask,
                 "delta": deltas,
-                # NEW: for per-target Spearman
                 "better_tid": better_target_ids,
                 "worse_tid": worse_target_ids,
                 "better_log_aff": better_log_affs,
@@ -165,8 +164,76 @@ class PairwiseCollator:
                 "worse_bid": worse_binder_ids,
             }
 
+
 # ======================================================================
-# 2. HYBRID PAIRWISE DATASET (Target-Centric) - For Train/Val
+# 2. BINARY CLASSIFICATION COLLATOR (For Binary Test)
+# ======================================================================
+@dataclass
+class BinaryClassificationCollator:
+    """
+    Collator for binary classification test set (binder vs non-binder).
+    """
+    tokenizer: Any
+    arch: str = "concat"
+    max_length: int = 1024
+
+    def _tokenize_concat(self, binders: List[str], targets: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+        eos = self.tokenizer.eos_token
+        cls_id = self.tokenizer.cls_token_id
+        eos_id = self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id
+
+        binder_seqs = [str(b).replace(":", eos) for b in binders]
+        target_seqs = [str(t).replace(":", eos) for t in targets]
+
+        b_encoded = self.tokenizer(binder_seqs, add_special_tokens=False)["input_ids"]
+        t_encoded = self.tokenizer(target_seqs, add_special_tokens=False)["input_ids"]
+
+        input_ids_list, mask_list = [], []
+        for b_ids, t_ids in zip(b_encoded, t_encoded):
+            allowed_len = self.max_length - 3 
+            if len(b_ids) + len(t_ids) > allowed_len:
+                t_ids = t_ids[:max(0, allowed_len - len(b_ids))]
+                b_ids = b_ids[:allowed_len]
+            
+            full_ids = [cls_id] + b_ids + [eos_id] + t_ids + [eos_id]
+            input_ids_list.append(torch.tensor(full_ids, dtype=torch.long))
+            mask_list.append(torch.ones(len(full_ids), dtype=torch.long))
+
+        return (
+            pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id),
+            pad_sequence(mask_list, batch_first=True, padding_value=0)
+        )
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        binders = [x["binder_seq"] for x in batch]
+        targets = [x["target_seq"] for x in batch]
+        target_ids = [x["target_id"] for x in batch]
+        is_binder = torch.tensor([x["is_binder"] for x in batch], dtype=torch.long)
+
+        if self.arch in ["cross_attn", "interaction_map"]:
+            b_enc = self.tokenizer(binders, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
+            t_enc = self.tokenizer(targets, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
+            return {
+                "binder_ids": b_enc["input_ids"],
+                "binder_mask": b_enc["attention_mask"],
+                "target_ids": t_enc["input_ids"],
+                "target_mask": t_enc["attention_mask"],
+                "tid": target_ids,
+                "is_binder": is_binder,
+            }
+        else:
+            input_ids, mask = self._tokenize_concat(binders, targets)
+            return {
+                "input_ids": input_ids,
+                "attention_mask": mask,
+                "tid": target_ids,
+                "is_binder": is_binder,
+            }
+
+
+# ======================================================================
+# 3. HYBRID PAIRWISE DATASET (Target-Centric) - For Train/Val
 # ======================================================================
 class PairwiseAffinityDataset(Dataset):
     def __init__(self, base_df, lookup_csv_path, pairs_per_sample=2, inter_pps=10, 
@@ -194,9 +261,9 @@ class PairwiseAffinityDataset(Dataset):
         self.b_better, self.t_better = [], []
         self.b_worse, self.t_worse = [], []
         self.deltas, self.pair_types = [], []
-        self.aff_better, self.aff_worse = [], []  # NEW: store log_Affs
+        self.aff_better, self.aff_worse = [], []
 
-        # --- PATH 1: Intra-Target (Mutant Ranking) ---
+        # --- PATH 1: Intra-Target ---
         self._log(f"\n[*] Generating intra-target pairs...")
         rich_df = num_df[num_df['pocket_size'] > 1]
         intra_count = 0
@@ -227,7 +294,7 @@ class PairwiseAffinityDataset(Dataset):
         
         self._log(f"    Intra-target pairs: {intra_count:,}")
 
-        # --- PATH 2: Inter-Target (Global Specificity) ---
+        # --- PATH 2: Inter-Target ---
         self._log(f"\n[*] Generating inter-target pairs...")
         singleton_df = num_df[num_df['pocket_size'] == 1]
         recs = singleton_df.to_dict('records')
@@ -315,8 +382,8 @@ class PairwiseAffinityDataset(Dataset):
         self.t_worse.append(w_rec['target_id'])
         self.deltas.append(abs(w_rec['log_Aff'] - b_rec['log_Aff']))
         self.pair_types.append(pair_type)
-        self.aff_better.append(b_rec['log_Aff'])  # NEW
-        self.aff_worse.append(w_rec['log_Aff'])   # NEW
+        self.aff_better.append(b_rec['log_Aff'])
+        self.aff_worse.append(w_rec['log_Aff'])
 
     def _log(self, msg: str):
         if self.verbose:
@@ -332,7 +399,6 @@ class PairwiseAffinityDataset(Dataset):
             "worse_binder": self.id2seq.get(f"binder_{self.b_worse[idx]}", ""),
             "worse_target": self.id2seq.get(f"target_{self.t_worse[idx]}", ""),
             "delta": self.deltas[idx],
-            # NEW: for per-target Spearman
             "better_target_id": self.t_better[idx],
             "worse_target_id": self.t_worse[idx],
             "better_log_aff": self.aff_better[idx],
@@ -343,7 +409,7 @@ class PairwiseAffinityDataset(Dataset):
 
 
 # ======================================================================
-# 3. TEST REGRESSION DATASET (Single Samples) - For Test
+# 4. TEST REGRESSION DATASET
 # ======================================================================
 class TestRegressionDataset(Dataset):
     def __init__(self, test_csv_path: str, provided_stats: Tuple[float, float], verbose: bool = True):
@@ -380,7 +446,45 @@ class TestRegressionDataset(Dataset):
 
 
 # ======================================================================
-# 4. DATAMODULE
+# 5. BINARY CLASSIFICATION TEST DATASET
+# ======================================================================
+class BinaryClassificationTestDataset(Dataset):
+    """
+    Test dataset for binary classification (binder vs non-binder).
+    Expected format: id, target_id, binder_sequence, target_sequence, is_binder
+    """
+    def __init__(self, test_csv_path: str, verbose: bool = True):
+        self.verbose = verbose
+        self.test_df = pd.read_csv(test_csv_path)
+        
+        required_cols = ['target_id', 'binder_sequence', 'target_sequence', 'is_binder']
+        missing = [col for col in required_cols if col not in self.test_df.columns]
+        if missing:
+            raise KeyError(f"Binary test CSV missing required columns: {missing}")
+        
+        self._log(f"\n[BinaryTestDataset] Loaded {len(self.test_df)} samples")
+        self._log(f"[BinaryTestDataset] Unique targets: {self.test_df['target_id'].nunique()}")
+        self._log(f"[BinaryTestDataset] Binders: {self.test_df['is_binder'].sum()}, Non-binders: {(~self.test_df['is_binder'].astype(bool)).sum()}")
+    
+    def _log(self, msg: str):
+        if self.verbose:
+            print(msg)
+    
+    def __len__(self):
+        return len(self.test_df)
+    
+    def __getitem__(self, idx):
+        row = self.test_df.iloc[idx]
+        return {
+            "binder_seq": str(row["binder_sequence"]),
+            "target_seq": str(row["target_sequence"]),
+            "target_id": row["target_id"],
+            "is_binder": int(row["is_binder"]),
+        }
+
+
+# ======================================================================
+# 6. DATAMODULE
 # ======================================================================
 class PairAffinityDataModule(LightningDataModule):
     def __init__(self, cfg: DictConfig):
@@ -402,6 +506,8 @@ class PairAffinityDataModule(LightningDataModule):
         self.val_dataset = None
         self.test_dataset = None
         self.test_collate_fn = None
+        self.binary_test_dataset = None
+        self.binary_test_collate_fn = None
         self.sampler = None
 
     @property
@@ -468,6 +574,7 @@ class PairAffinityDataModule(LightningDataModule):
         if self.is_main_process:
             print(f"  Train samples: {len(train_df)}, Val samples: {len(val_df)}")
 
+        # Train/Val datasets
         self.train_dataset = PairwiseAffinityDataset(
             train_df, self.cfg.data.lookup_csv, 
             pairs_per_sample=self.cfg.data.get("pairs_per_sample", 2),
@@ -492,6 +599,7 @@ class PairAffinityDataModule(LightningDataModule):
             neg_log_aff=self.cfg.data.get("neg_log_aff", 2.0)
         )
         
+        # Regression test dataset
         test_csv = self.cfg.data.get("test_csv", None)
         if test_csv and os.path.exists(test_csv):
             if self.is_main_process:
@@ -517,9 +625,31 @@ class PairAffinityDataModule(LightningDataModule):
             )
         else:
             if self.is_main_process:
-                print("\n[DataModule] No test CSV provided - skipping test dataset")
+                print("\n[DataModule] No regression test CSV provided")
             self.test_dataset = None
             self.test_collate_fn = None
+        
+        # Binary classification test dataset
+        binary_test_csv = self.cfg.data.get("binary_test_csv", None)
+        if binary_test_csv and os.path.exists(binary_test_csv):
+            if self.is_main_process:
+                print(f"\n[DataModule] Loading BINARY CLASSIFICATION test set from: {binary_test_csv}")
+            
+            self.binary_test_dataset = BinaryClassificationTestDataset(
+                test_csv_path=binary_test_csv,
+                verbose=self.is_main_process
+            )
+            
+            self.binary_test_collate_fn = BinaryClassificationCollator(
+                tokenizer=self.tokenizer,
+                arch=self.cfg.model.get("arch", "concat"),
+                max_length=self.cfg.model.max_length
+            )
+        else:
+            if self.is_main_process:
+                print("\n[DataModule] No binary test CSV provided")
+            self.binary_test_dataset = None
+            self.binary_test_collate_fn = None
         
         self._setup_sampler(base_df)
 
@@ -606,5 +736,14 @@ class PairAffinityDataModule(LightningDataModule):
         return DataLoader(
             self.test_dataset, batch_size=self.cfg.training.batch_size,
             collate_fn=self.test_collate_fn, shuffle=False,
+            num_workers=self.num_workers, pin_memory=True
+        )
+    
+    def binary_test_dataloader(self):
+        if self.binary_test_dataset is None:
+            return None
+        return DataLoader(
+            self.binary_test_dataset, batch_size=self.cfg.training.batch_size,
+            collate_fn=self.binary_test_collate_fn, shuffle=False,
             num_workers=self.num_workers, pin_memory=True
         )
