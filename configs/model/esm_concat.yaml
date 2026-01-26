@@ -1,7 +1,7 @@
 # configs/model/esm_concat.yaml
 name: "facebook/esm2_t33_650M_UR50D"
 arch: "concat"
-max_length: 1024
+max_length: 2048
 
 # Decoder Parameters (Simple/Standard)
 d_model: 256
@@ -9,8 +9,9 @@ dropout: 0.1
 
 # LoRA
 lora:
-  r: 16
-  alpha: 32
+  r: 8
+  alpha: 16
   dropout: 0.1
   target_modules: ["query", "key", "value"]
   modules_to_save: []
+  n_last_layers: 4

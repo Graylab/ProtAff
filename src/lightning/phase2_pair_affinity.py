@@ -12,6 +12,31 @@ from torchmetrics.functional import spearman_corrcoef
 from src.models import build_model 
 
 
+def get_esm_lora_target_modules(esm_model, target_modules: list, n_last_layers: int = None):
+    """
+    Build LoRA target module list.
+    
+    Args:
+        esm_model: The ESM model to get num_layers from
+        target_modules: Base module names like ["query", "key", "value"]
+        n_last_layers: If specified, only target last N layers. None = all layers
+    
+    Returns:
+        List of target module patterns/names for LoRA
+    """
+    if n_last_layers is None:
+        return target_modules
+    
+    num_layers = esm_model.config.num_hidden_layers
+    full_target_modules = []
+    
+    for i in range(num_layers - n_last_layers, num_layers):
+        for module in target_modules:
+            full_target_modules.append(f"esm.encoder.layer.{i}.attention.self.{module}")
+    
+    return full_target_modules
+
+
 class PairAffinityModule(pl.LightningModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
@@ -38,10 +63,26 @@ class PairAffinityModule(pl.LightningModule):
                 if m not in modules_to_save:
                     modules_to_save.append(m)
 
+        # Build target modules (with n_last_layers support)
+        base_target_modules = OmegaConf.to_container(cfg.model.lora.target_modules)
+        n_last_layers = cfg.model.lora.get("n_last_layers", None)
+        
+        target_modules = get_esm_lora_target_modules(
+            self.base_model.esm, 
+            base_target_modules, 
+            n_last_layers
+        )
+        
+        if n_last_layers is not None:
+            print(f"[LoRA] Targeting last {n_last_layers} layers")
+            print(f"[LoRA] Target modules: {target_modules[:3]}... ({len(target_modules)} total)")
+        else:
+            print(f"[LoRA] Targeting all layers with modules: {target_modules}")
+
         peft_config = LoraConfig(
             r=cfg.model.lora.r, 
             lora_alpha=cfg.model.lora.alpha, 
-            target_modules=OmegaConf.to_container(cfg.model.lora.target_modules),
+            target_modules=target_modules,
             modules_to_save=modules_to_save, 
             lora_dropout=cfg.model.lora.dropout, 
             bias="none"
@@ -135,7 +176,6 @@ class PairAffinityModule(pl.LightningModule):
         if not self.val_scores:
             return
         
-        # Build dataframe for easier grouping
         df = pd.DataFrame({
             'score': self.val_scores,
             'target_id': self.val_target_ids,
@@ -143,10 +183,8 @@ class PairAffinityModule(pl.LightningModule):
             'log_aff': self.val_log_affs
         })
         
-        # Deduplicate by (target_id, binder_id) - keep first occurrence
         df = df.drop_duplicates(subset=['target_id', 'binder_id'], keep='first')
         
-        # Compute per-target Spearman
         target_spearmans = []
         min_samples = 5
         
@@ -159,17 +197,15 @@ class PairAffinityModule(pl.LightningModule):
             
             sp = spearman_corrcoef(scores, affs)
             if not torch.isnan(sp):
-                target_spearmans.append(sp.item())  # Convert to Python float
+                target_spearmans.append(sp.item())
         
         if target_spearmans:
-            # Create tensor on correct device for DDP sync
             avg_spearman = torch.tensor(np.mean(target_spearmans), device=self.device)
             self.log('val_per_target_spearman', avg_spearman, prog_bar=True, sync_dist=True)
             
             if self.trainer.is_global_zero:
                 print(f"\n[Val] Per-target Spearman: {avg_spearman:.4f} (from {len(target_spearmans)} targets)")
         
-        # Clear
         self.val_scores.clear()
         self.val_target_ids.clear()
         self.val_binder_ids.clear()
