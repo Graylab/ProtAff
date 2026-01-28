@@ -93,7 +93,15 @@ class PairAffinityModule(pl.LightningModule):
         
         # 3. Loss
         self.margin = getattr(cfg.training, "margin", 0.1)
-        self.rank_loss = nn.MarginRankingLoss(margin=self.margin)
+        self.loss_type = getattr(cfg.training, "loss_type", "margin")  # NEW
+        
+        if self.loss_type == "margin":
+            self.rank_loss = nn.MarginRankingLoss(margin=self.margin)
+        elif self.loss_type == "soft_margin":
+            self.rank_loss = nn.SoftMarginLoss()
+        elif self.loss_type == "bce":
+            self.rank_loss = nn.BCEWithLogitsLoss()
+
         
         # 4. Validation storage for per-target Spearman
         self.val_scores = []
@@ -105,6 +113,43 @@ class PairAffinityModule(pl.LightningModule):
         ckpt_path = cfg.get("pretrained_ckpt_path", None) 
         if ckpt_path:
             self._load_phase1_weights(ckpt_path)
+    
+    def _compute_loss(self, scores_better, scores_worse, delta=None):
+        """Flexible loss computation."""
+        
+        if self.loss_type == "margin":
+            target_rank = torch.full_like(scores_better, -1.0)
+            return self.rank_loss(scores_better, scores_worse, target_rank)
+        
+        elif self.loss_type == "soft_margin":
+            # SoftMarginLoss: log(1 + exp(-y * (x1 - x2)))
+            diff = scores_worse - scores_better  # Should be positive
+            target = torch.ones_like(diff)
+            return self.rank_loss(diff, target)
+        
+        elif self.loss_type == "bce":
+            # BCE on difference
+            diff = scores_worse - scores_better
+            target = torch.ones_like(diff)
+            return self.rank_loss(diff, target)
+        
+        elif self.loss_type == "margin_weighted":
+            # Weight by affinity difference (delta)
+            target_rank = torch.full_like(scores_better, -1.0)
+            loss = nn.functional.margin_ranking_loss(
+                scores_better, scores_worse, target_rank, 
+                margin=self.margin, reduction='none'
+            )
+            if delta is not None:
+                weights = torch.clamp(delta, min=0.1, max=5.0)
+                loss = loss * weights.unsqueeze(-1)
+            return loss.mean()
+        
+        elif self.loss_type == "contrastive":
+            # InfoNCE-style contrastive
+            diff = scores_worse - scores_better
+            temperature = getattr(self.cfg.training, "temperature", 0.1)
+            return -torch.log(torch.sigmoid(diff / temperature) + 1e-8).mean()
 
     def forward(self, batch_subset, prefix="better"):
         arch = self.cfg.model.get("arch", "concat")
@@ -141,8 +186,8 @@ class PairAffinityModule(pl.LightningModule):
         scores_better = self.forward(batch, prefix="better")
         scores_worse = self.forward(batch, prefix="worse")
         
-        target_rank = torch.full_like(scores_better, -1.0)
-        loss = self.rank_loss(scores_better, scores_worse, target_rank)
+        delta = batch.get('delta', None)
+        loss = self._compute_loss(scores_better, scores_worse, delta)
         accuracy = (scores_better < scores_worse).float().mean()
         
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -153,14 +198,14 @@ class PairAffinityModule(pl.LightningModule):
         scores_better = self.forward(batch, prefix="better")
         scores_worse = self.forward(batch, prefix="worse")
         
-        target_rank = torch.full_like(scores_better, -1.0)
-        loss = self.rank_loss(scores_better, scores_worse, target_rank)
+        delta = batch.get('delta', None)
+        loss = self._compute_loss(scores_better, scores_worse, delta)
         accuracy = (scores_better < scores_worse).float().mean()
         
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('val_acc', accuracy, on_epoch=True, prog_bar=True, sync_dist=True)
         
-        # Store for per-target Spearman
+        # Store for per-target Spearman (unchanged)
         self.val_scores.extend(scores_better.detach().cpu().squeeze().tolist())
         self.val_scores.extend(scores_worse.detach().cpu().squeeze().tolist())
         self.val_target_ids.extend(batch['better_tid'])

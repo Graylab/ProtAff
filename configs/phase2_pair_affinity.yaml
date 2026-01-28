@@ -51,11 +51,13 @@ training:
   max_epochs: 15             # Ranking often takes longer to converge than regression
 
   # Loss Function
-  margin: 0.1                # Margin for MarginRankingLoss (diff between scores must be > this)
+  loss_type: "margin"  # Options: margin, soft_margin, bce, margin_weighted, contrastive
+  margin: 0.1
+  temperature: 0.1  # For contrastive loss
 
   # Optimizer
   learning_rate: 5e-5        # Slightly lower LR is often better for ranking fine-tuning
-  weight_decay: 5e-2
+  weight_decay: 1e-2
   warmup_ratio: 0.1
 
   # Model saving 
