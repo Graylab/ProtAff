@@ -1,7 +1,7 @@
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-from sklearn.metrics import average_precision_score, roc_auc_score, precision_recall_curve
+from sklearn.metrics import average_precision_score, roc_auc_score
 import os
 import argparse
 import numpy as np
@@ -30,19 +30,14 @@ def get_ap(y_true, y_scores):
 def get_auroc(y_true, y_scores):
     mask = y_true.notna() & y_scores.notna()
     y_t, y_s = y_true[mask], y_scores[mask]
-    if len(y_t) == 0 or y_t.nunique() < 2: return 0.5 # Random baseline
+    if len(y_t) == 0 or y_t.nunique() < 2: return 0.5 
     return roc_auc_score(y_t, y_s)
 
 def print_metrics_summary(plot_df):
-    """Prints detailed per-target metrics and the average across targets."""
-    
-    # 1. Detailed Per-Target Table
     print("\n" + "="*100)
     print(f"{'DETAILED PER-TARGET METRICS':^100}")
     print("="*100)
-    # Reorganizing for display
-    display_df = plot_df.copy()
-    display_df = display_df.sort_values(['Method', 'target_id'])
+    display_df = plot_df.copy().sort_values(['Method', 'target_id'])
     print(display_df.to_string(index=False, formatters={
         'AP': '{:,.3f}'.format, 
         'AUROC': '{:,.3f}'.format,
@@ -50,18 +45,12 @@ def print_metrics_summary(plot_df):
         'Success@10': '{:,.0f}'.format
     }))
 
-    # 2. Average (Global) Summary Table
     print("\n" + "="*100)
     print(f"{'AVERAGE METRICS ACROSS ALL TARGETS':^100}")
     print("="*100)
     summary = plot_df.groupby('Method').agg({
-        'AP': 'mean',
-        'AUROC': 'mean',
-        'Success@1': 'mean',
-        'Success@10': 'mean'
+        'AP': 'mean', 'AUROC': 'mean', 'Success@1': 'mean', 'Success@10': 'mean'
     }).reset_index()
-    
-    # Rename columns for clarity in terminal
     summary.columns = ['Method', 'Mean AP', 'Mean AUROC', 'Success Rate @1', 'Success Rate @10']
     print(summary.to_string(index=False, formatters={
         'Mean AP': '{:,.3f}'.format,
@@ -88,44 +77,40 @@ def analyze_results(pred_csv, output_dir):
     for label, (col, lower_is_better) in METRICS_CONFIG.items():
         if col not in merged_df.columns: continue
         
+        # Pre-process numeric types for this column
+        merged_df[col] = pd.to_numeric(merged_df[col], errors='coerce')
+        merged_df['is_binder'] = pd.to_numeric(merged_df['is_binder'], errors='coerce').fillna(0)
+        
         for t in targets:
             group = merged_df[merged_df['target_id'] == t].copy()
-            # Ensure numeric
-            group['is_binder'] = pd.to_numeric(group['is_binder'], errors='coerce').fillna(0)
-            group[col] = pd.to_numeric(group[col], errors='coerce')
-            
-            # For AP/AUROC, we need "higher is better" scores
             scores = -group[col] if lower_is_better else group[col]
             
-            # Ranking metrics
             ap_score = get_ap(group['is_binder'], scores)
             auroc_score = get_auroc(group['is_binder'], scores)
             
-            # Success metrics (Binary: Did we find at least one binder?)
             group_sorted = group.sort_values(by=col, ascending=lower_is_better)
             s1 = 1 if group_sorted.head(1)['is_binder'].sum() >= 1 else 0
             s10 = 1 if group_sorted.head(10)['is_binder'].sum() >= 1 else 0
             
             plot_data_list.append({
-                'target_id': t, 
-                'Method': label,
-                'AP': ap_score, 
-                'AUROC': auroc_score, 
-                'Success@1': s1, 
-                'Success@10': s10
+                'target_id': t, 'Method': label, 'AP': ap_score, 
+                'AUROC': auroc_score, 'Success@1': s1, 'Success@10': s10
             })
 
     plot_df = pd.DataFrame(plot_data_list)
 
-    # 1. Print tables to terminal
+    # 1. Console Output
     print_metrics_summary(plot_df)
     
-    # 2. Generate Per-Target Plots
+    # 2. Bar Plots (Per-Target)
     for m in ['AP', 'AUROC', 'Success@1', 'Success@10']:
         generate_per_target_plot(plot_df, output_dir, metric=m)
     
-    # 3. Generate Average/Global Summary Plot
+    # 3. Bar Plots (Global)
     plot_global_summary(plot_df, output_dir)
+
+    # 4. NEW: Distribution Strip Plots
+    generate_distribution_plots(merged_df, output_dir)
 
 def generate_per_target_plot(df, output_dir, metric):
     sns.set_context("paper", font_scale=PLOT_SETTINGS['font_scale'])
@@ -134,7 +119,6 @@ def generate_per_target_plot(df, output_dir, metric):
     
     ax = sns.barplot(data=df, x=metric, y='target_id', hue='Method', edgecolor='black')
     
-    # Formatting
     fmt = '%.2f' if metric in ['AP', 'AUROC'] else '%d'
     for container in ax.containers:
         ax.bar_label(container, fmt=fmt, padding=3)
@@ -146,7 +130,6 @@ def generate_per_target_plot(df, output_dir, metric):
     plt.close()
 
 def plot_global_summary(plot_df, output_dir):
-    """Plots the average of all metrics across targets."""
     summary_df = plot_df.groupby('Method')[['AP', 'AUROC', 'Success@1', 'Success@10']].mean().reset_index()
     melted = summary_df.melt(id_vars='Method', var_name='Metric', value_name='Average Value')
     
@@ -162,6 +145,76 @@ def plot_global_summary(plot_df, output_dir):
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "average_summary_metrics.png"), dpi=300)
     plt.close()
+
+def generate_distribution_plots(merged_df, output_dir):
+    """Generates strip plots showing individual design scores per target."""
+    sns.set_context("paper", font_scale=PLOT_SETTINGS['font_scale'])
+    
+    plot_df = merged_df.copy()
+    
+    # Map boolean/numeric is_binder to labels
+    plot_df['Binding Status'] = plot_df['is_binder'].map({
+        True: 'Binder', 
+        False: 'Non-Binder',
+        1: 'Binder',
+        0: 'Non-Binder',
+        1.0: 'Binder',
+        0.0: 'Non-Binder'
+    })
+    
+    # Drop rows where mapping failed
+    plot_df = plot_df.dropna(subset=['Binding Status', 'target_id'])
+
+    # Colorblind friendly palette (Bluish Green for Binder, Vermillion for Non-Binder)
+    # These are highly distinct for Deuteranopia, Protanopia, and Tritanopia.
+    cb_palette = {'Binder': '#009E73', 'Non-Binder': '#D55E00'}
+
+    for label, (col, lower_is_better) in METRICS_CONFIG.items():
+        if col not in plot_df.columns:
+            continue
+            
+        temp_df = plot_df.dropna(subset=[col]).copy()
+        if temp_df.empty:
+            continue
+
+        # If it was "lower is better", flip the sign for the distribution plot
+        plot_col = col
+        display_label = label
+        if lower_is_better:
+            temp_df[f'neg_{col}'] = -temp_df[col]
+            plot_col = f'neg_{col}'
+            display_label = f"-{label} (Higher is Better)"
+
+        h = max(8, len(temp_df['target_id'].unique()) * PLOT_SETTINGS['bar_height_per_target'])
+        plt.figure(figsize=(PLOT_SETTINGS['figsize_width'], h))
+        
+        # Strip plot with accessible colors
+        ax = sns.stripplot(
+            data=temp_df, 
+            x=plot_col, 
+            y='target_id', 
+            hue='Binding Status', 
+            hue_order=['Non-Binder', 'Binder'],
+            palette=cb_palette,
+            alpha=0.5, 
+            dodge=True, 
+            jitter=0.25,
+            size=4
+        )
+        
+        plt.title(f'Score Distribution: {display_label}', weight='bold', pad=20)
+        plt.xlabel(f"{display_label} Value")
+        plt.grid(axis='x', linestyle='--', alpha=0.3)
+        
+        plt.legend(title='Status', bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0)
+        
+        sns.despine(left=True, bottom=False)
+        plt.tight_layout()
+        
+        safe_name = label.lower().replace(' ', '_').replace('@', '_')
+        plt.savefig(os.path.join(output_dir, f"distribution_{safe_name}.png"), dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Generated colorblind-friendly distribution plot for {label}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

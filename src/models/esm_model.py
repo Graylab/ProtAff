@@ -37,11 +37,16 @@ class ESMConcatModel(nn.Module):
 
     def forward(self, input_ids, attention_mask, **kwargs):
         outputs = self.esm(input_ids=input_ids, attention_mask=attention_mask)
-        cls_token = outputs.last_hidden_state[:, 0, :]
-        vec = self.norm_input(self.projector(cls_token))
+        hidden = outputs.last_hidden_state  # (batch, seq_len, hidden)
+        
+        # Mean pooling
+        mask = attention_mask.unsqueeze(-1).float()
+        pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+        
+        vec = self.norm_input(self.projector(pooled))
         score = self.head_score(vec)
         return score
-
+        
 
 class ESMCrossAttnModel(nn.Module):
     """
@@ -66,6 +71,8 @@ class ESMCrossAttnModel(nn.Module):
             batch_first=True,
             dropout=dropout
         )
+
+        self.dropout = nn.Dropout(dropout)
         
         self.projector = nn.Linear(hidden_dim, d_model)
         self.norm_final = nn.LayerNorm(d_model)
@@ -99,6 +106,8 @@ class ESMCrossAttnModel(nn.Module):
             key_padding_mask=~target_mask.bool(),
             average_attn_weights=True
         )
+
+        attn_output = self.dropout(attn_output) + b_norm
         
         mask_expanded = binder_mask.unsqueeze(-1).expand(attn_output.size()).float()
         sum_embeddings = torch.sum(attn_output * mask_expanded, 1)
@@ -136,6 +145,9 @@ class ESMInteractionMapModel(nn.Module):
             batch_first=True,
             dropout=dropout
         )
+
+        self.dropout_b2t = nn.Dropout(dropout)
+        self.dropout_t2b = nn.Dropout(dropout)
         
         # Projection: hidden_dim * 2 (both directions concatenated)
         self.projector = nn.Linear(hidden_dim * 2, d_model)
@@ -180,6 +192,10 @@ class ESMInteractionMapModel(nn.Module):
             key_padding_mask=~binder_mask.bool(),
             average_attn_weights=True
         )
+
+        # Residual
+        attn_output_b2t = self.dropout_b2t(attn_output_b2t) + b_norm
+        attn_output_t2b = self.dropout_t2b(attn_output_t2b) + t_norm
         
         # Masked mean pooling for binder→target output
         mask_b = binder_mask.unsqueeze(-1).expand(attn_output_b2t.size()).float()

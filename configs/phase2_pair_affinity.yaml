@@ -21,10 +21,10 @@ data:
   binary_test_csv: "data/test/test_binary.csv"
   
   # --- Pair Mining ---
-  pairs_per_sample: 2
-  inter_pps: 10
-  min_margin: 1.0
-  max_anchors_per_target: 2000
+  pairs_per_sample: 2 # default 2
+  inter_pps: 10 # default 10
+  min_margin: 1.0 # default 1.0
+  max_anchors_per_target: 2000 # default 2000
   
   # --- Negative Sampling ---
   add_negatives: false
@@ -34,7 +34,7 @@ data:
   # --- Sampling & Balancing ---
   weight_col: "cluster_id"
   balance_clusters: true
-  balance_power: 0.25
+  balance_power: 0.25 # default 0.25
   
   # --- DataLoader ---
   num_workers: 6
@@ -54,8 +54,8 @@ training:
   margin: 0.1                # Margin for MarginRankingLoss (diff between scores must be > this)
 
   # Optimizer
-  learning_rate: 1e-4        # Slightly lower LR is often better for ranking fine-tuning
-  weight_decay: 1e-2
+  learning_rate: 5e-5        # Slightly lower LR is often better for ranking fine-tuning
+  weight_decay: 5e-2
   warmup_ratio: 0.1
 
   # Model saving 
@@ -64,7 +64,7 @@ training:
 
   # Early Stopping
   early_stopping: true
-  early_stopping_patience: 5                  # Stop after N epochs without improvement
+  early_stopping_patience: 3                  # Stop after N epochs without improvement
 
   # Testing
   test_every_val: true                        # Run test evaluation after each validation
@@ -74,13 +74,13 @@ training:
   # Hardware
   accelerator: "auto"
   devices: "auto"
-  strategy: "ddp_find_unused_parameters_true"
+  strategy: "ddp"
   precision: "bf16-mixed"
 
   # Stability
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
-  val_check_interval: 0.1    # Validate every half epoch
+  val_check_interval: 0.1
   
   wandb:
     project: "pair-affinity-finetune"

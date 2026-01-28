@@ -12,6 +12,6 @@ lora:
   r: 8
   alpha: 16
   dropout: 0.1
-  target_modules: ["query", "key", "value"]
+  target_modules: ["key", "value"]
   modules_to_save: []
   n_last_layers: 4
