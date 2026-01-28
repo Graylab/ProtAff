@@ -21,6 +21,7 @@ data:
   binary_test_csv: "data/test/test_binary.csv"
   
   # --- Pair Mining ---
+  pair_within_source: false  # Only pair samples with same 'source' value
   pairs_per_sample: 2 # default 2
   inter_pps: 10 # default 10
   min_margin: 1.0 # default 1.0
@@ -28,8 +29,8 @@ data:
   
   # --- Negative Sampling ---
   add_negatives: false
-  neg_per_positive: 5
-  neg_log_aff: 5.0
+  neg_per_positive: 2
+  neg_log_aff: 4.5
   
   # --- Sampling & Balancing ---
   weight_col: "cluster_id"

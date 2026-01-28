@@ -241,10 +241,12 @@ class PairwiseAffinityDataset(Dataset):
                  verbose=True,
                  add_negatives=False,
                  neg_per_positive=1,
-                 neg_log_aff=2.0):
+                 neg_log_aff=2.0,
+                 pair_within_source=False):  # NEW
         
         self.verbose = verbose
         self.neg_log_aff = neg_log_aff
+        self.pair_within_source = pair_within_source  # NEW
         
         lookup_df = pd.read_csv(lookup_csv_path)
         lookup_df['key'] = lookup_df['type'].astype(str) + "_" + lookup_df['id'].astype(str)
@@ -252,6 +254,13 @@ class PairwiseAffinityDataset(Dataset):
         
         self._log(f"\n{'='*25} {split_name} GENERATION {'='*25}")
         num_df = base_df[base_df['log_Aff'].notna()].copy()
+        
+        # Check if source column exists when pair_within_source is enabled
+        if self.pair_within_source:
+            if 'source' not in num_df.columns:
+                raise KeyError("'source' column not found but pair_within_source=True")
+            self._log(f"[*] Pairing within source: ENABLED")
+            self._log(f"[*] Unique sources: {num_df['source'].nunique()}")
         
         counts = num_df.groupby('target_id').size().reset_index(name='pocket_size')
         num_df = num_df.merge(counts, on='target_id')
@@ -263,9 +272,33 @@ class PairwiseAffinityDataset(Dataset):
         self.deltas, self.pair_types = [], []
         self.aff_better, self.aff_worse = [], []
 
-        # --- PATH 1: Intra-Target ---
-        self._log(f"\n[*] Generating intra-target pairs...")
-        rich_df = num_df[num_df['pocket_size'] > 1]
+        if self.pair_within_source:
+            # Generate pairs within each source
+            for source_id, source_df in num_df.groupby('source'):
+                self._log(f"\n[*] Processing source: {source_id} ({len(source_df)} samples)")
+                self._generate_intra_target_pairs(source_df, pairs_per_sample, min_margin, max_anchors_per_target)
+                self._generate_inter_target_pairs(source_df, inter_pps)
+        else:
+            # Original behavior: all data together
+            self._generate_intra_target_pairs(num_df, pairs_per_sample, min_margin, max_anchors_per_target)
+            self._generate_inter_target_pairs(num_df, inter_pps)
+
+        # --- PATH 3: Negative Pairs ---
+        if add_negatives:
+            self._add_negative_pairs(num_df, neg_per_positive)
+
+        # Summary
+        p_df = pd.DataFrame({'type': self.pair_types})
+        self._log(f"\n[*] Pair Breakdown:")
+        if self.verbose:
+            print(p_df['type'].value_counts().to_string())
+        self._log(f"\n[*] TOTAL PAIRS: {len(self.b_better):,}")
+        self._log(f"{'='*60}\n")
+
+    def _generate_intra_target_pairs(self, df, pairs_per_sample, min_margin, max_anchors_per_target):
+        """Generate intra-target pairs from given dataframe."""
+        self._log(f"[*] Generating intra-target pairs...")
+        rich_df = df[df['pocket_size'] > 1]
         intra_count = 0
         
         for t_id, group in rich_df.groupby('target_id'):
@@ -294,9 +327,10 @@ class PairwiseAffinityDataset(Dataset):
         
         self._log(f"    Intra-target pairs: {intra_count:,}")
 
-        # --- PATH 2: Inter-Target ---
-        self._log(f"\n[*] Generating inter-target pairs...")
-        singleton_df = num_df[num_df['pocket_size'] == 1]
+    def _generate_inter_target_pairs(self, df, inter_pps):
+        """Generate inter-target pairs from given dataframe."""
+        self._log(f"[*] Generating inter-target pairs...")
+        singleton_df = df[df['pocket_size'] == 1]
         recs = singleton_df.to_dict('records')
         n = len(recs)
         inter_count = 0
@@ -315,18 +349,6 @@ class PairwiseAffinityDataset(Dataset):
                     inter_count += 1
         
         self._log(f"    Inter-target pairs: {inter_count:,}")
-
-        # --- PATH 3: Negative Pairs ---
-        if add_negatives:
-            self._add_negative_pairs(num_df, neg_per_positive)
-
-        # Summary
-        p_df = pd.DataFrame({'type': self.pair_types})
-        self._log(f"\n[*] Pair Breakdown:")
-        if self.verbose:
-            print(p_df['type'].value_counts().to_string())
-        self._log(f"\n[*] TOTAL PAIRS: {len(self.b_better):,}")
-        self._log(f"{'='*60}\n")
 
     def _add_negative_pairs(self, num_df, neg_per_positive):
         self._log(f"\n[*] Generating negative pairs...")
@@ -585,9 +607,10 @@ class PairAffinityDataModule(LightningDataModule):
             verbose=self.is_main_process,
             add_negatives=self.cfg.data.get("add_negatives", False),
             neg_per_positive=self.cfg.data.get("neg_per_positive", 1),
-            neg_log_aff=self.cfg.data.get("neg_log_aff", 2.0)
+            neg_log_aff=self.cfg.data.get("neg_log_aff", 2.0),
+            pair_within_source=self.cfg.data.get("pair_within_source", False)  # NEW
         )
-        
+
         self.val_dataset = PairwiseAffinityDataset(
             val_df, self.cfg.data.lookup_csv, 
             pairs_per_sample=2, 
@@ -596,7 +619,8 @@ class PairAffinityDataModule(LightningDataModule):
             verbose=self.is_main_process,
             add_negatives=self.cfg.data.get("add_negatives", False),
             neg_per_positive=self.cfg.data.get("neg_per_positive", 1),
-            neg_log_aff=self.cfg.data.get("neg_log_aff", 2.0)
+            neg_log_aff=self.cfg.data.get("neg_log_aff", 2.0),
+            pair_within_source=self.cfg.data.get("pair_within_source", False)  # NEW
         )
         
         # Regression test dataset
