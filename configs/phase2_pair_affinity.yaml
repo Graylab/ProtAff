@@ -30,7 +30,7 @@ data:
   # --- Negative Sampling ---
   add_negatives: false
   neg_per_positive: 2
-  neg_log_aff: 4.5
+  neg_log_aff: 6.0
   
   # --- Sampling & Balancing ---
   weight_col: "cluster_id"
@@ -77,7 +77,7 @@ training:
   # Hardware
   accelerator: "auto"
   devices: "auto"
-  strategy: "ddp"
+  strategy: "ddp_find_unused_parameters_true"
   precision: "bf16-mixed"
 
   # Stability

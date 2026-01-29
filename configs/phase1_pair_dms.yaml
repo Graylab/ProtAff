@@ -12,7 +12,7 @@ data:
   mutant_csv: "data/dummy_dms/mutants.csv"
   wt_csv: "data/dummy_dms/wildtypes.csv"
   pairs_per_anchor: 3
-  min_margin: 0.3
+  min_margin: 0.1
   max_pairs_per_protein: 2000
   crop_method: "smart"
   invert_score: false
@@ -26,15 +26,16 @@ training:
   train_val_split: 0.9
 
   # Batch and Steps
-  batch_size: 2
-  accumulate_grad_batches: 16
-  max_epochs: 5
+  batch_size: 8
+  accumulate_grad_batches: 4
+  max_epochs: 15
 
   # Loss Function
+  loss_type: "margin"
   margin: 0.1                # Margin for MarginRankingLoss (diff between scores must be > this)
 
   # Optimizer
-  learning_rate: 1e-4  
+  learning_rate: 5e-5  
   weight_decay: 1e-2
   warmup_ratio: 0.1
 
@@ -49,7 +50,7 @@ training:
   # Hardware
   accelerator: "auto"
   devices: "auto"
-  strategy: "auto"
+  strategy: "ddp"
   precision: "bf16-mixed"
 
   # Stability
