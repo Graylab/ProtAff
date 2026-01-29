@@ -102,14 +102,7 @@ class PairAffinityModule(pl.LightningModule):
         elif self.loss_type == "bce":
             self.rank_loss = nn.BCEWithLogitsLoss()
 
-        
-        # 4. Validation storage for per-target Spearman
-        self.val_scores = []
-        self.val_target_ids = []
-        self.val_binder_ids = []
-        self.val_log_affs = []
-        
-        # 5. Phase transfer
+        # 4. Phase transfer
         ckpt_path = cfg.get("pretrained_ckpt_path", None) 
         if ckpt_path:
             self._load_phase1_weights(ckpt_path)
@@ -204,57 +197,7 @@ class PairAffinityModule(pl.LightningModule):
         
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('val_acc', accuracy, on_epoch=True, prog_bar=True, sync_dist=True)
-        
-        # Store for per-target Spearman (unchanged)
-        self.val_scores.extend(scores_better.detach().cpu().squeeze().tolist())
-        self.val_scores.extend(scores_worse.detach().cpu().squeeze().tolist())
-        self.val_target_ids.extend(batch['better_tid'])
-        self.val_target_ids.extend(batch['worse_tid'])
-        self.val_binder_ids.extend(batch['better_bid'])
-        self.val_binder_ids.extend(batch['worse_bid'])
-        self.val_log_affs.extend(batch['better_log_aff'].cpu().tolist())
-        self.val_log_affs.extend(batch['worse_log_aff'].cpu().tolist())
-        
         return loss
-
-    def on_validation_epoch_end(self):
-        if not self.val_scores:
-            return
-        
-        df = pd.DataFrame({
-            'score': self.val_scores,
-            'target_id': self.val_target_ids,
-            'binder_id': self.val_binder_ids,
-            'log_aff': self.val_log_affs
-        })
-        
-        df = df.drop_duplicates(subset=['target_id', 'binder_id'], keep='first')
-        
-        target_spearmans = []
-        min_samples = 5
-        
-        for tid, group in df.groupby('target_id'):
-            if len(group) < min_samples:
-                continue
-            
-            scores = torch.tensor(group['score'].values)
-            affs = torch.tensor(group['log_aff'].values)
-            
-            sp = spearman_corrcoef(scores, affs)
-            if not torch.isnan(sp):
-                target_spearmans.append(sp.item())
-        
-        if target_spearmans:
-            avg_spearman = torch.tensor(np.mean(target_spearmans), device=self.device)
-            self.log('val_per_target_spearman', avg_spearman, prog_bar=True, sync_dist=True)
-            
-            if self.trainer.is_global_zero:
-                print(f"\n[Val] Per-target Spearman: {avg_spearman:.4f} (from {len(target_spearmans)} targets)")
-        
-        self.val_scores.clear()
-        self.val_target_ids.clear()
-        self.val_binder_ids.clear()
-        self.val_log_affs.clear()
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
