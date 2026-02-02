@@ -1,0 +1,87 @@
+defaults:
+  - _self_
+  - model: esm_cross_attn
+
+# ==========================================
+# TASK CONFIGURATION
+# ==========================================
+task_name: "affinity"
+
+# ==========================================
+# CHECKPOINT PATHS
+# ==========================================
+# Pretrained model to load weights from (e.g., from Phase 1 DMS training)
+pretrained_ckpt_path: null
+
+# Resume training from a specific checkpoint (e.g., "outputs/.../checkpoints/last.ckpt")
+resume_checkpoint_path: null
+
+# ==========================================
+# DATA CONFIGURATION
+# ==========================================
+data:
+  # Data files
+  base_csv: "data/dummy/base_data.csv"       # Train/Val data with target_id column
+  lookup_csv: "data/dummy/lookup_data.csv"   # Sequence lookup table
+  test_csv: "data/test/test_adaptyv.csv"     # Test data (format: id,binder_sequence,target_sequence,log_Aff)
+  
+  # DataLoader
+  num_workers: 6
+  
+  # Balancing configuration
+  balance_clusters: true                      # Enable weighted sampling by target_id
+  balance_power: 0.25                         # Balancing strength (0.25=gentle, 0.5=medium, 1.0=aggressive)
+  weight_col: null                            # Alternative weighting column (usually null)
+  
+# ==========================================
+# TRAINING CONFIGURATION
+# ==========================================
+training:
+  # Reproducibility
+  seed: 42
+  
+  # Data splitting (CRITICAL: Val must have unseen targets for your task)
+  split_strategy: "group"                     # "group" = split by target_id (val has unseen targets)
+  train_val_split: 0.9                        # 90% targets for train, 10% for val
+  
+  # Batch configuration
+  batch_size: 8
+  accumulate_grad_batches: 4                 # Effective batch size = 16 * 2 = 32
+  max_epochs: 15
+  
+  # Optimizer
+  learning_rate: 5e-5
+  weight_decay: 5e-2                          # High weight decay for regularization
+  warmup_ratio: 0.1
+  
+  # Model saving 
+  monitor_metric: "val_loss"              # Metric to monitor: "val_loss", "val_spearman", "test_spearman"
+  monitor_mode: "min"                         # "min" for loss, "max" for spearman/accuracy
+  
+  # Early stopping
+  early_stopping: true
+  early_stopping_patience: 3                  # Stop after N epochs without improvement
+  
+  # Testing
+  test_every_val: true                        # Run test evaluation after each validation
+  
+  # Hardware
+  accelerator: "auto"                         # "gpu", "cpu", or "auto"
+  devices: "auto"                             # Number of devices or "auto"
+  strategy: "auto" # Distributed strategy
+  precision: "bf16-mixed"                     # "16-mixed", "bf16-mixed", or "32"
+  
+  # Training stability
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: "norm"
+  val_check_interval: 0.5                     # Validate every 0.5 epochs
+  
+  wandb:
+    project: "affinity-finetune"
+
+# ==========================================
+# HYDRA OUTPUT CONFIGURATION (unchanged)
+# ==========================================
+hydra:
+  run:
+    dir: outputs/affinity/${now:%Y-%m-%d}/${now:%H-%M-%S}

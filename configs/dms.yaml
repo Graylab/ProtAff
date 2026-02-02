@@ -54,4 +54,4 @@ training:
 # Hydra handles the output path logic
 hydra:
   run:
-    dir: outputs/phase1_dms/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: outputs/dms/${now:%Y-%m-%d}/${now:%H-%M-%S}

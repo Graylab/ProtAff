@@ -15,21 +15,29 @@ from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_sco
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 # --- IMPORT MODULES ---
-# Phase 1: DMS (Regression)
+# DMS (Regression)
 from src.datasets.dataset_dms import DMSDataModule
-from src.lightning.phase1_dms import DMSModule
+from src.lightning.dms_module import DMSModule
 
-# Phase 1: DMS (Ranking)
+# Pair DMS (Ranking)
 from src.datasets.dataset_pair_dms import PairDMSDataModule
-from src.lightning.phase1_pair_dms import PairDMSModule
+from src.lightning.pair_dms_module import PairDMSModule
 
-# Phase 2: Affinity (Regression)
+# Affinity (Regression)
 from src.datasets.dataset_affinity import AffinityDataModule 
-from src.lightning.phase2_affinity import AffinityModule
+from src.lightning.affinity_module import AffinityModule
 
-# Phase 2: Pair Affinity (Ranking)
+# Pair Affinity (Ranking)
 from src.datasets.dataset_pair_affinity import PairAffinityDataModule
-from src.lightning.phase2_pair_affinity import PairAffinityModule
+from src.lightning.pair_affinity_module import PairAffinityModule
+
+# PPI (Regression)
+from src.datasets.dataset_ppi import PPIDataModule 
+from src.lightning.ppi_module import PPIModule
+
+# PPI (Ranking)
+from src.datasets.dataset_pair_ppi import PairPPIDataModule 
+from src.lightning.pair_ppi_module import PairPPIModule
 
 
 class BestModelSaver(Callback):
@@ -268,27 +276,37 @@ def get_task_modules(cfg):
     task = cfg.get("task_name", "dms").lower()
     
     if task == "dms":
-        print("[Factory] Loading Phase 1: DMS (Regression)")
+        print("[Factory] Loading DMS (Regression)")
         dm = DMSDataModule(cfg)
         model = DMSModule(cfg)
 
     elif task == "pair_dms":
-        print("[Factory] Loading Phase 1: DMS (Pair Ranking)")
+        print("[Factory] Loading Pair DMS (Ranking)")
         dm = PairDMSDataModule(cfg)
         model = PairDMSModule(cfg)
         
     elif task == "affinity":
-        print("[Factory] Loading Phase 2: Affinity (Regression)")
+        print("[Factory] Loading Affinity (Regression)")
         dm = AffinityDataModule(cfg)
         model = AffinityModule(cfg)
         
     elif task == "pair_affinity":
-        print("[Factory] Loading Phase 2: Pair Affinity (Ranking)")
+        print("[Factory] Loading Pair Affinity (Ranking)")
         dm = PairAffinityDataModule(cfg)
         model = PairAffinityModule(cfg)
-        
+    
+    elif task == "ppi":
+        print("[Factory] Loading PPI (Regression)")
+        dm = PPIDataModule(cfg)
+        model = PPIModule(cfg)
+
+    elif task == "pair_ppi":
+        print("[Factory] Loading Pair PPI (Ranking)")
+        dm = PairPPIDataModule(cfg)
+        model = PairPPIModule(cfg)
+
     else:
-        raise ValueError(f"Unknown task_name: {task}. Options: ['dms', 'pair_dms', 'affinity', 'pair_affinity']")
+        raise ValueError(f"Unknown task_name: {task}. Options: ['dms', 'pair_dms', 'affinity', 'pair_affinity', 'ppi', 'pair_ppi']")
     
     return dm, model
 
@@ -333,7 +351,7 @@ def main(cfg: DictConfig):
     checkpoint_cb = ModelCheckpoint(
         dirpath=os.path.join(hydra_out_dir, "checkpoints"),
         filename=f"{cfg.task_name}-{{epoch:02d}}-{{{monitor_metric}:.4f}}",
-        save_top_k=3,
+        save_top_k=0,
         monitor=monitor_metric,
         mode=monitor_mode,
         save_last=True,

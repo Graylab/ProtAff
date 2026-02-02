@@ -5,7 +5,7 @@ defaults:
 # ==========================================
 # TASK CONFIGURATION
 # ==========================================
-task_name: "affinity"
+task_name: "ppi"
 
 # ==========================================
 # CHECKPOINT PATHS
@@ -21,22 +21,18 @@ resume_checkpoint_path: null
 # ==========================================
 data:
   # Data files
-  base_csv: "data/dummy/base_data.csv"       # Train/Val data with target_id column
-  lookup_csv: "data/dummy/lookup_data.csv"   # Sequence lookup table
-  test_csv: "data/test/test_adaptyv.csv"     # Test data (format: id,binder_sequence,target_sequence,log_Aff)
+  pairs_csv: "data/ppi/ppi_pairs.csv"
+  lookup_csv: "data/ppi/ppi_lookup.csv"
+  sources: null
   
   # DataLoader
   num_workers: 6
   
   # Balancing configuration
-  balance_clusters: true                      # Enable weighted sampling by target_id
+  balance_clusters: false                      # Enable weighted sampling by target_id
   balance_power: 0.25                         # Balancing strength (0.25=gentle, 0.5=medium, 1.0=aggressive)
   weight_col: null                            # Alternative weighting column (usually null)
   
-  # Optionsqmeal: Data filtering (uncomment to use)
-  # max_samples_per_target: 5000              # Cap maximum samples per target
-  # min_samples_per_target: 2                 # Remove targets with fewer samples
-
 # ==========================================
 # TRAINING CONFIGURATION
 # ==========================================
@@ -45,17 +41,20 @@ training:
   seed: 42
   
   # Data splitting (CRITICAL: Val must have unseen targets for your task)
-  split_strategy: "group"                     # "group" = split by target_id (val has unseen targets)
+  split_strategy: "random"                     # "group" = split by target_id (val has unseen targets)
   train_val_split: 0.9                        # 90% targets for train, 10% for val
   
   # Batch configuration
-  batch_size: 8
-  accumulate_grad_batches: 4                 # Effective batch size = 16 * 2 = 32
-  max_epochs: 15
+  batch_size: 16
+  accumulate_grad_batches: 1                 # Effective batch size = 16 * 2 = 32
+  max_epochs: 5
+
+  # Loss Function
+  loss_type: "mse"  # Options: margin, soft_margin, bce, margin_weighted, contrastive
   
   # Optimizer
-  learning_rate: 5e-5
-  weight_decay: 5e-2                          # High weight decay for regularization
+  learning_rate: 1e-4
+  weight_decay: 1e-2                          # High weight decay for regularization
   warmup_ratio: 0.1
   
   # Model saving 
@@ -67,7 +66,7 @@ training:
   early_stopping_patience: 3                  # Stop after N epochs without improvement
   
   # Testing
-  test_every_val: true                        # Run test evaluation after each validation
+  test_every_val: false                        # Run test evaluation after each validation
   
   # Hardware
   accelerator: "auto"                         # "gpu", "cpu", or "auto"
@@ -81,11 +80,11 @@ training:
   val_check_interval: 0.5                     # Validate every 0.5 epochs
   
   wandb:
-    project: "affinity-finetune"
+    project: "ppi-pretrain"
 
 # ==========================================
 # HYDRA OUTPUT CONFIGURATION (unchanged)
 # ==========================================
 hydra:
   run:
-    dir: outputs/phase2_affinity/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: outputs/ppi/${now:%Y-%m-%d}/${now:%H-%M-%S}

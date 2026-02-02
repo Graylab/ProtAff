@@ -91,4 +91,4 @@ training:
 # Standard Hydra Output
 hydra:
   run:
-    dir: outputs/phase2_pair_affinity/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: outputs/pair_affinity/${now:%Y-%m-%d}/${now:%H-%M-%S}
