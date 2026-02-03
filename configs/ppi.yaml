@@ -23,15 +23,27 @@ data:
   # Data files
   pairs_csv: "data/ppi/ppi_pairs.csv"
   lookup_csv: "data/ppi/ppi_lookup.csv"
-  sources: null
+
+  # Optional filters
+  sources: null  # or ["PPI", "DNS", "DNU"]
+  min_confidence: null
+  max_confidence: null
+
+  # Balancing
+  balance_clusters: false
+  balance_power: 0.5
+
+  # Label
+  invert_label: true  # 1 - confidence (lower = better)
+  undersample: true
+  undersample_ratio: 1.0      # 1:1 ratio (balanced)
+  confidence_threshold: 0.5
+
+  # Split (only used if strategy=group)
+  split_col: "protein_a"
   
   # DataLoader
   num_workers: 6
-  
-  # Balancing configuration
-  balance_clusters: false                      # Enable weighted sampling by target_id
-  balance_power: 0.25                         # Balancing strength (0.25=gentle, 0.5=medium, 1.0=aggressive)
-  weight_col: null                            # Alternative weighting column (usually null)
   
 # ==========================================
 # TRAINING CONFIGURATION
@@ -42,7 +54,7 @@ training:
   
   # Data splitting (CRITICAL: Val must have unseen targets for your task)
   split_strategy: "random"                     # "group" = split by target_id (val has unseen targets)
-  train_val_split: 0.9                        # 90% targets for train, 10% for val
+  train_val_split: 0.95                        # 90% targets for train, 10% for val
   
   # Batch configuration
   batch_size: 16
@@ -50,7 +62,9 @@ training:
   max_epochs: 5
 
   # Loss Function
-  loss_type: "mse"  # Options: margin, soft_margin, bce, margin_weighted, contrastive
+  loss_type: "bce"  # Options: margin, soft_margin, bce, margin_weighted, contrastive
+  focal_gamma: 2.0
+  focal_alpha: 0.04
   
   # Optimizer
   learning_rate: 1e-4
@@ -77,7 +91,7 @@ training:
   # Training stability
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
-  val_check_interval: 0.5                     # Validate every 0.5 epochs
+  val_check_interval: 0.1                     # Validate every 0.1 epochs
   
   wandb:
     project: "ppi-pretrain"

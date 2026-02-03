@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from peft import get_peft_model, LoraConfig
 from peft.utils import load_peft_weights
@@ -12,17 +13,6 @@ from src.models import build_model
 
 
 def get_esm_lora_target_modules(esm_model, target_modules: list, n_last_layers: int = None):
-    """
-    Build LoRA target module list.
-    
-    Args:
-        esm_model: The ESM model to get num_layers from
-        target_modules: Base module names like ["query", "key", "value"]
-        n_last_layers: If specified, only target last N layers. None = all layers
-    
-    Returns:
-        List of target module patterns/names for LoRA
-    """
     if n_last_layers is None:
         return target_modules
     
@@ -36,8 +26,30 @@ def get_esm_lora_target_modules(esm_model, target_modules: list, n_last_layers: 
     return full_target_modules
 
 
+# ----------------------------------------------------------------------
+# Focal Loss Implementation
+# ----------------------------------------------------------------------
+class FocalLoss(nn.Module):
+    """Focal Loss for addressing class imbalance."""
+    def __init__(self, alpha: float = 1.0, gamma: float = 2.0, reduction: str = 'mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        loss = self.alpha * (1 - p_t)**self.gamma * bce_loss
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        return loss.sum()
+
+
 class PPIModule(pl.LightningModule):
-    """Lightning module for PPI confidence regression."""
+    """Lightning module for PPI pretraining (regression or binary classification)."""
     
     def __init__(self, cfg: DictConfig):
         super().__init__()
@@ -64,7 +76,6 @@ class PPIModule(pl.LightningModule):
                 if m not in modules_to_save:
                     modules_to_save.append(m)
 
-        # Build target modules (with n_last_layers support)
         base_target_modules = OmegaConf.to_container(cfg.model.lora.target_modules)
         n_last_layers = cfg.model.lora.get("n_last_layers", None)
         
@@ -94,6 +105,7 @@ class PPIModule(pl.LightningModule):
         
         # 3. Loss
         self.loss_type = getattr(cfg.training, "loss_type", "mse")
+        self.bce_threshold = getattr(cfg.data, "confidence_threshold", 0.5)
         
         if self.loss_type == "mse":
             self.loss_fn = nn.MSELoss()
@@ -101,10 +113,19 @@ class PPIModule(pl.LightningModule):
             self.loss_fn = nn.SmoothL1Loss()
         elif self.loss_type == "huber":
             self.loss_fn = nn.HuberLoss()
+        elif self.loss_type == "bce":
+            self.loss_fn = nn.BCEWithLogitsLoss()
+        elif self.loss_type == "focal":
+            # Added Focal Loss
+            gamma = getattr(cfg.training, "focal_gamma", 2.0)
+            alpha = getattr(cfg.training, "focal_alpha", 1.0)
+            self.loss_fn = FocalLoss(alpha=alpha, gamma=gamma)
         else:
             self.loss_fn = nn.MSELoss()
         
         print(f"[PPIModule] Loss: {self.loss_type}")
+        if self.loss_type in ["bce", "focal"]:
+            print(f"[PPIModule] Threshold: {self.bce_threshold}")
 
         # 4. Phase transfer
         ckpt_path = cfg.get("pretrained_ckpt_path", None) 
@@ -127,26 +148,62 @@ class PPIModule(pl.LightningModule):
                 attention_mask=batch["attention_mask"]
             )
 
-    def training_step(self, batch, batch_idx):
-        preds = self.forward(batch).squeeze(-1)
+    def _get_labels(self, batch):
+        """Convert labels for BCE or Focal if needed."""
         labels = batch["labels"]
         
-        loss = self.loss_fn(preds, labels)
+        if self.loss_type in ["bce", "focal"]:
+            # labels are inverted confidence (1 - conf) if invert_label=True
+            # For BCE/Focal: binder (high conf, low label) = 0, non-binder (low conf, high label) = 1
+            # threshold on inverted: label > (1 - threshold) means non-binder
+            binary_labels = (labels > (1.0 - self.bce_threshold)).float()
+            return binary_labels
         
+        return labels
+
+    def training_step(self, batch, batch_idx):
+        preds = self.forward(batch).squeeze(-1)
+        labels = self._get_labels(batch)
+        
+        loss = self.loss_fn(preds, labels)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+        if self.loss_type in ["bce", "focal"]:
+            acc = ((preds > 0) == (labels > 0.5)).float().mean()
+            self.log("train_acc", acc, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        
         return loss
 
     def validation_step(self, batch, batch_idx):
         preds = self.forward(batch).squeeze(-1)
-        labels = batch["labels"]
+        labels = self._get_labels(batch)
         
         loss = self.loss_fn(preds, labels)
-        spearman = spearman_corrcoef(preds, labels)
-        pearson = pearson_corrcoef(preds, labels)
-        
         self.log("val_loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("val_spearman", spearman, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("val_pearson", pearson, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+        if self.loss_type in ["bce", "focal"]:
+            acc = ((preds > 0) == (labels > 0.5)).float().mean()
+            
+            pred_binder = (preds <= 0)
+            true_binder = (labels < 0.5)
+            
+            tp = (pred_binder & true_binder).sum().float()
+            fp = (pred_binder & ~true_binder).sum().float()
+            fn = (~pred_binder & true_binder).sum().float()
+            
+            precision = tp / (tp + fp + 1e-8)
+            recall = tp / (tp + fn + 1e-8)
+            f1 = 2 * precision * recall / (precision + recall + 1e-8)
+            
+            self.log("val_acc", acc, on_epoch=True, prog_bar=True, sync_dist=True)
+            self.log("val_precision", precision, on_epoch=True, sync_dist=True)
+            self.log("val_recall", recall, on_epoch=True, sync_dist=True)
+            self.log("val_f1", f1, on_epoch=True, prog_bar=True, sync_dist=True)
+        else:
+            spearman = spearman_corrcoef(preds, labels)
+            pearson = pearson_corrcoef(preds, labels)
+            self.log("val_spearman", spearman, on_epoch=True, prog_bar=True, sync_dist=True)
+            self.log("val_pearson", pearson, on_epoch=True, prog_bar=True, sync_dist=True)
         
         return loss
 
