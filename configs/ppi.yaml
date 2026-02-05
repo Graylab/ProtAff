@@ -29,14 +29,9 @@ data:
   min_confidence: null
   max_confidence: null
 
-  # Balancing
-  balance_clusters: false
-  balance_power: 0.5
-
   # Label
   invert_label: true  # 1 - confidence (lower = better)
-  undersample: true
-  undersample_ratio: 1.0      # 1:1 ratio (balanced)
+  use_weighted_sampler: True
   confidence_threshold: 0.5
 
   # Split (only used if strategy=group)
@@ -57,7 +52,7 @@ training:
   train_val_split: 0.95                        # 90% targets for train, 10% for val
   
   # Batch configuration
-  batch_size: 16
+  batch_size: 64
   accumulate_grad_batches: 1                 # Effective batch size = 16 * 2 = 32
   max_epochs: 5
 

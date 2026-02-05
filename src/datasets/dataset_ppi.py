@@ -91,14 +91,10 @@ class PPICrossAttnCollator:
 
 class PPIDataset(Dataset):
     """PPI Dataset for confidence regression."""
-    
     def __init__(
         self,
         pairs_df: pd.DataFrame,
         id2seq: Dict[str, str],
-        balance_clusters: bool = False,
-        balance_power: float = 0.5,
-        provided_stats: Optional[Tuple[float, float]] = None,
         invert_label: bool = True,
         verbose: bool = True,
     ):
@@ -107,39 +103,8 @@ class PPIDataset(Dataset):
         self.invert_label = invert_label
         self.verbose = verbose
         
-        # Weights for sampling
-        self.weights = None
-        if balance_clusters:
-            # Count frequency of each protein
-            protein_a_counts = self.pairs_df["protein_a"].value_counts()
-            protein_b_counts = self.pairs_df["protein_b"].value_counts()
-            
-            self._log(f"\n[PPIDataset] Balancing by protein frequency:")
-            self._log(f"  Unique protein_a: {len(protein_a_counts):,}")
-            self._log(f"  Unique protein_b: {len(protein_b_counts):,}")
-            self._log(f"  protein_a freq range: {protein_a_counts.min()} - {protein_a_counts.max()}")
-            self._log(f"  protein_b freq range: {protein_b_counts.min()} - {protein_b_counts.max()}")
-            
-            # Get frequencies for each pair
-            freq_a = self.pairs_df["protein_a"].map(protein_a_counts).values.astype(np.float32)
-            freq_b = self.pairs_df["protein_b"].map(protein_b_counts).values.astype(np.float32)
-            
-            # Geometric mean of frequencies
-            combined_freq = np.sqrt(freq_a * freq_b)
-            
-            # Weight = 1 / freq^power (no normalization needed)
-            self.weights = (1.0 / np.power(combined_freq, balance_power)).astype(np.float32)
-            
-            self._log(f"  Balance power: {balance_power}")
-            self._log(f"  Weight range: {self.weights.min():.4f} - {self.weights.max():.4f}")
-            self._log(f"  Weight ratio (max/min): {self.weights.max() / self.weights.min():.1f}x")
-        
-        # Stats for normalization
-        if provided_stats:
-            self.mean, self.std = provided_stats
-        else:
-            self.mean = float(self.pairs_df["confidence"].mean())
-            self.std = float(self.pairs_df["confidence"].std())
+        self.mean = float(self.pairs_df["confidence"].mean())
+        self.std = float(self.pairs_df["confidence"].std())
         
         self._log(f"[PPIDataset] Loaded {len(self):,} pairs")
         self._log(f"[PPIDataset] Confidence stats - Mean: {self.mean:.4f}, Std: {self.std:.4f}")
@@ -167,14 +132,12 @@ class PPIDataset(Dataset):
             "label": label,
         }
 
-
 # ----------------------------------------------------------------------
 # 3. DataModule
 # ----------------------------------------------------------------------
 
 class PPIDataModule(LightningDataModule):
     """DataModule for PPI pretraining."""
-    
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.cfg = cfg
@@ -183,7 +146,7 @@ class PPIDataModule(LightningDataModule):
         
         # Select collator
         arch = cfg.model.get("arch", "concat")
-        max_length = cfg.model.get("max_length", 512)
+        max_length = cfg.model.get("max_length", 1024)
         
         if arch in ["cross_attn", "interaction_map"]:
             print("[PPIDataModule] Using CrossAttnCollator")
@@ -271,60 +234,54 @@ class PPIDataModule(LightningDataModule):
             raise ValueError(f"Unknown split_strategy: {strategy}")
 
         # =====================================================
-        # STEP 2: Undersample ONLY the Training Set
+        # STEP 2: Weighted Sampling for Class Imbalance
         # =====================================================
-        undersample = self.cfg.data.get("undersample", False)
-        if undersample:
-            undersample_ratio = self.cfg.data.get("undersample_ratio", 1.0)
-            confidence_threshold = self.cfg.data.get("confidence_threshold", 0.5)
+        # We no longer "undersample" by deleting rows. 
+        # Instead, we calculate weights so the model sees classes equally.
+        use_weighted_sampler = self.cfg.data.get("use_weighted_sampler", True)
+        confidence_threshold = self.cfg.data.get("confidence_threshold", 0.5)
+        
+        if use_weighted_sampler:
+            # 1. Define labels for training set
+            train_labels = (train_df["confidence"] >= confidence_threshold).astype(int)
+            class_counts = train_labels.value_counts().to_dict()
             
-            # Split train into binders (positive) and non-binders (negative)
-            positive_train = train_df[train_df["confidence"] >= confidence_threshold]
-            negative_train = train_df[train_df["confidence"] < confidence_threshold]
-            
-            n_pos = len(positive_train)
-            n_neg = len(negative_train)
+            n_pos = class_counts.get(1, 0)
+            n_neg = class_counts.get(0, 0)
             
             if self.is_main_process:
-                print(f"[PPIDataModule] Before undersampling (TRAIN ONLY):")
-                print(f"  Positive (conf >= {confidence_threshold}): {n_pos:,} ({100*n_pos/len(train_df):.1f}%)")
-                print(f"  Negative (conf < {confidence_threshold}): {n_neg:,} ({100*n_neg/len(train_df):.1f}%)")
+                print(f"[PPIDataModule] Training Class Distribution (Before Weighting):")
+                print(f"  Positive (Binders): {n_pos:,} ({100*n_pos/len(train_df):.1f}%)")
+                print(f"  Negative (Non-Binders): {n_neg:,} ({100*n_neg/len(train_df):.1f}%)")
+
+            # 2. Calculate inverse frequency weights: 1 / class_count
+            # This ensures that in a sample, P(binder) == P(non-binder)
+            class_weights = {cls: 1.0 / count for cls, count in class_counts.items() if count > 0}
+            sample_weights = train_labels.map(class_weights).values
             
-            # Undersample the majority class in training
-            n_negative_keep = int(n_pos * undersample_ratio)
-            n_negative_keep = min(n_negative_keep, n_neg)
-            
-            negative_train_sampled = negative_train.sample(
-                n=n_negative_keep, 
-                random_state=seed
+            # 3. Initialize the Sampler
+            # num_samples=len(train_df) ensures an "epoch" is still one full pass.
+            self.sampler = WeightedRandomSampler(
+                weights=sample_weights,
+                num_samples=len(train_df),
+                replacement=True
             )
             
-            # Recombine and shuffle training set
-            train_df = pd.concat([positive_train, negative_train_sampled], ignore_index=True)
-            train_df = train_df.sample(frac=1, random_state=seed).reset_index(drop=True)
-            
             if self.is_main_process:
-                print(f"[PPIDataModule] After undersampling (ratio={undersample_ratio}):")
-                print(f"  Train Total: {len(train_df):,}")
-                print(f"  Train Positive: {len(positive_train):,}")
-                print(f"  Train Negative: {n_negative_keep:,}")
-
+                print(f"[PPIDataModule] Initialized WeightedRandomSampler (Label-based)")
+        
         # Final summary print
         if self.is_main_process:
             print(f"[PPIDataModule] Final Split - Train: {len(train_df):,}, Val: {len(val_df):,}")
-        
+
         # =====================================================
         # STEP 3: Create Datasets
         # =====================================================
-        balance_clusters = self.cfg.data.get("balance_clusters", False)
-        balance_power = self.cfg.data.get("balance_power", 0.5)
         invert_label = self.cfg.data.get("invert_label", True)
         
         self.train_dataset = PPIDataset(
             pairs_df=train_df,
             id2seq=id2seq,
-            balance_clusters=balance_clusters,
-            balance_power=balance_power,
             invert_label=invert_label,
             verbose=self.is_main_process,
         )
@@ -332,20 +289,9 @@ class PPIDataModule(LightningDataModule):
         self.val_dataset = PPIDataset(
             pairs_df=val_df,
             id2seq=id2seq,
-            balance_clusters=False,
             invert_label=invert_label,
             verbose=self.is_main_process,
         )
-        
-        # Sampler logic
-        if self.train_dataset.weights is not None:
-            if self.is_main_process:
-                print("[PPIDataModule] Using WeightedRandomSampler")
-            self.sampler = WeightedRandomSampler(
-                weights=self.train_dataset.weights,
-                num_samples=len(self.train_dataset),
-                replacement=True
-            )
     
     def train_dataloader(self):
         return DataLoader(

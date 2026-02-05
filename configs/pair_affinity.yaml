@@ -47,8 +47,8 @@ training:
 
   # Batch and Steps
   # Note: Effective batch size = batch_size * 2 (since we process Better + Worse)
-  batch_size: 8              # Lowered slightly as we process 2x sequences per step
-  accumulate_grad_batches: 4 # Increased to maintain effective batch size
+  batch_size: 16              # Lowered slightly as we process 2x sequences per step
+  accumulate_grad_batches: 2 # Increased to maintain effective batch size
   max_epochs: 15             # Ranking often takes longer to converge than regression
 
   # Loss Function
@@ -83,7 +83,7 @@ training:
   # Stability
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
-  val_check_interval: 0.1
+  val_check_interval: 0.5
   
   wandb:
     project: "pair-affinity-finetune"
