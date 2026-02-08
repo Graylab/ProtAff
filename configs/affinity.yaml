@@ -24,6 +24,7 @@ data:
   base_csv: "data/dummy/base_data.csv"       # Train/Val data with target_id column
   lookup_csv: "data/dummy/lookup_data.csv"   # Sequence lookup table
   test_csv: "data/test/test_adaptyv.csv"     # Test data (format: id,binder_sequence,target_sequence,log_Aff)
+  binary_test_csv: "data/test/test_binary.csv"
   
   # DataLoader
   num_workers: 6
@@ -45,13 +46,13 @@ training:
   train_val_split: 0.9                        # 90% targets for train, 10% for val
   
   # Batch configuration
-  batch_size: 8
-  accumulate_grad_batches: 4                 # Effective batch size = 16 * 2 = 32
+  batch_size: 16
+  accumulate_grad_batches: 2                 # Effective batch size = 16 * 2 = 32
   max_epochs: 15
   
   # Optimizer
   learning_rate: 5e-5
-  weight_decay: 5e-2                          # High weight decay for regularization
+  weight_decay: 1e-2                          # High weight decay for regularization
   warmup_ratio: 0.1
   
   # Model saving 
@@ -64,6 +65,8 @@ training:
   
   # Testing
   test_every_val: true                        # Run test evaluation after each validation
+  test_binary_every_val: true
+  binary_test_every_n_epoch: 1
   
   # Hardware
   accelerator: "auto"                         # "gpu", "cpu", or "auto"

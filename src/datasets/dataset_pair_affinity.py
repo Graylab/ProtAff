@@ -2,238 +2,19 @@ import os
 import torch
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Tuple
 from omegaconf import DictConfig
 
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torch.nn.utils.rnn import pad_sequence
 from pytorch_lightning import LightningDataModule
 from transformers import EsmTokenizer
 
-# ======================================================================
-# 0. REGRESSION COLLATOR (For Test)
-# ======================================================================
-@dataclass
-class RegressionCollator:
-    """
-    Collator for regression test set - single samples (not pairs).
-    """
-    tokenizer: Any
-    arch: str = "concat"
-    max_length: int = 1024
-
-    def _tokenize_concat(self, binders: List[str], targets: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        eos = self.tokenizer.eos_token
-        cls_id = self.tokenizer.cls_token_id
-        eos_id = self.tokenizer.eos_token_id
-        pad_id = self.tokenizer.pad_token_id
-
-        binder_seqs = [str(b).replace(":", eos) for b in binders]
-        target_seqs = [str(t).replace(":", eos) for t in targets]
-
-        b_encoded = self.tokenizer(binder_seqs, add_special_tokens=False)["input_ids"]
-        t_encoded = self.tokenizer(target_seqs, add_special_tokens=False)["input_ids"]
-
-        input_ids_list, mask_list = [], []
-        for b_ids, t_ids in zip(b_encoded, t_encoded):
-            allowed_len = self.max_length - 3 
-            if len(b_ids) + len(t_ids) > allowed_len:
-                t_ids = t_ids[:max(0, allowed_len - len(b_ids))]
-                b_ids = b_ids[:allowed_len]
-            
-            full_ids = [cls_id] + b_ids + [eos_id] + t_ids + [eos_id]
-            input_ids_list.append(torch.tensor(full_ids, dtype=torch.long))
-            mask_list.append(torch.ones(len(full_ids), dtype=torch.long))
-
-        return (
-            pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id),
-            pad_sequence(mask_list, batch_first=True, padding_value=0)
-        )
-
-    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        binders = [x["binder_seq"] for x in batch]
-        targets = [x["target_seq"] for x in batch]
-        labels = torch.tensor([x["log_Aff"] for x in batch], dtype=torch.float32).unsqueeze(1)
-
-        if self.arch in ["cross_attn", "interaction_map"]:
-            b_enc = self.tokenizer(binders, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
-            t_enc = self.tokenizer(targets, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
-            return {
-                "binder_ids": b_enc["input_ids"],
-                "binder_mask": b_enc["attention_mask"],
-                "target_ids": t_enc["input_ids"],
-                "target_mask": t_enc["attention_mask"],
-                "reg_labels": labels
-            }
-        else:
-            input_ids, mask = self._tokenize_concat(binders, targets)
-            return {
-                "input_ids": input_ids,
-                "attention_mask": mask,
-                "reg_labels": labels
-            }
+from src.datasets.collators import select_collator, RegressionTestCollator, BinaryClassificationCollator
+from src.datasets.test_datasets import TestRegressionDataset, BinaryClassificationTestDataset
 
 
 # ======================================================================
-# 1. PAIRWISE COLLATOR (For Train/Val)
-# ======================================================================
-@dataclass
-class PairwiseCollator:
-    tokenizer: Any
-    arch: str = "concat"
-    max_length: int = 1024
-
-    def _tokenize_batch_concat(self, binders: List[str], targets: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        eos = self.tokenizer.eos_token
-        cls_id = self.tokenizer.cls_token_id
-        eos_id = self.tokenizer.eos_token_id
-        pad_id = self.tokenizer.pad_token_id
-
-        binder_seqs = [str(b).replace(":", eos) for b in binders]
-        target_seqs = [str(t).replace(":", eos) for t in targets]
-
-        b_encoded = self.tokenizer(binder_seqs, add_special_tokens=False)["input_ids"]
-        t_encoded = self.tokenizer(target_seqs, add_special_tokens=False)["input_ids"]
-
-        input_ids_list, mask_list = [], []
-        for b_ids, t_ids in zip(b_encoded, t_encoded):
-            allowed_len = self.max_length - 3 
-            if len(b_ids) + len(t_ids) > allowed_len:
-                t_ids = t_ids[:max(0, allowed_len - len(b_ids))]
-                b_ids = b_ids[:allowed_len]
-            
-            full_ids = [cls_id] + b_ids + [eos_id] + t_ids + [eos_id]
-            input_ids_list.append(torch.tensor(full_ids, dtype=torch.long))
-            mask_list.append(torch.ones(len(full_ids), dtype=torch.long))
-
-        return (
-            pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id),
-            pad_sequence(mask_list, batch_first=True, padding_value=0)
-        )
-
-    def _tokenize_batch_cross(self, binders: List[str], targets: List[str]) -> Dict[str, torch.Tensor]:
-        b_enc = self.tokenizer(binders, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
-        t_enc = self.tokenizer(targets, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
-        return {
-            "ids": b_enc["input_ids"], "mask": b_enc["attention_mask"],
-            "target_ids": t_enc["input_ids"], "target_mask": t_enc["attention_mask"]
-        }
-
-    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        better_b, better_t = [x["better_binder"] for x in batch], [x["better_target"] for x in batch]
-        worse_b, worse_t = [x["worse_binder"] for x in batch], [x["worse_target"] for x in batch]
-        deltas = torch.tensor([x["delta"] for x in batch], dtype=torch.float32)
-
-        # For per-target Spearman
-        better_target_ids = [x["better_target_id"] for x in batch]
-        worse_target_ids = [x["worse_target_id"] for x in batch]
-        better_log_affs = torch.tensor([x["better_log_aff"] for x in batch], dtype=torch.float32)
-        worse_log_affs = torch.tensor([x["worse_log_aff"] for x in batch], dtype=torch.float32)
-        better_binder_ids = [x["better_binder_id"] for x in batch]
-        worse_binder_ids = [x["worse_binder_id"] for x in batch]
-
-        if self.arch in ["cross_attn", "interaction_map"]:
-            b_data = self._tokenize_batch_cross(better_b, better_t)
-            w_data = self._tokenize_batch_cross(worse_b, worse_t)
-            return {
-                "better_binder_ids": b_data["ids"], "better_binder_mask": b_data["mask"],
-                "better_target_ids": b_data["target_ids"], "better_target_mask": b_data["target_mask"],
-                "worse_binder_ids": w_data["ids"], "worse_binder_mask": w_data["mask"],
-                "worse_target_ids": w_data["target_ids"], "worse_target_mask": w_data["target_mask"],
-                "delta": deltas,
-                "better_tid": better_target_ids,
-                "worse_tid": worse_target_ids,
-                "better_log_aff": better_log_affs,
-                "worse_log_aff": worse_log_affs,
-                "better_bid": better_binder_ids,
-                "worse_bid": worse_binder_ids,
-            }
-        else:
-            b_ids, b_mask = self._tokenize_batch_concat(better_b, better_t)
-            w_ids, w_mask = self._tokenize_batch_concat(worse_b, worse_t)
-            return {
-                "better_input_ids": b_ids, "better_mask": b_mask,
-                "worse_input_ids": w_ids, "worse_mask": w_mask,
-                "delta": deltas,
-                "better_tid": better_target_ids,
-                "worse_tid": worse_target_ids,
-                "better_log_aff": better_log_affs,
-                "worse_log_aff": worse_log_affs,
-                "better_bid": better_binder_ids,
-                "worse_bid": worse_binder_ids,
-            }
-
-
-# ======================================================================
-# 2. BINARY CLASSIFICATION COLLATOR (For Binary Test)
-# ======================================================================
-@dataclass
-class BinaryClassificationCollator:
-    """
-    Collator for binary classification test set (binder vs non-binder).
-    """
-    tokenizer: Any
-    arch: str = "concat"
-    max_length: int = 1024
-
-    def _tokenize_concat(self, binders: List[str], targets: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        eos = self.tokenizer.eos_token
-        cls_id = self.tokenizer.cls_token_id
-        eos_id = self.tokenizer.eos_token_id
-        pad_id = self.tokenizer.pad_token_id
-
-        binder_seqs = [str(b).replace(":", eos) for b in binders]
-        target_seqs = [str(t).replace(":", eos) for t in targets]
-
-        b_encoded = self.tokenizer(binder_seqs, add_special_tokens=False)["input_ids"]
-        t_encoded = self.tokenizer(target_seqs, add_special_tokens=False)["input_ids"]
-
-        input_ids_list, mask_list = [], []
-        for b_ids, t_ids in zip(b_encoded, t_encoded):
-            allowed_len = self.max_length - 3 
-            if len(b_ids) + len(t_ids) > allowed_len:
-                t_ids = t_ids[:max(0, allowed_len - len(b_ids))]
-                b_ids = b_ids[:allowed_len]
-            
-            full_ids = [cls_id] + b_ids + [eos_id] + t_ids + [eos_id]
-            input_ids_list.append(torch.tensor(full_ids, dtype=torch.long))
-            mask_list.append(torch.ones(len(full_ids), dtype=torch.long))
-
-        return (
-            pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id),
-            pad_sequence(mask_list, batch_first=True, padding_value=0)
-        )
-
-    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        binders = [x["binder_seq"] for x in batch]
-        targets = [x["target_seq"] for x in batch]
-        target_ids = [x["target_id"] for x in batch]
-        is_binder = torch.tensor([x["is_binder"] for x in batch], dtype=torch.long)
-
-        if self.arch in ["cross_attn", "interaction_map"]:
-            b_enc = self.tokenizer(binders, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
-            t_enc = self.tokenizer(targets, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
-            return {
-                "binder_ids": b_enc["input_ids"],
-                "binder_mask": b_enc["attention_mask"],
-                "target_ids": t_enc["input_ids"],
-                "target_mask": t_enc["attention_mask"],
-                "tid": target_ids,
-                "is_binder": is_binder,
-            }
-        else:
-            input_ids, mask = self._tokenize_concat(binders, targets)
-            return {
-                "input_ids": input_ids,
-                "attention_mask": mask,
-                "tid": target_ids,
-                "is_binder": is_binder,
-            }
-
-
-# ======================================================================
-# 3. HYBRID PAIRWISE DATASET (Target-Centric) - For Train/Val
+# HYBRID PAIRWISE DATASET (Target-Centric) - For Train/Val
 # ======================================================================
 class PairwiseAffinityDataset(Dataset):
     def __init__(self, base_df, lookup_csv_path, pairs_per_sample=2, inter_pps=10, 
@@ -431,82 +212,7 @@ class PairwiseAffinityDataset(Dataset):
 
 
 # ======================================================================
-# 4. TEST REGRESSION DATASET
-# ======================================================================
-class TestRegressionDataset(Dataset):
-    def __init__(self, test_csv_path: str, provided_stats: Tuple[float, float], verbose: bool = True):
-        self.verbose = verbose
-        self.test_df = pd.read_csv(test_csv_path)
-        
-        required_cols = ['binder_sequence', 'target_sequence', 'log_Aff']
-        missing = [col for col in required_cols if col not in self.test_df.columns]
-        if missing:
-            raise KeyError(f"Test CSV missing required columns: {missing}")
-        
-        self.mean, self.std = provided_stats
-        self._log(f"\n[TestDataset] Using PROVIDED stats. Mean: {self.mean:.4f}, Std: {self.std:.4f}")
-        self._log(f"[TestDataset] Loaded {len(self.test_df)} test samples")
-        self._log(f"[TestDataset] Unique targets: {self.test_df['target_sequence'].nunique()}")
-    
-    def _log(self, msg: str):
-        if self.verbose:
-            print(msg)
-    
-    def __len__(self):
-        return len(self.test_df)
-    
-    def __getitem__(self, idx):
-        row = self.test_df.iloc[idx]
-        raw_aff = float(row["log_Aff"])
-        norm_aff = (raw_aff - self.mean) / (self.std + 1e-8)
-        
-        return {
-            "binder_seq": str(row["binder_sequence"]),
-            "target_seq": str(row["target_sequence"]),
-            "log_Aff": norm_aff
-        }
-
-
-# ======================================================================
-# 5. BINARY CLASSIFICATION TEST DATASET
-# ======================================================================
-class BinaryClassificationTestDataset(Dataset):
-    """
-    Test dataset for binary classification (binder vs non-binder).
-    Expected format: id, target_id, binder_sequence, target_sequence, is_binder
-    """
-    def __init__(self, test_csv_path: str, verbose: bool = True):
-        self.verbose = verbose
-        self.test_df = pd.read_csv(test_csv_path)
-        
-        required_cols = ['target_id', 'binder_sequence', 'target_sequence', 'is_binder']
-        missing = [col for col in required_cols if col not in self.test_df.columns]
-        if missing:
-            raise KeyError(f"Binary test CSV missing required columns: {missing}")
-        
-        self._log(f"\n[BinaryTestDataset] Loaded {len(self.test_df)} samples")
-        self._log(f"[BinaryTestDataset] Unique targets: {self.test_df['target_id'].nunique()}")
-        self._log(f"[BinaryTestDataset] Binders: {self.test_df['is_binder'].sum()}, Non-binders: {(~self.test_df['is_binder'].astype(bool)).sum()}")
-    
-    def _log(self, msg: str):
-        if self.verbose:
-            print(msg)
-    
-    def __len__(self):
-        return len(self.test_df)
-    
-    def __getitem__(self, idx):
-        row = self.test_df.iloc[idx]
-        return {
-            "binder_seq": str(row["binder_sequence"]),
-            "target_seq": str(row["target_sequence"]),
-            "target_id": row["target_id"],
-            "is_binder": int(row["is_binder"]),
-        }
-
-
-# ======================================================================
-# 6. DATAMODULE
+# DATAMODULE
 # ======================================================================
 class PairAffinityDataModule(LightningDataModule):
     def __init__(self, cfg: DictConfig):
@@ -514,10 +220,8 @@ class PairAffinityDataModule(LightningDataModule):
         self.cfg = cfg
         self.tokenizer = EsmTokenizer.from_pretrained(cfg.model.name)
         
-        self.collate_fn = PairwiseCollator(
-            tokenizer=self.tokenizer, 
-            arch=cfg.model.get("arch", "concat"), 
-            max_length=cfg.model.max_length
+        self.collate_fn = select_collator(
+            cfg.model.get("arch", "concat"), self.tokenizer, cfg.model.max_length, mode="pairwise"
         )
         
         self.num_workers = cfg.data.get("num_workers", 4)
@@ -642,7 +346,7 @@ class PairAffinityDataModule(LightningDataModule):
                 verbose=self.is_main_process
             )
             
-            self.test_collate_fn = RegressionCollator(
+            self.test_collate_fn = RegressionTestCollator(
                 tokenizer=self.tokenizer,
                 arch=self.cfg.model.get("arch", "concat"),
                 max_length=self.cfg.model.max_length
@@ -711,7 +415,7 @@ class PairAffinityDataModule(LightningDataModule):
                 t2 = self.train_dataset.t_worse[i]
                 g1 = target_to_group.get(t1, t1)
                 g2 = target_to_group.get(t2, t2)
-                combined_freq = counts_dict.get(g1, 1) + counts_dict.get(g2, 1)
+                combined_freq = np.sqrt(counts_dict.get(g1, 1) * counts_dict.get(g2, 1))
                 weight = 1.0 / np.power(combined_freq, balance_power)
                 pair_weights.append(weight)
             
@@ -733,7 +437,7 @@ class PairAffinityDataModule(LightningDataModule):
             for i in range(len(self.train_dataset)):
                 t1 = self.train_dataset.t_better[i]
                 t2 = self.train_dataset.t_worse[i]
-                combined_freq = counts_dict[t1] + counts_dict[t2]
+                combined_freq = np.sqrt(counts_dict[t1] * counts_dict[t2])
                 pair_weights.append(1.0 / np.sqrt(combined_freq))
             
             self.sampler = WeightedRandomSampler(

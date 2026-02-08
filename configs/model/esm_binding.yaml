@@ -1,11 +1,13 @@
-# configs/model/esm_interaction_map.yaml
+# configs/model/esm_binding.yaml
 name: "facebook/esm2_t33_650M_UR50D"
-arch: "interaction_map"
+arch: "binding"
 max_length: 1024
+binding_head: "affinity"  # "classify" for binary pretrain, "affinity" for regression/ranking
 
-# Decoder Parameters (Simple/Standard)
-n_heads: 8
+# Decoder Parameters
 d_model: 256
+n_heads: 8
+n_cross_layers: 2
 dropout: 0.1
 
 # LoRA

@@ -1,11 +1,11 @@
 # Import the interaction map architecture alongside the others
-from .esm_model import ESMConcatModel, ESMCrossAttnModel, ESMInteractionMapModel
+from .esm_model import ESMConcatModel, ESMCrossAttnModel, ESMBiCrossAttnModel, ESMBindingModel
 
-# Strict registry: Supporting original, cross-attention, and the dot-product interaction map
 MODEL_REGISTRY = {
     "concat": ESMConcatModel,
     "cross_attn": ESMCrossAttnModel,
-    "interaction_map": ESMInteractionMapModel  # The dot-product matrix architecture
+    "bi_cross_attn": ESMBiCrossAttnModel,
+    "binding": ESMBindingModel,
 }
 
 def build_model(cfg):

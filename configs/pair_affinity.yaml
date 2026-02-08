@@ -77,7 +77,7 @@ training:
   # Hardware
   accelerator: "auto"
   devices: "auto"
-  strategy: "ddp_find_unused_parameters_true"
+  strategy: "auto"
   precision: "bf16-mixed"
 
   # Stability

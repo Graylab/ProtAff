@@ -1,5 +1,3 @@
-# src/data/pair_ppi_datamodule.py
-
 import os
 import torch
 import numpy as np
@@ -14,9 +12,11 @@ from transformers import EsmTokenizer
 from sklearn.model_selection import train_test_split
 from omegaconf import DictConfig
 
+from src.datasets.collators import tokenize_concat, tokenize_cross_attn
+
 
 # ----------------------------------------------------------------------
-# 1. Collators
+# PPI-specific Pairwise Collators (PPI uses 'better_a_seq'/'better_b_seq' keys)
 # ----------------------------------------------------------------------
 
 @dataclass
@@ -25,41 +25,16 @@ class PPIPairwiseConcatCollator:
     tokenizer: Any
     max_length: int = 512
 
-    def _tokenize_concat(self, seqs_a: List[str], seqs_b: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        cls_id = self.tokenizer.cls_token_id
-        eos_id = self.tokenizer.eos_token_id
-        pad_id = self.tokenizer.pad_token_id
-        
-        a_encoded = self.tokenizer(seqs_a, add_special_tokens=False)["input_ids"]
-        b_encoded = self.tokenizer(seqs_b, add_special_tokens=False)["input_ids"]
-        
-        input_ids_list, mask_list = [], []
-        
-        for a_ids, b_ids in zip(a_encoded, b_encoded):
-            allowed = self.max_length - 3
-            if len(a_ids) + len(b_ids) > allowed:
-                b_ids = b_ids[:max(0, allowed - len(a_ids))]
-                a_ids = a_ids[:allowed]
-            
-            full_ids = [cls_id] + a_ids + [eos_id] + b_ids + [eos_id]
-            input_ids_list.append(torch.tensor(full_ids, dtype=torch.long))
-            mask_list.append(torch.ones(len(full_ids), dtype=torch.long))
-        
-        return (
-            pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id),
-            pad_sequence(mask_list, batch_first=True, padding_value=0)
-        )
-
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         better_a = [x["better_a_seq"] for x in batch]
         better_b = [x["better_b_seq"] for x in batch]
         worse_a = [x["worse_a_seq"] for x in batch]
         worse_b = [x["worse_b_seq"] for x in batch]
         deltas = torch.tensor([x["delta"] for x in batch], dtype=torch.float32)
-        
-        better_ids, better_mask = self._tokenize_concat(better_a, better_b)
-        worse_ids, worse_mask = self._tokenize_concat(worse_a, worse_b)
-        
+
+        better_ids, better_mask = tokenize_concat(self.tokenizer, better_a, better_b, self.max_length)
+        worse_ids, worse_mask = tokenize_concat(self.tokenizer, worse_a, worse_b, self.max_length)
+
         return {
             "better_input_ids": better_ids,
             "better_mask": better_mask,
@@ -75,43 +50,31 @@ class PPIPairwiseCrossAttnCollator:
     tokenizer: Any
     max_length: int = 512
 
-    def _tokenize_batch(self, seqs_a: List[str], seqs_b: List[str]) -> Dict[str, torch.Tensor]:
-        a_enc = self.tokenizer(seqs_a, padding=True, truncation=True, 
-                               max_length=self.max_length, return_tensors="pt")
-        b_enc = self.tokenizer(seqs_b, padding=True, truncation=True,
-                               max_length=self.max_length, return_tensors="pt")
-        return {
-            "a_ids": a_enc["input_ids"],
-            "a_mask": a_enc["attention_mask"],
-            "b_ids": b_enc["input_ids"],
-            "b_mask": b_enc["attention_mask"],
-        }
-
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         better_a = [x["better_a_seq"] for x in batch]
         better_b = [x["better_b_seq"] for x in batch]
         worse_a = [x["worse_a_seq"] for x in batch]
         worse_b = [x["worse_b_seq"] for x in batch]
         deltas = torch.tensor([x["delta"] for x in batch], dtype=torch.float32)
-        
-        better_enc = self._tokenize_batch(better_a, better_b)
-        worse_enc = self._tokenize_batch(worse_a, worse_b)
-        
+
+        better_enc = tokenize_cross_attn(self.tokenizer, better_a, better_b, self.max_length)
+        worse_enc = tokenize_cross_attn(self.tokenizer, worse_a, worse_b, self.max_length)
+
         return {
-            "better_binder_ids": better_enc["a_ids"],
-            "better_binder_mask": better_enc["a_mask"],
-            "better_target_ids": better_enc["b_ids"],
-            "better_target_mask": better_enc["b_mask"],
-            "worse_binder_ids": worse_enc["a_ids"],
-            "worse_binder_mask": worse_enc["a_mask"],
-            "worse_target_ids": worse_enc["b_ids"],
-            "worse_target_mask": worse_enc["b_mask"],
+            "better_binder_ids": better_enc["binder_ids"],
+            "better_binder_mask": better_enc["binder_mask"],
+            "better_target_ids": better_enc["target_ids"],
+            "better_target_mask": better_enc["target_mask"],
+            "worse_binder_ids": worse_enc["binder_ids"],
+            "worse_binder_mask": worse_enc["binder_mask"],
+            "worse_target_ids": worse_enc["target_ids"],
+            "worse_target_mask": worse_enc["target_mask"],
             "delta": deltas,
         }
 
 
 # ----------------------------------------------------------------------
-# 2. Dataset
+# Dataset
 # ----------------------------------------------------------------------
 
 class PPIPairwiseDataset(Dataset):
@@ -251,7 +214,7 @@ class PairPPIDataModule(LightningDataModule):
         arch = cfg.model.get("arch", "concat")
         max_length = cfg.model.get("max_length", 512)
         
-        if arch in ["cross_attn", "interaction_map"]:
+        if arch in ["cross_attn", "bi_cross_attn", "binding"]:
             print("[PPIDataModule] Using CrossAttnCollator")
             self.collate_fn = PPIPairwiseCrossAttnCollator(
                 tokenizer=self.tokenizer, max_length=max_length

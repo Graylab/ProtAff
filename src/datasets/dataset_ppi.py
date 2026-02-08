@@ -3,7 +3,7 @@ import torch
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Any
 
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.nn.utils.rnn import pad_sequence
@@ -14,7 +14,8 @@ from omegaconf import DictConfig
 
 
 # ----------------------------------------------------------------------
-# 1. Collators
+# PPI-specific Collators (PPI uses 'seq_a'/'seq_b' and 'label' keys,
+# different from affinity's 'binder_seq'/'target_seq' and 'log_Aff')
 # ----------------------------------------------------------------------
 
 @dataclass
@@ -26,28 +27,28 @@ class PPIConcatCollator:
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         seqs_a = [str(f["seq_a"]) for f in features]
         seqs_b = [str(f["seq_b"]) for f in features]
-        
+
         a_encoded = self.tokenizer(seqs_a, add_special_tokens=False)["input_ids"]
         b_encoded = self.tokenizer(seqs_b, add_special_tokens=False)["input_ids"]
-        
+
         cls_id = self.tokenizer.cls_token_id
         eos_id = self.tokenizer.eos_token_id
         pad_id = self.tokenizer.pad_token_id
-        
+
         input_ids_list, mask_list = [], []
-        
+
         for a_ids, b_ids in zip(a_encoded, b_encoded):
             allowed = self.max_length - 3
             if len(a_ids) + len(b_ids) > allowed:
                 b_ids = b_ids[:max(0, allowed - len(a_ids))]
                 a_ids = a_ids[:allowed]
-            
+
             full_ids = [cls_id] + a_ids + [eos_id] + b_ids + [eos_id]
             input_ids_list.append(torch.tensor(full_ids, dtype=torch.long))
             mask_list.append(torch.ones(len(full_ids), dtype=torch.long))
-        
+
         labels = torch.tensor([f["label"] for f in features], dtype=torch.float32)
-        
+
         return {
             "input_ids": pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id),
             "attention_mask": pad_sequence(mask_list, batch_first=True, padding_value=0),
@@ -64,7 +65,7 @@ class PPICrossAttnCollator:
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         seqs_a = [str(f["seq_a"]) for f in features]
         seqs_b = [str(f["seq_b"]) for f in features]
-        
+
         a_enc = self.tokenizer(
             seqs_a, padding=True, truncation=True,
             max_length=self.max_length, return_tensors="pt"
@@ -73,9 +74,9 @@ class PPICrossAttnCollator:
             seqs_b, padding=True, truncation=True,
             max_length=self.max_length, return_tensors="pt"
         )
-        
+
         labels = torch.tensor([f["label"] for f in features], dtype=torch.float32)
-        
+
         return {
             "binder_ids": a_enc["input_ids"],
             "binder_mask": a_enc["attention_mask"],
@@ -86,7 +87,7 @@ class PPICrossAttnCollator:
 
 
 # ----------------------------------------------------------------------
-# 2. Dataset
+# Dataset
 # ----------------------------------------------------------------------
 
 class PPIDataset(Dataset):
@@ -148,7 +149,7 @@ class PPIDataModule(LightningDataModule):
         arch = cfg.model.get("arch", "concat")
         max_length = cfg.model.get("max_length", 1024)
         
-        if arch in ["cross_attn", "interaction_map"]:
+        if arch in ["cross_attn", "bi_cross_attn", "binding"]:
             print("[PPIDataModule] Using CrossAttnCollator")
             self.collate_fn = PPICrossAttnCollator(tokenizer=self.tokenizer, max_length=max_length)
         else:

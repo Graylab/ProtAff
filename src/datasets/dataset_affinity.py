@@ -2,111 +2,19 @@ import os
 import torch
 import numpy as np
 import pandas as pd
-import random
-from dataclasses import dataclass
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Tuple
 from omegaconf import DictConfig
 
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torch.nn.utils.rnn import pad_sequence
 from pytorch_lightning import LightningDataModule
 from transformers import EsmTokenizer
 from sklearn.model_selection import train_test_split
 
-# ----------------------------------------------------------------------
-# 1. Collators (Concat vs Cross-Attention)
-# ----------------------------------------------------------------------
-
-@dataclass
-class ConcatCollator:
-    """
-    Original 'Concat' Collator: [CLS] Binder [EOS] Target [EOS]
-    """
-    tokenizer: Any
-    max_length: int = 2048
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        eos = self.tokenizer.eos_token
-        binder_seqs = [str(f["binder_seq"]).replace(":", eos) for f in features]
-        target_seqs = [str(f["target_seq"]).replace(":", eos) for f in features]
-        
-        b_encoded = self.tokenizer(binder_seqs, add_special_tokens=False)
-        t_encoded = self.tokenizer(target_seqs, add_special_tokens=False)
-        
-        input_ids_list = []
-        attention_mask_list = []
-        cls_id = self.tokenizer.cls_token_id
-        eos_id = self.tokenizer.eos_token_id
-        
-        for b_ids, t_ids in zip(b_encoded["input_ids"], t_encoded["input_ids"]):
-            allowed_len = self.max_length - 3
-            current_len = len(b_ids) + len(t_ids)
-            
-            if current_len > allowed_len:
-                excess = current_len - allowed_len
-                if len(t_ids) > excess:
-                    t_ids = t_ids[:-excess]
-                else:
-                    remaining_excess = excess - len(t_ids)
-                    t_ids = []
-                    b_ids = b_ids[:-remaining_excess]
-            
-            full_ids = [cls_id] + b_ids + [eos_id] + t_ids + [eos_id]
-            input_ids_list.append(torch.tensor(full_ids, dtype=torch.long))
-            attention_mask_list.append(torch.ones(len(full_ids), dtype=torch.long))
-
-        batch_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id)
-        batch_mask = pad_sequence(attention_mask_list, batch_first=True, padding_value=0)
-        reg_labels = [f["log_Aff"] for f in features]
-
-        return {
-            "input_ids": batch_ids,
-            "attention_mask": batch_mask,
-            "reg_labels": torch.tensor(reg_labels, dtype=torch.float32).unsqueeze(1),
-        }
-
-@dataclass
-class CrossAttnCollator:
-    """
-    New 'Cross-Attention' Collator: Separate tensors for Binder and Target.
-    Outputs: binder_ids, binder_mask, target_ids, target_mask
-    """
-    tokenizer: Any
-    max_length: int = 2048
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        # For Cross-Attention, we keep sequences separate
-        binder_seqs = [str(f["binder_seq"]) for f in features]
-        target_seqs = [str(f["target_seq"]) for f in features]
-        
-        # Split budget: each gets the max_length
-        b_enc = self.tokenizer(
-            binder_seqs, 
-            padding=True, 
-            truncation=True, 
-            max_length=self.max_length, 
-            return_tensors="pt"
-        )
-        t_enc = self.tokenizer(
-            target_seqs, 
-            padding=True, 
-            truncation=True, 
-            max_length=self.max_length, 
-            return_tensors="pt"
-        )
-        
-        reg_labels = [f["log_Aff"] for f in features]
-
-        return {
-            "binder_ids": b_enc["input_ids"],
-            "binder_mask": b_enc["attention_mask"],
-            "target_ids": t_enc["input_ids"],
-            "target_mask": t_enc["attention_mask"],
-            "reg_labels": torch.tensor(reg_labels, dtype=torch.float32).unsqueeze(1),
-        }
+from src.datasets.collators import select_collator, BinaryClassificationCollator
+from src.datasets.test_datasets import TestRegressionDataset, BinaryClassificationTestDataset
 
 # ----------------------------------------------------------------------
-# 2. Dataset
+# Dataset
 # ----------------------------------------------------------------------
 
 class AffinityDataset(Dataset):
@@ -177,44 +85,8 @@ class AffinityDataset(Dataset):
         }
 
 
-class TestAffinityDataset(Dataset):
-    """
-    Test dataset that directly uses sequences from CSV.
-    Expected CSV format: id,binder_sequence,target_sequence,log_Aff
-    """
-    def __init__(self, 
-                 test_csv_path: str,
-                 provided_stats: Tuple[float, float]):
-        
-        self.test_df = pd.read_csv(test_csv_path)
-        
-        # Validate required columns
-        required_cols = ['binder_sequence', 'target_sequence', 'log_Aff']
-        missing = [col for col in required_cols if col not in self.test_df.columns]
-        if missing:
-            raise KeyError(f"Test CSV missing required columns: {missing}")
-        
-        self.mean, self.std = provided_stats
-        print(f"[TestDataset] Using PROVIDED stats. Mean: {self.mean:.4f}, Std: {self.std:.4f}")
-        print(f"[TestDataset] Loaded {len(self.test_df)} test samples")
-
-    def __len__(self):
-        return len(self.test_df)
-
-    def __getitem__(self, idx):
-        row = self.test_df.iloc[idx]
-        raw_aff = float(row["log_Aff"])
-        norm_aff = (raw_aff - self.mean) / (self.std + 1e-8)
-
-        return {
-            "binder_seq": str(row["binder_sequence"]),
-            "target_seq": str(row["target_sequence"]),
-            "log_Aff": norm_aff,
-        }
-
-
 # ----------------------------------------------------------------------
-# 3. DataModule
+# DataModule
 # ----------------------------------------------------------------------
 class AffinityDataModule(LightningDataModule):
     def __init__(self, cfg: DictConfig):
@@ -224,20 +96,17 @@ class AffinityDataModule(LightningDataModule):
         self.num_workers = cfg.data.num_workers if cfg.data.num_workers is not None else os.cpu_count()
         
         arch = self.cfg.model.get("arch", "concat")
-        if arch in ["cross_attn", "interaction_map"]:
-            print("[DataModule] Initializing CrossAttnCollator")
-            self.collate_fn = CrossAttnCollator(tokenizer=self.tokenizer, max_length=self.cfg.model.max_length)
-        else:
-            print("[DataModule] Initializing ConcatCollator")
-            self.collate_fn = ConcatCollator(tokenizer=self.tokenizer, max_length=self.cfg.model.max_length)
+        self.collate_fn = select_collator(arch, self.tokenizer, self.cfg.model.max_length, mode="regression")
+        print(f"[DataModule] Initializing {type(self.collate_fn).__name__}")
         
-        # Use weight_col for both balancing AND splitting
         self.weight_col = self.cfg.data.get("weight_col")
         self.split_col = self.weight_col if self.weight_col is not None else "target_id"
         
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
+        self.binary_test_dataset = None
+        self.binary_test_collate_fn = None
         self.sampler = None
 
     def setup(self, stage: Optional[str] = None):
@@ -332,13 +201,30 @@ class AffinityDataModule(LightningDataModule):
         test_csv = self.cfg.data.get("test_csv", None)
         if test_csv and os.path.exists(test_csv):
             print(f"[DataModule] Loading test set from: {test_csv}")
-            self.test_dataset = TestAffinityDataset(
+            self.test_dataset = TestRegressionDataset(
                 test_csv_path=test_csv,
                 provided_stats=(self.train_dataset.mean, self.train_dataset.std)
             )
         else:
             print("[DataModule] No test CSV provided or file not found - skipping test dataset")
             self.test_dataset = None
+        
+        # Binary classification test dataset
+        binary_test_csv = self.cfg.data.get("binary_test_csv", None)
+        if binary_test_csv and os.path.exists(binary_test_csv):
+            print(f"[DataModule] Loading BINARY CLASSIFICATION test set from: {binary_test_csv}")
+            self.binary_test_dataset = BinaryClassificationTestDataset(
+                test_csv_path=binary_test_csv
+            )
+            self.binary_test_collate_fn = BinaryClassificationCollator(
+                tokenizer=self.tokenizer,
+                arch=self.cfg.model.get("arch", "concat"),
+                max_length=self.cfg.model.max_length,
+            )
+        else:
+            print("[DataModule] No binary test CSV provided")
+            self.binary_test_dataset = None
+            self.binary_test_collate_fn = None
 
         # 5. Setup weighted sampler if balancing enabled
         if self.train_dataset.weights is not None:
@@ -375,4 +261,16 @@ class AffinityDataModule(LightningDataModule):
             num_workers=self.num_workers,
             shuffle=False,
             pin_memory=True
+        )
+    
+    def binary_test_dataloader(self):
+        if self.binary_test_dataset is None:
+            return None
+        return DataLoader(
+            self.binary_test_dataset,
+            batch_size=self.cfg.training.batch_size,
+            collate_fn=self.binary_test_collate_fn,
+            num_workers=self.num_workers,
+            shuffle=False,
+            pin_memory=True,
         )

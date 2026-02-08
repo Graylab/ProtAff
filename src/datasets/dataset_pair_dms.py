@@ -7,9 +7,10 @@ from typing import Optional, Dict, List, Any, Tuple
 from omegaconf import DictConfig
 
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torch.nn.utils.rnn import pad_sequence
 from pytorch_lightning import LightningDataModule
 from transformers import EsmTokenizer
+
+from src.datasets.collators import tokenize_cross_attn
 
 
 # =========================================================================
@@ -37,41 +38,21 @@ class PairDMSCollator:
         worse_mut = [x["worse_mutant"] for x in batch]
         worse_wt = [x["worse_wildtype"] for x in batch]
         deltas = torch.tensor([x["delta"] for x in batch], dtype=torch.float32)
-        
-        if self.arch in ["cross_attn", "interaction_map"]:
-            # Tokenize better pair
-            better_mut_enc = self.tokenizer(
-                better_mut, padding=True, truncation=True,
-                max_length=self.max_length, return_tensors="pt"
-            )
-            better_wt_enc = self.tokenizer(
-                better_wt, padding=True, truncation=True,
-                max_length=self.max_length, return_tensors="pt"
-            )
-            
-            # Tokenize worse pair
-            worse_mut_enc = self.tokenizer(
-                worse_mut, padding=True, truncation=True,
-                max_length=self.max_length, return_tensors="pt"
-            )
-            worse_wt_enc = self.tokenizer(
-                worse_wt, padding=True, truncation=True,
-                max_length=self.max_length, return_tensors="pt"
-            )
-            
+
+        if self.arch in ["cross_attn", "bi_cross_attn", "binding"]:
+            better_enc = tokenize_cross_attn(self.tokenizer, better_mut, better_wt, self.max_length)
+            worse_enc = tokenize_cross_attn(self.tokenizer, worse_mut, worse_wt, self.max_length)
+
             return {
-                # Better pair (mutant=binder, wt=target)
-                "better_binder_ids": better_mut_enc["input_ids"],
-                "better_binder_mask": better_mut_enc["attention_mask"],
-                "better_target_ids": better_wt_enc["input_ids"],
-                "better_target_mask": better_wt_enc["attention_mask"],
-                # Worse pair
-                "worse_binder_ids": worse_mut_enc["input_ids"],
-                "worse_binder_mask": worse_mut_enc["attention_mask"],
-                "worse_target_ids": worse_wt_enc["input_ids"],
-                "worse_target_mask": worse_wt_enc["attention_mask"],
-                # Delta
-                "delta": deltas
+                "better_binder_ids": better_enc["binder_ids"],
+                "better_binder_mask": better_enc["binder_mask"],
+                "better_target_ids": better_enc["target_ids"],
+                "better_target_mask": better_enc["target_mask"],
+                "worse_binder_ids": worse_enc["binder_ids"],
+                "worse_binder_mask": worse_enc["binder_mask"],
+                "worse_target_ids": worse_enc["target_ids"],
+                "worse_target_mask": worse_enc["target_mask"],
+                "delta": deltas,
             }
         else:
             # Concat architecture - combine mutant + wt into single sequence

@@ -15,29 +15,17 @@ from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_sco
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 # --- IMPORT MODULES ---
-# DMS (Regression)
+# DataModules
 from src.datasets.dataset_dms import DMSDataModule
-from src.lightning.dms_module import DMSModule
-
-# Pair DMS (Ranking)
 from src.datasets.dataset_pair_dms import PairDMSDataModule
-from src.lightning.pair_dms_module import PairDMSModule
-
-# Affinity (Regression)
-from src.datasets.dataset_affinity import AffinityDataModule 
-from src.lightning.affinity_module import AffinityModule
-
-# Pair Affinity (Ranking)
+from src.datasets.dataset_affinity import AffinityDataModule
 from src.datasets.dataset_pair_affinity import PairAffinityDataModule
-from src.lightning.pair_affinity_module import PairAffinityModule
+from src.datasets.dataset_ppi import PPIDataModule
+from src.datasets.dataset_pair_ppi import PairPPIDataModule
 
-# PPI (Regression)
-from src.datasets.dataset_ppi import PPIDataModule 
-from src.lightning.ppi_module import PPIModule
-
-# PPI (Ranking)
-from src.datasets.dataset_pair_ppi import PairPPIDataModule 
-from src.lightning.pair_ppi_module import PairPPIModule
+# Unified Lightning Modules
+from src.lightning.regression_module import RegressionModule
+from src.lightning.ranking_module import RankingModule
 
 
 class BestModelSaver(Callback):
@@ -271,44 +259,28 @@ class BinaryTestCallback(Callback):
             print(f"[BinaryTest] Step {trainer.global_step} | Avg AUC: {metrics['binary_test/avg_auc']:.4f}")
 
 
+TASK_MAP = {
+    "dms":           (DMSDataModule,          RegressionModule),
+    "pair_dms":      (PairDMSDataModule,      RankingModule),
+    "affinity":      (AffinityDataModule,     RegressionModule),
+    "pair_affinity": (PairAffinityDataModule, RankingModule),
+    "ppi":           (PPIDataModule,          RegressionModule),
+    "pair_ppi":      (PairPPIDataModule,      RankingModule),
+}
+
+
 def get_task_modules(cfg):
     """Factory: Returns (DataModule, LightningModule) based on cfg.task_name"""
     task = cfg.get("task_name", "dms").lower()
-    
-    if task == "dms":
-        print("[Factory] Loading DMS (Regression)")
-        dm = DMSDataModule(cfg)
-        model = DMSModule(cfg)
 
-    elif task == "pair_dms":
-        print("[Factory] Loading Pair DMS (Ranking)")
-        dm = PairDMSDataModule(cfg)
-        model = PairDMSModule(cfg)
-        
-    elif task == "affinity":
-        print("[Factory] Loading Affinity (Regression)")
-        dm = AffinityDataModule(cfg)
-        model = AffinityModule(cfg)
-        
-    elif task == "pair_affinity":
-        print("[Factory] Loading Pair Affinity (Ranking)")
-        dm = PairAffinityDataModule(cfg)
-        model = PairAffinityModule(cfg)
-    
-    elif task == "ppi":
-        print("[Factory] Loading PPI (Regression)")
-        dm = PPIDataModule(cfg)
-        model = PPIModule(cfg)
+    if task not in TASK_MAP:
+        raise ValueError(f"Unknown task_name: {task}. Options: {list(TASK_MAP.keys())}")
 
-    elif task == "pair_ppi":
-        print("[Factory] Loading Pair PPI (Ranking)")
-        dm = PairPPIDataModule(cfg)
-        model = PairPPIModule(cfg)
+    dm_cls, model_cls = TASK_MAP[task]
+    task_type = "Ranking" if "pair" in task else "Regression"
+    print(f"[Factory] Loading {task} ({task_type})")
 
-    else:
-        raise ValueError(f"Unknown task_name: {task}. Options: ['dms', 'pair_dms', 'affinity', 'pair_affinity', 'ppi', 'pair_ppi']")
-    
-    return dm, model
+    return dm_cls(cfg), model_cls(cfg)
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
