@@ -81,7 +81,7 @@ def load_model(cfg, device):
     return model.to(device).eval()
 
 
-def run_inference(model, dataloader, arch, device):
+def run_inference(model, dataloader, arch, device, binding_head="affinity"):
     """Run model inference and return predictions."""
     is_cross_attn = arch in CROSS_ATTN_ARCHS
     predictions = []
@@ -91,10 +91,13 @@ def run_inference(model, dataloader, arch, device):
             batch = {k: v.to(device) for k, v in batch.items()}
 
             if is_cross_attn:
-                outputs = model(
+                kwargs = dict(
                     binder_ids=batch["binder_ids"], binder_mask=batch["binder_mask"],
                     target_ids=batch["target_ids"], target_mask=batch["target_mask"],
                 )
+                if arch == "binding":
+                    kwargs["task"] = binding_head
+                outputs = model(**kwargs)
             else:
                 outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
 
@@ -128,7 +131,8 @@ def main(cfg: DictConfig):
         num_workers=cfg.get("num_workers", 0),
     )
 
-    predictions = run_inference(model, dataloader, arch, device)
+    binding_head = cfg.model.get("binding_head", "affinity")
+    predictions = run_inference(model, dataloader, arch, device, binding_head=binding_head)
     df["predicted_affinity"] = predictions
     df.to_csv(output_path, index=False)
     print(f"[SUCCESS] Results saved to: {output_path}")
