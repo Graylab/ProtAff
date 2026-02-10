@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - model: esm_cross_attn
+  - model: esm_binding
 
 # Task name (Informational for logging)
 task_name: "pair_affinity"

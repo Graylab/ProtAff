@@ -11,6 +11,7 @@ from pytorch_lightning import LightningDataModule
 from transformers import EsmTokenizer
 
 from src.datasets.collators import tokenize_cross_attn
+from src.datasets.split_utils import group_split
 
 
 # =========================================================================
@@ -95,73 +96,74 @@ class PairDMSDataset(Dataset):
         max_length: int = 1024,
         crop_method: str = "smart",
         invert_score: bool = False,
-        verbose: bool = True
+        verbose: bool = True,
+        rng: Optional[np.random.Generator] = None,
     ):
         self.verbose = verbose
         self.crop_method = crop_method
         self.seq_crop_len = max_length - 2  # -2 for [CLS], [EOS]
-        
+        self.rng = rng if rng is not None else np.random.default_rng()
+
         self._log(f"\n{'='*25} DMS PAIRWISE DATASET {'='*25}")
-        
+
         # Load wildtype sequences
         wt_df = pd.read_csv(wt_csv)
         self.wt_lookup = dict(zip(wt_df['filename'], wt_df['target_seq']))
-        
+
         # Filter to proteins with known WT
         mut_df = dataframe[dataframe['filename'].isin(self.wt_lookup)].copy()
-        
+
         self._log(f"[*] Raw DMS samples: {len(mut_df):,}")
         self._log(f"[*] Unique proteins: {mut_df['filename'].nunique():,}")
-        
+
         # Invert scores if needed (so higher = better)
         if invert_score:
-            self._log(f"[*] Inverting scores (× -1)")
+            self._log(f"[*] Inverting scores (x -1)")
             mut_df['fitness'] = -1.0 * mut_df['DMS_score_normalized']
         else:
             mut_df['fitness'] = mut_df['DMS_score_normalized']
-        
+
         # Build pairs
         self.better_mut, self.worse_mut = [], []
         self.better_wt, self.worse_wt = [], []
         self.deltas = []
         self.filenames = []
-        
+
         for filename, group in mut_df.groupby('filename'):
             wt_seq = self.wt_lookup[filename]
             group = group.sort_values('fitness')
-            
+
             mutants = group['mutated_sequence'].values
             scores = group['fitness'].values
             n = len(mutants)
-            
+
             if n < 2:
                 continue
-            
+
             # Find valid pairs with margin
             pairs_added = 0
             starts = np.searchsorted(scores, scores + min_margin, side='right')
             valid_anchors = np.where(starts < n)[0]
-            
+
             if len(valid_anchors) > max_pairs_per_protein:
-                valid_anchors = np.random.choice(valid_anchors, max_pairs_per_protein, replace=False)
-            
+                valid_anchors = self.rng.choice(valid_anchors, max_pairs_per_protein, replace=False)
+
             for a_idx in valid_anchors:
                 if pairs_added >= max_pairs_per_protein:
                     break
-                
-                possible = list(range(starts[a_idx], n))
-                if not possible:
+
+                possible = np.arange(starts[a_idx], n)
+                if len(possible) == 0:
                     continue
-                
-                chosen = np.random.choice(possible, min(len(possible), pairs_per_anchor), replace=False)
-                
+
+                chosen = self.rng.choice(possible, min(len(possible), pairs_per_anchor), replace=False)
+
                 for b_idx in chosen:
                     # Higher fitness = better
-                    # Crop sequences
                     better_mut_crop = self._smart_crop(wt_seq, mutants[b_idx])
                     worse_mut_crop = self._smart_crop(wt_seq, mutants[a_idx])
                     wt_crop = self._crop_wt(wt_seq)
-                    
+
                     self.better_mut.append(better_mut_crop)
                     self.better_wt.append(wt_crop)
                     self.worse_mut.append(worse_mut_crop)
@@ -169,7 +171,7 @@ class PairDMSDataset(Dataset):
                     self.deltas.append(scores[b_idx] - scores[a_idx])
                     self.filenames.append(filename)
                     pairs_added += 1
-        
+
         self._log(f"[*] Total DMS pairs: {len(self.better_mut):,}")
         self._log(f"{'='*60}\n")
     
@@ -254,36 +256,35 @@ class PairDMSDataModule(LightningDataModule):
         if self.is_main_process:
             print(f"\n[DMS Pairwise] Loading Data...")
             print(f"[DMS Pairwise] Architecture: {self.cfg.model.get('arch', 'cross_attn')}")
-        
+
         full_df = pd.read_csv(self.cfg.data.mutant_csv)
-        
+
         seed = self.cfg.training.get("seed", 42)
         train_ratio = self.cfg.training.get("train_val_split", 0.9)
         strategy = self.cfg.training.get("split_strategy", "group")
-        
+        rng = np.random.default_rng(seed)
+
         if self.is_main_process:
             print(f"[DMS Pairwise] Split strategy: {strategy}")
-        
+
         if strategy == "random":
-            # Random split (rows, not proteins)
             from sklearn.model_selection import train_test_split
             train_df, val_df = train_test_split(
-                full_df,
-                train_size=train_ratio,
-                random_state=seed,
-                shuffle=True
+                full_df, train_size=train_ratio, random_state=seed, shuffle=True
             )
             if self.is_main_process:
                 print(f"[Split] Random split")
                 print(f"[Split] Train samples: {len(train_df)} | Val samples: {len(val_df)}")
-        
+
         elif strategy == "group":
-            # Group split by filename (protein) - val has UNSEEN proteins
-            train_df, val_df = self._group_split(full_df, train_ratio, seed)
-        
+            train_df, val_df = group_split(
+                full_df, col="filename", ratio=train_ratio, seed=seed,
+                verbose=self.is_main_process,
+            )
+
         else:
             raise ValueError(f"Unknown split_strategy: {strategy}. Options: ['random', 'group']")
-        
+
         # Create datasets
         self.train_dataset = PairDMSDataset(
             dataframe=train_df,
@@ -294,9 +295,10 @@ class PairDMSDataModule(LightningDataModule):
             max_length=self.cfg.model.max_length,
             crop_method=self.cfg.data.get("crop_method", "smart"),
             invert_score=self.cfg.data.get("invert_score", False),
-            verbose=self.is_main_process
+            verbose=self.is_main_process,
+            rng=rng,
         )
-        
+
         self.val_dataset = PairDMSDataset(
             dataframe=val_df,
             wt_csv=self.cfg.data.wt_csv,
@@ -306,55 +308,12 @@ class PairDMSDataModule(LightningDataModule):
             max_length=self.cfg.model.max_length,
             crop_method=self.cfg.data.get("crop_method", "smart"),
             invert_score=self.cfg.data.get("invert_score", False),
-            verbose=self.is_main_process
+            verbose=self.is_main_process,
+            rng=rng,
         )
-        
+
         # Setup weighted sampler
         self._setup_sampler()
-
-    def _group_split(self, full_df: pd.DataFrame, train_ratio: float, seed: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Split by filename (protein) - validation has completely unseen proteins."""
-        all_proteins = full_df['filename'].unique()
-        
-        # Count samples per protein
-        counts = full_df['filename'].value_counts()
-        singleton_proteins = counts[counts == 1].index.tolist()
-        multi_sample_proteins = counts[counts > 1].index.tolist()
-        
-        if self.is_main_process:
-            print(f"[Split] Total proteins: {len(all_proteins)}")
-            print(f"[Split] Singleton proteins (1 sample): {len(singleton_proteins)}")
-            print(f"[Split] Multi-sample proteins (>1 sample): {len(multi_sample_proteins)}")
-        
-        # Shuffle and split multi-sample proteins
-        np.random.seed(seed)
-        np.random.shuffle(multi_sample_proteins)
-        
-        val_count = max(1, int(len(multi_sample_proteins) * (1 - train_ratio)))
-        val_proteins = set(multi_sample_proteins[:val_count])
-        train_proteins_multi = set(multi_sample_proteins[val_count:])
-        
-        # Add singletons to train (can't create pairs from singletons anyway)
-        train_proteins = train_proteins_multi.union(set(singleton_proteins))
-        
-        # Create splits
-        train_df = full_df[full_df['filename'].isin(train_proteins)].copy()
-        val_df = full_df[full_df['filename'].isin(val_proteins)].copy()
-        
-        # Verify no overlap
-        overlap = train_proteins & val_proteins
-        if len(overlap) > 0:
-            raise ValueError(f"ERROR: Train/Val protein overlap: {overlap}")
-        
-        if self.is_main_process:
-            print(f"[Split] ✓ Train proteins: {len(train_proteins)}")
-            print(f"[Split]   - Multi-sample: {len(train_proteins_multi)}")
-            print(f"[Split]   - Singletons: {len(singleton_proteins)}")
-            print(f"[Split] ✓ Val proteins: {len(val_proteins)} (COMPLETELY UNSEEN)")
-            print(f"[Split] ✓ Overlap check: {len(overlap)} (MUST be 0)")
-            print(f"[Split] Train samples: {len(train_df)} | Val samples: {len(val_df)}")
-        
-        return train_df, val_df
 
     def _setup_sampler(self):
         """Weighted sampling by filename (protein) frequency."""

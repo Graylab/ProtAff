@@ -11,24 +11,27 @@ from transformers import EsmTokenizer
 
 from src.datasets.collators import select_collator, RegressionTestCollator, BinaryClassificationCollator
 from src.datasets.test_datasets import TestRegressionDataset, BinaryClassificationTestDataset
+from src.datasets.split_utils import group_split
 
 
 # ======================================================================
 # HYBRID PAIRWISE DATASET (Target-Centric) - For Train/Val
 # ======================================================================
 class PairwiseAffinityDataset(Dataset):
-    def __init__(self, base_df, lookup_csv_path, pairs_per_sample=2, inter_pps=10, 
+    def __init__(self, base_df, lookup_csv_path, pairs_per_sample=2, inter_pps=10,
                  min_margin=1.0, max_anchors_per_target=2000, split_name="DATASET",
                  verbose=True,
                  add_negatives=False,
                  neg_per_positive=1,
                  neg_log_aff=2.0,
-                 pair_within_source=False):  # NEW
-        
+                 pair_within_source=False,
+                 rng=None):
+
         self.verbose = verbose
         self.neg_log_aff = neg_log_aff
-        self.pair_within_source = pair_within_source  # NEW
-        
+        self.pair_within_source = pair_within_source
+        self.rng = rng if rng is not None else np.random.default_rng()
+
         lookup_df = pd.read_csv(lookup_csv_path)
         lookup_df['key'] = lookup_df['type'].astype(str) + "_" + lookup_df['id'].astype(str)
         self.id2seq = dict(zip(lookup_df['key'], lookup_df['seq']))
@@ -52,6 +55,8 @@ class PairwiseAffinityDataset(Dataset):
         self.b_worse, self.t_worse = [], []
         self.deltas, self.pair_types = [], []
         self.aff_better, self.aff_worse = [], []
+        self.dropped_pairs = 0
+        self.missing_keys = set()
 
         if self.pair_within_source:
             # Generate pairs within each source
@@ -74,6 +79,11 @@ class PairwiseAffinityDataset(Dataset):
         if self.verbose:
             print(p_df['type'].value_counts().to_string())
         self._log(f"\n[*] TOTAL PAIRS: {len(self.b_better):,}")
+        if self.dropped_pairs > 0:
+            self._log(f"[!] Dropped pairs (missing sequences): {self.dropped_pairs:,}")
+            self._log(f"[!] Missing keys ({len(self.missing_keys)}): {sorted(self.missing_keys)[:20]}")
+            if len(self.missing_keys) > 20:
+                self._log(f"    ... and {len(self.missing_keys) - 20} more")
         self._log(f"{'='*60}\n")
 
     def _generate_intra_target_pairs(self, df, pairs_per_sample, min_margin, max_anchors_per_target):
@@ -81,31 +91,31 @@ class PairwiseAffinityDataset(Dataset):
         self._log(f"[*] Generating intra-target pairs...")
         rich_df = df[df['pocket_size'] > 1]
         intra_count = 0
-        
+
         for t_id, group in rich_df.groupby('target_id'):
             group = group.sort_values('log_Aff')
             affs, recs = group['log_Aff'].values, group.to_dict('records')
             n = len(recs)
             starts = np.searchsorted(affs, affs + min_margin, side='right')
             valid_anchors = np.where(starts < n)[0]
-            
+
             if len(valid_anchors) > max_anchors_per_target:
-                valid_anchors = np.random.choice(valid_anchors, max_anchors_per_target, replace=False)
-            
-            if len(valid_anchors) == 0: 
+                valid_anchors = self.rng.choice(valid_anchors, max_anchors_per_target, replace=False)
+
+            if len(valid_anchors) == 0:
                 continue
-            
-            rand_floats = np.random.random((len(valid_anchors), pairs_per_sample))
+
+            rand_floats = self.rng.random((len(valid_anchors), pairs_per_sample))
             ranges = n - starts[valid_anchors]
             match_indices = (rand_floats * ranges[:, None]).astype(int) + starts[valid_anchors][:, None]
-            
+
             for a_idx, m_idxs in zip(valid_anchors, match_indices):
                 for m_idx in m_idxs:
-                    if recs[a_idx]['binder_id'] == recs[m_idx]['binder_id']: 
+                    if recs[a_idx]['binder_id'] == recs[m_idx]['binder_id']:
                         continue
                     self._append_pair(recs[a_idx], recs[m_idx], pair_type='intra_target')
                     intra_count += 1
-        
+
         self._log(f"    Intra-target pairs: {intra_count:,}")
 
     def _generate_inter_target_pairs(self, df, inter_pps):
@@ -115,20 +125,26 @@ class PairwiseAffinityDataset(Dataset):
         recs = singleton_df.to_dict('records')
         n = len(recs)
         inter_count = 0
-        
+
         if n >= 2:
+            target_ids = np.array([r['target_id'] for r in recs])
+            indices = np.arange(n)
+
             for i in range(n):
-                competitors = [j for j in range(n) if recs[j]['target_id'] != recs[i]['target_id']]
-                if not competitors: 
+                mask = target_ids != target_ids[i]
+                competitors = indices[mask]
+                if len(competitors) == 0:
                     continue
-                chosen_idxs = np.random.choice(competitors, min(len(competitors), inter_pps), replace=False)
+                chosen_idxs = self.rng.choice(
+                    competitors, min(len(competitors), inter_pps), replace=False
+                )
                 for c_idx in chosen_idxs:
                     if recs[i]['log_Aff'] < recs[c_idx]['log_Aff']:
                         self._append_pair(recs[i], recs[c_idx], pair_type='inter_target')
                     else:
                         self._append_pair(recs[c_idx], recs[i], pair_type='inter_target')
                     inter_count += 1
-        
+
         self._log(f"    Inter-target pairs: {inter_count:,}")
 
     def _add_negative_pairs(self, num_df, neg_per_positive):
@@ -160,7 +176,7 @@ class PairwiseAffinityDataset(Dataset):
             max_attempts = neg_per_positive * 3
             
             while sampled < neg_per_positive and attempts < max_attempts:
-                neg_bid = all_binders[np.random.randint(n_binders)]
+                neg_bid = all_binders[self.rng.integers(n_binders)]
                 attempts += 1
                 
                 if neg_bid in true_binders:
@@ -179,6 +195,17 @@ class PairwiseAffinityDataset(Dataset):
         self._log(f"    Negative pairs: {neg_count:,}")
 
     def _append_pair(self, b_rec, w_rec, pair_type: str):
+        # Filter out pairs where any sequence is missing
+        keys = [
+            f"binder_{b_rec['binder_id']}", f"target_{b_rec['target_id']}",
+            f"binder_{w_rec['binder_id']}", f"target_{w_rec['target_id']}",
+        ]
+        missing = [k for k in keys if k not in self.id2seq]
+        if missing:
+            self.dropped_pairs += 1
+            self.missing_keys.update(missing)
+            return
+
         self.b_better.append(b_rec['binder_id'])
         self.t_better.append(b_rec['target_id'])
         self.b_worse.append(w_rec['binder_id'])
@@ -243,17 +270,18 @@ class PairAffinityDataModule(LightningDataModule):
 
     def setup(self, stage=None):
         base_df = pd.read_csv(self.cfg.data.base_csv)
-        
+
         if self.split_col not in base_df.columns:
             raise KeyError(f"Split column '{self.split_col}' not found in CSV.")
-        
+
         seed = self.cfg.training.get("seed", 42)
         train_ratio = self.cfg.training.get("train_val_split", 0.9)
         strategy = self.cfg.training.get("split_strategy", "group")
-        
+        rng = np.random.default_rng(seed)
+
         if self.is_main_process:
             print(f"\n[DataModule] Split/Balance Column: {self.split_col}")
-        
+
         if strategy == "random":
             from sklearn.model_selection import train_test_split
             train_df, val_df = train_test_split(
@@ -261,48 +289,24 @@ class PairAffinityDataModule(LightningDataModule):
             )
             if self.is_main_process:
                 print(f"[DataModule] Split Strategy: Random")
-            
+
         elif strategy == "group":
             if self.is_main_process:
                 print(f"[DataModule] Split Strategy: Group by {self.split_col}")
-            
-            unique_groups = base_df[self.split_col].unique()
-            counts = base_df[self.split_col].value_counts()
-            singleton_groups = counts[counts == 1].index.tolist()
-            multi_sample_groups = counts[counts > 1].index.tolist()
-            
-            if self.is_main_process:
-                print(f"  Total unique {self.split_col}s: {len(unique_groups)}")
-                print(f"  Singleton {self.split_col}s (1 sample): {len(singleton_groups)}")
-                print(f"  Multi-sample {self.split_col}s (>1 sample): {len(multi_sample_groups)}")
-            
-            np.random.seed(seed)
-            np.random.shuffle(multi_sample_groups)
-            
-            val_group_count = max(1, int(len(multi_sample_groups) * (1 - train_ratio)))
-            val_groups = set(multi_sample_groups[:val_group_count])
-            train_groups_multi = set(multi_sample_groups[val_group_count:])
-            train_groups = train_groups_multi.union(set(singleton_groups))
-            
-            train_df = base_df[base_df[self.split_col].isin(train_groups)].copy()
-            val_df = base_df[base_df[self.split_col].isin(val_groups)].copy()
-            
-            overlap = train_groups & val_groups
-            if len(overlap) > 0:
-                raise ValueError(f"ERROR: Train/Val {self.split_col} overlap: {overlap}")
-            
-            if self.is_main_process:
-                print(f"  ✓ Train {self.split_col}s: {len(train_groups)}")
-                print(f"  ✓ Val {self.split_col}s: {len(val_groups)} (COMPLETELY UNSEEN)")
+            train_df, val_df = group_split(
+                base_df, col=self.split_col, ratio=train_ratio, seed=seed,
+                verbose=self.is_main_process,
+                label_col="log_Aff",
+            )
         else:
             raise ValueError(f"Unknown split_strategy: {strategy}")
-        
+
         if self.is_main_process:
             print(f"  Train samples: {len(train_df)}, Val samples: {len(val_df)}")
 
         # Train/Val datasets
         self.train_dataset = PairwiseAffinityDataset(
-            train_df, self.cfg.data.lookup_csv, 
+            train_df, self.cfg.data.lookup_csv,
             pairs_per_sample=self.cfg.data.get("pairs_per_sample", 2),
             inter_pps=self.cfg.data.get("inter_pps", 10),
             min_margin=self.cfg.data.get("min_margin", 1.0),
@@ -312,19 +316,21 @@ class PairAffinityDataModule(LightningDataModule):
             add_negatives=self.cfg.data.get("add_negatives", False),
             neg_per_positive=self.cfg.data.get("neg_per_positive", 1),
             neg_log_aff=self.cfg.data.get("neg_log_aff", 2.0),
-            pair_within_source=self.cfg.data.get("pair_within_source", False)  # NEW
+            pair_within_source=self.cfg.data.get("pair_within_source", False),
+            rng=rng,
         )
 
         self.val_dataset = PairwiseAffinityDataset(
-            val_df, self.cfg.data.lookup_csv, 
-            pairs_per_sample=2, 
-            inter_pps=5, 
+            val_df, self.cfg.data.lookup_csv,
+            pairs_per_sample=2,
+            inter_pps=5,
             split_name="VAL",
             verbose=self.is_main_process,
             add_negatives=self.cfg.data.get("add_negatives", False),
             neg_per_positive=self.cfg.data.get("neg_per_positive", 1),
             neg_log_aff=self.cfg.data.get("neg_log_aff", 2.0),
-            pair_within_source=self.cfg.data.get("pair_within_source", False)  # NEW
+            pair_within_source=self.cfg.data.get("pair_within_source", False),
+            rng=rng,
         )
         
         # Regression test dataset

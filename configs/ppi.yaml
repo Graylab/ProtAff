@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - model: esm_cross_attn
+  - model: esm_binding
 
 # ==========================================
 # TASK CONFIGURATION
@@ -54,7 +54,7 @@ training:
   # Batch configuration
   batch_size: 16
   accumulate_grad_batches: 2                 # Effective batch size = 16 * 2 = 32
-  max_epochs: 5
+  max_epochs: 2
 
   # Loss Function
   loss_type: "bce"  # Options: margin, soft_margin, bce, margin_weighted, contrastive
@@ -72,7 +72,7 @@ training:
   
   # Early stopping
   early_stopping: true
-  early_stopping_patience: 3                  # Stop after N epochs without improvement
+  early_stopping_patience: 4                  # Stop after N val checks without improvement
   
   # Testing
   test_every_val: false                        # Run test evaluation after each validation
@@ -86,7 +86,7 @@ training:
   # Training stability
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
-  val_check_interval: 0.1                     # Validate every 0.1 epochs
+  val_check_interval: 0.25                    # Validate 4x per epoch
   
   wandb:
     project: "ppi-pretrain"

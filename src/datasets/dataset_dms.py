@@ -3,12 +3,13 @@ import torch
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 from omegaconf import DictConfig
 
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from pytorch_lightning import LightningDataModule
 from transformers import EsmTokenizer
+from src.datasets.split_utils import group_split
 
 # =========================================================================
 # 1. Single-Sequence Collator (Regression)
@@ -51,15 +52,16 @@ class DMSCollator:
 # =========================================================================
 class DMSDataset(Dataset):
     def __init__(
-        self, 
+        self,
         dataframe: pd.DataFrame, # Changed: Accept DataFrame directly
-        wt_csv: str, 
-        max_length: int = 1024, 
+        wt_csv: str,
+        max_length: int = 1024,
         crop_method: str = "smart",
         weight_col: Optional[str] = None,
         balance_clusters: bool = False,
         normalize_labels: bool = True, # New: Auto-normalization
-        invert_score: bool = True     # New: Optional sign flip
+        invert_score: bool = True,     # New: Optional sign flip
+        provided_stats: Optional[Tuple[float, float]] = None,
     ):
         self.mut_df = dataframe.copy() # Work on a copy
         self.wt_df = pd.read_csv(wt_csv)
@@ -78,15 +80,18 @@ class DMSDataset(Dataset):
         # --- Label Normalization (Critical for Regression) ---
         self.label_mean = 0.0
         self.label_std = 1.0
-        
+
         # Extract raw scores
         raw_scores = pd.to_numeric(self.mut_df["DMS_score_normalized"], errors='coerce').values
-        
+
         if invert_score:
-            print("[Dataset] ⚠️ Inverting scores (multiplying by -1.0).")
+            print("[Dataset] Inverting scores (multiplying by -1.0).")
             raw_scores = -1.0 * raw_scores
-            
-        if normalize_labels:
+
+        if provided_stats is not None:
+            self.label_mean, self.label_std = provided_stats
+            print(f"[Dataset] Using PROVIDED stats -> Mean: {self.label_mean:.4f}, Std: {self.label_std:.4f}")
+        elif normalize_labels:
             self.label_mean = np.nanmean(raw_scores)
             self.label_std = np.nanstd(raw_scores) + 1e-8
             print(f"[Dataset] Normalizing Labels -> Mean: {self.label_mean:.4f}, Std: {self.label_std:.4f}")
@@ -194,53 +199,40 @@ class DMSDataModule(LightningDataModule):
 
         # 1. Load Full Dataframe
         full_df = pd.read_csv(self.cfg.data.mutant_csv)
-        
+
         # 2. STRICT TARGET SPLIT (Unseen Targets in Validation)
-        # We split by 'filename' (target ID), NOT by row.
-        all_targets = full_df['filename'].unique()
-        
-        # Shuffle targets deterministically
-        rng = np.random.default_rng(self.cfg.training.seed)
-        rng.shuffle(all_targets)
-        
-        # Define Split
-        val_count = max(1, int(len(all_targets) * 0.1)) # 10% validation
-        val_targets = set(all_targets[:val_count])
-        train_targets = set(all_targets[val_count:])
-        
-        print(f"[Split] Total Targets: {len(all_targets)}")
-        print(f"[Split] Train Targets: {len(train_targets)} | Val Targets: {len(val_targets)} (STRICTLY UNSEEN)")
-        
-        # Create Sub-DataFrames
-        train_df = full_df[full_df['filename'].isin(train_targets)].copy()
-        val_df = full_df[full_df['filename'].isin(val_targets)].copy()
+        train_ratio = self.cfg.training.get("train_val_split", 0.9)
+        seed = self.cfg.training.seed
+        train_df, val_df = group_split(
+            full_df, col="filename", ratio=train_ratio, seed=seed, verbose=True
+        )
 
         # 3. Initialize Datasets (Passing DataFrames)
-        # Note: We can invert score if config requests it, but default is False (Higher is Better)
         invert = self.cfg.data.get("invert_score", False)
         normalize = self.cfg.data.get("normalize_labels", True)
 
         self.train_dataset = DMSDataset(
-            dataframe=train_df, 
-            wt_csv=self.cfg.data.wt_csv, 
+            dataframe=train_df,
+            wt_csv=self.cfg.data.wt_csv,
             max_length=self.cfg.model.max_length,
             crop_method=self.cfg.data.get("crop_method", "smart"),
             weight_col=self.cfg.data.get("weight_col", None),
             balance_clusters=self.cfg.data.get("balance_clusters", False),
             normalize_labels=normalize,
-            invert_score=invert
+            invert_score=invert,
         )
 
-        # For Validation, we ideally use Train stats to normalize, but self-normalization is fine for monitoring
+        # Pass train stats to val dataset to avoid label leakage
         self.val_dataset = DMSDataset(
-            dataframe=val_df, 
-            wt_csv=self.cfg.data.wt_csv, 
+            dataframe=val_df,
+            wt_csv=self.cfg.data.wt_csv,
             max_length=self.cfg.model.max_length,
             crop_method=self.cfg.data.get("crop_method", "smart"),
             weight_col=None, # No weighting for validation
             balance_clusters=False,
             normalize_labels=normalize,
-            invert_score=invert
+            invert_score=invert,
+            provided_stats=(self.train_dataset.label_mean, self.train_dataset.label_std),
         )
         
         # 4. Sampler for Training

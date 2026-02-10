@@ -12,6 +12,7 @@ from sklearn.model_selection import train_test_split
 
 from src.datasets.collators import select_collator, BinaryClassificationCollator
 from src.datasets.test_datasets import TestRegressionDataset, BinaryClassificationTestDataset
+from src.datasets.split_utils import group_split
 
 # ----------------------------------------------------------------------
 # Dataset
@@ -131,46 +132,9 @@ class AffinityDataModule(LightningDataModule):
         
         elif strategy == "group":
             print(f"--- Running STRICT GROUP Split (Val has UNSEEN {self.split_col}s) ---")
-            
-            # 1. Count occurrences per split column (could be target_id or cluster_id)
-            counts = base_df[self.split_col].value_counts()
-            
-            # Separate singletons and multi-sample groups
-            singleton_groups = counts[counts == 1].index.tolist()
-            multi_sample_groups = counts[counts > 1].index.tolist()
-            
-            print(f"  Total unique {self.split_col}s: {len(counts)}")
-            print(f"  Singleton {self.split_col}s (1 sample): {len(singleton_groups)}")
-            print(f"  Multi-sample {self.split_col}s (>1 sample): {len(multi_sample_groups)}")
-            
-            # 2. Shuffle multi-sample groups
-            rng = np.random.default_rng(seed)
-            rng.shuffle(multi_sample_groups)
-            
-            # 3. Split multi-sample groups for train/val (NO OVERLAP)
-            # Val gets groups completely unseen in training
-            val_group_count = max(1, int(len(multi_sample_groups) * (1 - train_ratio)))
-            
-            val_groups = set(multi_sample_groups[:val_group_count])
-            train_groups_multi = set(multi_sample_groups[val_group_count:])
-            
-            # 4. Add all singletons to training (can't split them)
-            train_groups = train_groups_multi.union(set(singleton_groups))
-            
-            # 5. Create dataframes based on group membership
-            train_df = base_df[base_df[self.split_col].isin(train_groups)].copy()
-            val_df = base_df[base_df[self.split_col].isin(val_groups)].copy()
-            
-            # 6. Verify no group overlap (CRITICAL!)
-            overlap = train_groups & val_groups
-            if len(overlap) > 0:
-                raise ValueError(f"ERROR: Train/Val {self.split_col} overlap detected: {overlap}")
-            
-            print(f"  ✓ Train {self.split_col}s: {len(train_groups)}")
-            print(f"    - Multi-sample: {len(train_groups_multi)}")
-            print(f"    - Singletons: {len(singleton_groups)}")
-            print(f"  ✓ Val {self.split_col}s: {len(val_groups)} (COMPLETELY UNSEEN in train)")
-            print(f"  ✓ {self.split_col} overlap check: {len(overlap)} (MUST be 0)")
+            train_df, val_df = group_split(
+                base_df, col=self.split_col, ratio=train_ratio, seed=seed, verbose=True
+            )
 
         else:
             raise ValueError(f"Unknown split_strategy: {strategy}")

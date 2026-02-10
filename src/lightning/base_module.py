@@ -6,7 +6,7 @@ import pytorch_lightning as pl
 from peft import get_peft_model, LoraConfig
 from peft.utils import load_peft_weights
 from omegaconf import DictConfig, OmegaConf
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 
 from src.models import build_model
 
@@ -55,7 +55,7 @@ class BaseModule(pl.LightningModule):
         arch = cfg.model.get("arch", "concat")
         n_cross = getattr(cfg.model, "n_cross_layers", 1)
 
-        modules_to_save = ["head_score"]
+        modules_to_save = ["head_score", "pool"]
         if arch in ["bi_cross_attn", "cross_attn", "binding"]:
             modules_to_save.extend(["input_norm", "input_proj"])
             modules_to_save.extend([f"cross_layers.{i}" for i in range(n_cross)])
@@ -128,7 +128,13 @@ class BaseModule(pl.LightningModule):
         )
         total_steps = self.trainer.estimated_stepping_batches
         warmup = int(total_steps * getattr(self.cfg.training, "warmup_ratio", 0.1))
-        scheduler = get_linear_schedule_with_warmup(optimizer, warmup, total_steps)
+
+        schedule_type = getattr(self.cfg.training, "scheduler", "cosine")
+        if schedule_type == "linear":
+            scheduler = get_linear_schedule_with_warmup(optimizer, warmup, total_steps)
+        else:
+            scheduler = get_cosine_schedule_with_warmup(optimizer, warmup, total_steps)
+
         return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
 
     def _load_pretrained_weights(self, ckpt_path):

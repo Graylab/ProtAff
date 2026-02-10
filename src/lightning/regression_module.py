@@ -39,13 +39,10 @@ class RegressionModule(BaseModule):
 
     def _get_labels(self, batch):
         """Get labels from batch, converting for BCE/Focal if needed."""
-        # Affinity/DMS tasks use 'reg_labels', PPI uses 'labels'
-        if "reg_labels" in batch:
-            labels = batch["reg_labels"]
-        else:
-            labels = batch["labels"]
+        labels = batch["reg_labels"]
 
         if self.loss_type in ["bce", "focal"]:
+            labels = labels.reshape(-1)
             binary_labels = (labels > (1.0 - self.bce_threshold)).float()
             return binary_labels
 

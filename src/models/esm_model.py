@@ -19,15 +19,16 @@ class ESMConcatModel(nn.Module):
 
         self.projector = nn.Linear(esm_hidden, d_model)
         self.norm_input = nn.LayerNorm(d_model)
-        
+        self.pool = AttnPool(d_model)
+
         self.head_score = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.LayerNorm(d_model),
-            nn.GELU(), 
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, 1) 
+            nn.Linear(d_model, 1)
         )
-        
+
         self._init_weights()
 
     def _init_weights(self):
@@ -38,13 +39,10 @@ class ESMConcatModel(nn.Module):
     def forward(self, input_ids, attention_mask, **kwargs):
         outputs = self.esm(input_ids=input_ids, attention_mask=attention_mask)
         hidden = outputs.last_hidden_state  # (batch, seq_len, hidden)
-        
-        # Mean pooling
-        mask = attention_mask.unsqueeze(-1).float()
-        pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
-        
-        vec = self.norm_input(self.projector(pooled))
-        score = self.head_score(vec)
+
+        projected = self.norm_input(self.projector(hidden))
+        pooled = self.pool(projected, attention_mask)
+        score = self.head_score(pooled)
         return score
         
 class ESMCrossAttnModel(nn.Module):
@@ -71,6 +69,8 @@ class ESMCrossAttnModel(nn.Module):
             for _ in range(n_layers)
         ])
 
+        self.pool = AttnPool(d_model)
+
         self.head_score = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
@@ -85,11 +85,6 @@ class ESMCrossAttnModel(nn.Module):
             if "esm" not in n and p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    @staticmethod
-    def _masked_mean_pool(x, mask):
-        mask_f = mask.unsqueeze(-1).float()
-        return (x * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1e-9)
-
     def forward(self, binder_ids, binder_mask, target_ids, target_mask, return_attn=False, **kwargs):
         b = self.input_norm(self.input_proj(
             self.esm(input_ids=binder_ids, attention_mask=binder_mask).last_hidden_state
@@ -102,7 +97,7 @@ class ESMCrossAttnModel(nn.Module):
         for layer in self.cross_layers:
             b, attn_weights = layer(b, t, target_mask)
 
-        score = self.head_score(self._masked_mean_pool(b, binder_mask))
+        score = self.head_score(self.pool(b, binder_mask))
 
         if return_attn:
             return score, attn_weights
@@ -133,6 +128,8 @@ class ESMBiCrossAttnModel(nn.Module):
             for _ in range(n_layers)
         ])
 
+        self.pool = AttnPool(d_model)
+
         self.head_score = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.GELU(),
@@ -147,11 +144,6 @@ class ESMBiCrossAttnModel(nn.Module):
             if "esm" not in n and p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    @staticmethod
-    def _masked_mean_pool(x, mask):
-        mask_f = mask.unsqueeze(-1).float()
-        return (x * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1e-9)
-
     def forward(self, binder_ids, binder_mask, target_ids, target_mask, return_attn=False, **kwargs):
         b = self.input_norm(self.input_proj(
             self.esm(input_ids=binder_ids, attention_mask=binder_mask).last_hidden_state
@@ -165,8 +157,8 @@ class ESMBiCrossAttnModel(nn.Module):
             b, t, w_b2t, w_t2b = layer(b, t, binder_mask, target_mask)
 
         pooled = torch.cat([
-            self._masked_mean_pool(b, binder_mask),
-            self._masked_mean_pool(t, target_mask),
+            self.pool(b, binder_mask),
+            self.pool(t, target_mask),
         ], dim=-1)
 
         score = self.head_score(pooled)
@@ -202,6 +194,8 @@ class ESMBindingModel(nn.Module):
             for _ in range(n_layers)
         ])
 
+        self.pool = AttnPool(d_model)
+
         self.head_classify = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
@@ -222,11 +216,6 @@ class ESMBindingModel(nn.Module):
             if "esm" not in n and p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    @staticmethod
-    def _masked_mean_pool(x, mask):
-        mask_f = mask.unsqueeze(-1).float()
-        return (x * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1e-9)
-
     def encode(self, binder_ids, binder_mask, target_ids, target_mask):
         b = self.input_norm(self.input_proj(
             self.esm(input_ids=binder_ids, attention_mask=binder_mask).last_hidden_state
@@ -238,7 +227,7 @@ class ESMBindingModel(nn.Module):
         for layer in self.cross_layers:
             b, _ = layer(b, t, target_mask)
 
-        return self._masked_mean_pool(b, binder_mask)
+        return self.pool(b, binder_mask)
 
     def forward(self, binder_ids, binder_mask, target_ids, target_mask,
                 task="classify", return_attn=False, **kwargs):
@@ -252,8 +241,21 @@ class ESMBindingModel(nn.Module):
 
 # ─── Building Blocks ────────────────────────────────────────────────
 
+class AttnPool(nn.Module):
+    """Learnable attention-weighted pooling over sequence positions."""
+
+    def __init__(self, d_model):
+        super().__init__()
+        self.attn = nn.Linear(d_model, 1)
+
+    def forward(self, x, mask):
+        weights = self.attn(x).squeeze(-1)  # (B, L)
+        weights = weights.masked_fill(~mask.bool(), float('-inf'))
+        weights = torch.softmax(weights, dim=-1).unsqueeze(-1)  # (B, L, 1)
+        return (x * weights).sum(dim=1)  # (B, d_model)
+
 class UniCrossAttnBlock(nn.Module):
-    """Uni-directional cross-attention: query attends to context, with pre-norm and residual."""
+    """Uni-directional cross-attention: query attends to context, with pre-norm, FFN, and residual."""
 
     def __init__(self, d_model, n_heads, dropout):
         super().__init__()
@@ -264,6 +266,14 @@ class UniCrossAttnBlock(nn.Module):
             batch_first=True, dropout=dropout,
         )
         self.dropout = nn.Dropout(dropout)
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout),
+        )
 
     def forward(self, q, kv, kv_mask):
         q_out, attn_weights = self.cross_attn(
@@ -271,37 +281,61 @@ class UniCrossAttnBlock(nn.Module):
             key_padding_mask=~kv_mask.bool(),
             average_attn_weights=True,
         )
-        return q + self.dropout(q_out), attn_weights
+        q = q + self.dropout(q_out)
+        q = q + self.ffn(q)
+        return q, attn_weights
 
 
 class BiCrossAttnBlock(nn.Module):
-    """Bidirectional cross-attention: both sequences attend to each other, with pre-norm and residual."""
+    """Bidirectional cross-attention: both sequences attend to each other, with pre-norm, FFN, and residual."""
 
     def __init__(self, d_model, n_heads, dropout):
         super().__init__()
         self.norm_b = nn.LayerNorm(d_model)
         self.norm_t = nn.LayerNorm(d_model)
-        self.cross_attn = nn.MultiheadAttention(
+        self.b2t_attn = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=n_heads,
+            batch_first=True, dropout=dropout,
+        )
+        self.t2b_attn = nn.MultiheadAttention(
             embed_dim=d_model, num_heads=n_heads,
             batch_first=True, dropout=dropout,
         )
         self.dropout = nn.Dropout(dropout)
+        self.ffn_b = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout),
+        )
+        self.ffn_t = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout),
+        )
 
     def forward(self, b, t, b_mask, t_mask):
         b_normed, t_normed = self.norm_b(b), self.norm_t(t)
 
-        b_out, w_b2t = self.cross_attn(
+        b_out, w_b2t = self.b2t_attn(
             b_normed, t_normed, t_normed,
             key_padding_mask=~t_mask.bool(),
             average_attn_weights=True,
         )
         b = b + self.dropout(b_out)
+        b = b + self.ffn_b(b)
 
-        t_out, w_t2b = self.cross_attn(
+        t_out, w_t2b = self.t2b_attn(
             self.norm_t(t), self.norm_b(b), self.norm_b(b),
             key_padding_mask=~b_mask.bool(),
             average_attn_weights=True,
         )
         t = t + self.dropout(t_out)
+        t = t + self.ffn_t(t)
 
         return b, t, w_b2t, w_t2b

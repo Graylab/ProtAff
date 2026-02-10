@@ -10,9 +10,9 @@ dropout: 0.1
 
 # LoRA
 lora:
-  r: 8
-  alpha: 16
+  r: 16
+  alpha: 32
   dropout: 0.1
-  target_modules: ["key", "value"]
+  target_modules: ["query", "key", "value"]
   modules_to_save: []
   n_last_layers: 4
