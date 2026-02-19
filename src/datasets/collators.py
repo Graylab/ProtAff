@@ -119,8 +119,6 @@ class PairwiseConcatCollator:
         if "better_target_id" in batch[0]:
             result["better_tid"] = [x["better_target_id"] for x in batch]
             result["worse_tid"] = [x["worse_target_id"] for x in batch]
-            result["better_log_aff"] = torch.tensor([x["better_log_aff"] for x in batch], dtype=torch.float32)
-            result["worse_log_aff"] = torch.tensor([x["worse_log_aff"] for x in batch], dtype=torch.float32)
             result["better_bid"] = [x["better_binder_id"] for x in batch]
             result["worse_bid"] = [x["worse_binder_id"] for x in batch]
 
@@ -155,8 +153,6 @@ class PairwiseCrossAttnCollator:
         if "better_target_id" in batch[0]:
             result["better_tid"] = [x["better_target_id"] for x in batch]
             result["worse_tid"] = [x["worse_target_id"] for x in batch]
-            result["better_log_aff"] = torch.tensor([x["better_log_aff"] for x in batch], dtype=torch.float32)
-            result["worse_log_aff"] = torch.tensor([x["worse_log_aff"] for x in batch], dtype=torch.float32)
             result["better_bid"] = [x["better_binder_id"] for x in batch]
             result["worse_bid"] = [x["worse_binder_id"] for x in batch]
 

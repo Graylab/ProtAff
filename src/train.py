@@ -16,8 +16,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 # --- IMPORT MODULES ---
 # DataModules
-from src.datasets.dataset_dms import DMSDataModule
-from src.datasets.dataset_pair_dms import PairDMSDataModule
 from src.datasets.dataset_affinity import AffinityDataModule
 from src.datasets.dataset_pair_affinity import PairAffinityDataModule
 from src.datasets.dataset_ppi import PPIDataModule
@@ -198,7 +196,7 @@ class BinaryTestCallback(Callback):
                 
                 scores = pl_module.forward(batch_device)
                 
-                all_scores.extend(scores.cpu().squeeze().tolist())
+                all_scores.extend(scores.cpu().flatten().tolist())
                 all_labels.extend(batch['is_binder'].tolist())
                 all_target_ids.extend(batch['tid'])
         
@@ -260,8 +258,6 @@ class BinaryTestCallback(Callback):
 
 
 TASK_MAP = {
-    "dms":           (DMSDataModule,          RegressionModule),
-    "pair_dms":      (PairDMSDataModule,      RankingModule),
     "affinity":      (AffinityDataModule,     RegressionModule),
     "pair_affinity": (PairAffinityDataModule, RankingModule),
     "ppi":           (PPIDataModule,          RegressionModule),
@@ -271,7 +267,7 @@ TASK_MAP = {
 
 def get_task_modules(cfg):
     """Factory: Returns (DataModule, LightningModule) based on cfg.task_name"""
-    task = cfg.get("task_name", "dms").lower()
+    task = cfg.get("task_name", "affinity").lower()
 
     if task not in TASK_MAP:
         raise ValueError(f"Unknown task_name: {task}. Options: {list(TASK_MAP.keys())}")
@@ -390,7 +386,8 @@ def main(cfg: DictConfig):
         gradient_clip_val=cfg.training.get("gradient_clip_val", 1.0),
         val_check_interval=cfg.training.get("val_check_interval", 1.0),
         limit_val_batches=cfg.training.get("limit_val_batches", None),
-        check_val_every_n_epoch=cfg.training.get("check_val_every_n_epoch", 1)
+        check_val_every_n_epoch=cfg.training.get("check_val_every_n_epoch", 1),
+        reload_dataloaders_every_n_epochs=1 if cfg.data.get("resample_each_epoch", False) else 0
     )
 
     # ======================================================================

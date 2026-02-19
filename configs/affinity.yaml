@@ -10,7 +10,7 @@ task_name: "affinity"
 # ==========================================
 # CHECKPOINT PATHS
 # ==========================================
-# Pretrained model to load weights from (e.g., from Phase 1 DMS training)
+# Pretrained model to load weights from (e.g., from Phase 1 PPI training)
 pretrained_ckpt_path: null
 
 # Resume training from a specific checkpoint (e.g., "outputs/.../checkpoints/last.ckpt")

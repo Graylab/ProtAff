@@ -15,11 +15,34 @@ METRICS_CONFIG = {
 }
 
 PLOT_SETTINGS = {
-    'figsize_width': 12,
-    'bar_height_per_target': 0.6,
-    'font_scale': 1.2
+    'figsize_width': 14,
+    'bar_height_per_target': 0.7,
 }
+
+# Highlight color for our method
+HIGHLIGHT_COLOR = '#D55E00'
+BASELINE_COLOR = '#0072B2'
 # =================================================
+
+def setup_slide_style():
+    """Sets visual styles sized for presentation slides."""
+    sns.set_theme(style="whitegrid", rc={
+        'axes.edgecolor': '.15',
+        'grid.linestyle': '--',
+        'grid.alpha': 0.3,
+    })
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'DejaVu Sans'],
+        'font.size': 18,
+        'axes.titlesize': 22,
+        'axes.labelsize': 24,
+        'xtick.labelsize': 16,
+        'ytick.labelsize': 16,
+        'legend.fontsize': 14,
+        'figure.titlesize': 26,
+        'lines.linewidth': 2.5,
+    })
 
 def get_ap(y_true, y_scores):
     mask = y_true.notna() & y_scores.notna()
@@ -120,42 +143,54 @@ def analyze_results(pred_csv, output_dir):
     generate_distribution_plots(merged_df, output_dir)
 
 def generate_per_target_plot(df, output_dir, metric):
-    sns.set_context("paper", font_scale=PLOT_SETTINGS['font_scale'])
+    setup_slide_style()
     h = max(6, len(df['target_id'].unique()) * PLOT_SETTINGS['bar_height_per_target'])
     plt.figure(figsize=(PLOT_SETTINGS['figsize_width'], h))
-    
-    ax = sns.barplot(data=df, x=metric, y='target_id', hue='Method', edgecolor='black')
-    
+
+    palette = {m: HIGHLIGHT_COLOR if 'Predicted' in m else BASELINE_COLOR
+               for m in df['Method'].unique()}
+    ax = sns.barplot(data=df, x=metric, y='target_id', hue='Method',
+                     palette=palette, edgecolor='black')
+
     fmt = '%.2f' if metric in ['AP', 'AUROC', 'P@10'] else '%d'
     for container in ax.containers:
-        ax.bar_label(container, fmt=fmt, padding=3)
-    
-    plt.title(f'Per-Target {metric}', weight='bold')
-    plt.grid(axis='x', linestyle='--', alpha=0.7)
+        ax.bar_label(container, fmt=fmt, padding=3, fontsize=14)
+
+    plt.title(metric, weight='bold')
+    plt.ylabel("")
+    plt.legend(frameon=True, framealpha=0.9)
+    plt.grid(axis='x', linestyle='--', alpha=0.3)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f"per_target_{metric.lower().replace('@','_')}.png"), dpi=300)
     plt.close()
 
 def plot_global_summary(plot_df, output_dir):
+    setup_slide_style()
     summary_df = plot_df.groupby('Method')[['AP', 'AUROC', 'P@10', 'Success@1', 'Success@10']].mean().reset_index()
-    melted = summary_df.melt(id_vars='Method', var_name='Metric', value_name='Average Value')
-    
-    plt.figure(figsize=(12, 6))
-    ax = sns.barplot(data=melted, x='Metric', y='Average Value', hue='Method', palette='magma')
-    
+    melted = summary_df.melt(id_vars='Method', var_name='metric_name', value_name='Average Value')
+
+    palette = {m: HIGHLIGHT_COLOR if 'Predicted' in m else BASELINE_COLOR
+               for m in melted['Method'].unique()}
+
+    plt.figure(figsize=(14, 7))
+    ax = sns.barplot(data=melted, x='metric_name', y='Average Value', hue='Method',
+                     palette=palette, edgecolor='black')
+
     for container in ax.containers:
-        ax.bar_label(container, fmt='%.2f', padding=3)
-        
-    plt.title('Average Metrics Across All Targets', weight='bold')
+        ax.bar_label(container, fmt='%.2f', padding=3, fontsize=14)
+
+    plt.title('Average Across All Targets', weight='bold')
     plt.ylim(0, 1.1)
-    plt.ylabel('Score / Success Rate')
+    plt.xlabel("")
+    plt.ylabel('Score')
+    plt.legend(frameon=True, framealpha=0.9)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "average_summary_metrics.png"), dpi=300)
     plt.close()
 
 def generate_distribution_plots(merged_df, output_dir):
     """Generates strip plots showing individual design scores per target."""
-    sns.set_context("paper", font_scale=PLOT_SETTINGS['font_scale'])
+    setup_slide_style()
     
     plot_df = merged_df.copy()
     
@@ -202,11 +237,12 @@ def generate_distribution_plots(merged_df, output_dir):
             size=4
         )
         
-        plt.title(f'Score Distribution: {display_label}', weight='bold', pad=20)
-        plt.xlabel(f"{display_label} Value")
+        plt.title(f'{display_label}', weight='bold', pad=20)
+        plt.xlabel(display_label)
+        plt.ylabel("")
         plt.grid(axis='x', linestyle='--', alpha=0.3)
-        
-        plt.legend(title='Status', bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0)
+
+        plt.legend(bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0)
         
         sns.despine(left=True, bottom=False)
         plt.tight_layout()

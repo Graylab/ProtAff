@@ -8,7 +8,7 @@ from src.lightning.base_module import BaseModule
 
 class RankingModule(BaseModule):
     """
-    Unified ranking module for pair_affinity, pair_dms, and pair_ppi tasks.
+    Unified ranking module for pair_affinity and pair_ppi tasks.
     Supports loss types: margin, soft_margin, bce, margin_weighted, contrastive.
     """
 

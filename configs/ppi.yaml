@@ -1,16 +1,20 @@
 defaults:
-  - _self_
   - model: esm_binding
+  - _self_
 
 # ==========================================
 # TASK CONFIGURATION
 # ==========================================
 task_name: "ppi"
 
+# Override binding head for classification pretraining
+model:
+  binding_head: "classify"
+
 # ==========================================
 # CHECKPOINT PATHS
 # ==========================================
-# Pretrained model to load weights from (e.g., from Phase 1 DMS training)
+# Pretrained model to load weights from (e.g., from a pretrained model)
 pretrained_ckpt_path: null
 
 # Resume training from a specific checkpoint (e.g., "outputs/.../checkpoints/last.ckpt")
@@ -26,13 +30,13 @@ data:
 
   # Optional filters
   sources: null  # or ["PPI", "DNS", "DNU"]
-  min_confidence: null
+  min_confidence: 0.05
   max_confidence: null
 
   # Label
   invert_label: true  # 1 - confidence (lower = better)
   use_weighted_sampler: True
-  confidence_threshold: 0.5
+  confidence_threshold: 0.3
 
   # Split (only used if strategy=group)
   split_col: "protein_a"
@@ -48,21 +52,19 @@ training:
   seed: 42
   
   # Data splitting (CRITICAL: Val must have unseen targets for your task)
-  split_strategy: "random"                     # "group" = split by target_id (val has unseen targets)
-  train_val_split: 0.95                        # 90% targets for train, 10% for val
-  
+  split_strategy: "group"                      # "group" = split by protein_a (val has unseen targets)
+  train_val_split: 0.95
+
   # Batch configuration
   batch_size: 16
   accumulate_grad_batches: 2                 # Effective batch size = 16 * 2 = 32
-  max_epochs: 2
+  max_epochs: 10
 
   # Loss Function
-  loss_type: "bce"  # Options: margin, soft_margin, bce, margin_weighted, contrastive
-  focal_gamma: 2.0
-  focal_alpha: 0.04
-  
+  loss_type: "bce"
+
   # Optimizer
-  learning_rate: 1e-4
+  learning_rate: 5e-5
   weight_decay: 1e-2                          # High weight decay for regularization
   warmup_ratio: 0.1
   
@@ -72,7 +74,7 @@ training:
   
   # Early stopping
   early_stopping: true
-  early_stopping_patience: 4                  # Stop after N val checks without improvement
+  early_stopping_patience: 5                 # Stop after N val checks without improvement
   
   # Testing
   test_every_val: false                        # Run test evaluation after each validation
@@ -86,7 +88,7 @@ training:
   # Training stability
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
-  val_check_interval: 0.25                    # Validate 4x per epoch
+  val_check_interval: 0.5                    # Validate 4x per epoch
   
   wandb:
     project: "ppi-pretrain"

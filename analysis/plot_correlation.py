@@ -14,18 +14,24 @@ STRUCT_METRICS = ['ipSAE', 'ipTM_af', 'pDockQ', 'pDockQ2', 'LIS']
 AGG_METHODS = ['max', 'min', 'mean', 'median']
 # ============================================================
 
-def setup_plotting():
-    """Sets visual styles for the plots with LARGE FONTS"""
-    sns.set_theme(style="whitegrid")
+def setup_slide_style():
+    """Sets visual styles sized for presentation slides."""
+    sns.set_theme(style="whitegrid", rc={
+        'axes.edgecolor': '.15',
+        'grid.linestyle': '--',
+        'grid.alpha': 0.3,
+    })
     plt.rcParams.update({
         'font.family': 'sans-serif',
-        'font.size': 20,                
-        'axes.titlesize': 22,         
-        'axes.labelsize': 18,         
+        'font.sans-serif': ['Arial', 'DejaVu Sans'],
+        'font.size': 18,
+        'axes.titlesize': 22,
+        'axes.labelsize': 24,
         'xtick.labelsize': 16,
         'ytick.labelsize': 16,
-        'legend.fontsize': 16,
-        'figure.titlesize': 26
+        'legend.fontsize': 14,
+        'figure.titlesize': 26,
+        'lines.linewidth': 2.5,
     })
 
 def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
@@ -78,7 +84,7 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
     # 1. MAIN ANALYSIS LOOP (Original Grids)
     for agg in AGG_METHODS:
         print(f"--- Processing Aggregation: {agg.upper()} ---")
-        setup_plotting()
+        setup_slide_style()
         fig, axes = plt.subplots(2, 3, figsize=(22, 16))
         axes = axes.flatten()
         
@@ -106,19 +112,29 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
                 'N': len(x)
             })
 
+            is_ours = "Predicted Affinity" in label
+            dot_color = '#D55E00' if is_ours else '#4C72B0'
+            line_color = '#d62728' if is_ours else '#1f77b4'
+
             sns.regplot(data=merged_df, x=col_name, y='neg_log_Aff', ax=ax,
-                        scatter_kws={'alpha': 0.6, 'edgecolor': 'w', 's': 120},
-                        line_kws={'color': '#d62728', 'alpha': 0.8, 'linewidth': 4})
+                        scatter_kws={'alpha': 0.6, 'edgecolor': 'w', 's': 120, 'color': dot_color},
+                        line_kws={'color': line_color, 'alpha': 0.8, 'linewidth': 4})
+
+            if is_ours:
+                for spine in ax.spines.values():
+                    spine.set_edgecolor('#D55E00')
+                    spine.set_linewidth(3)
 
             box_color = '#e6fffa' if pearson_r > 0 else '#ffe6e6'
             stats_text = f"Pearson R = {pearson_r:.3f}\nSpearman $\\rho$ = {spearman_rho:.3f}\nP-value = {p_val:.1e}"
-            ax.text(0.05, 0.95, stats_text, transform=ax.transAxes, fontsize=16, 
+            ax.text(0.05, 0.95, stats_text, transform=ax.transAxes, fontsize=16,
                     verticalalignment='top', fontweight='medium',
                     bbox=dict(facecolor=box_color, alpha=0.9, edgecolor='gray', boxstyle='round,pad=0.5'))
 
-            ax.set_title(label, fontsize=22, fontweight='bold', pad=15)
-            ax.set_xlabel("Predicted -log_Aff" if "Predicted Affinity" in label else f"Predicted {label}", fontsize=18)
-            ax.set_ylabel("Ground Truth -log_Aff", fontsize=18)
+            ax.set_title(label, fontsize=22, fontweight='bold', pad=15,
+                         color='#D55E00' if is_ours else 'black')
+            ax.set_xlabel("-Predicted Affinity" if is_ours else label)
+            ax.set_ylabel("-Ground Truth log_Aff")
 
         out_img_path = os.path.join(output_dir, f"correlation_{agg}_final.png")
         fig.suptitle(f"Binder Selection Metrics ({agg.upper()}) | N={n_samples}", fontsize=26, fontweight='bold', y=0.99)
@@ -130,37 +146,43 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
     print("\n[Analysis] Generating focused 1x2 ipSAE_min vs Predicted Affinity comparison...")
     ipsae_min_col = "ipSAE_min"
     if ipsae_min_col in merged_df.columns:
-        setup_plotting()
-        # Changed to 1 row, 2 columns. Swapped figsize to be wide (20x10)
+        setup_slide_style()
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 20))
-        
+
         comparison_tasks = [
-            (ipsae_min_col, "Structural: ipSAE (min) vs GT", ax1),
-            ('neg_predicted_affinity', "Sequence: Predicted Affinity vs GT", ax2)
+            (ipsae_min_col, "ipSAE (min)", ax1, False),
+            ('neg_predicted_affinity', "Predicted Affinity", ax2, True)
         ]
-        
-        for col, title, ax in comparison_tasks:
+
+        for col, title, ax, is_ours in comparison_tasks:
             clean_data = merged_df[[col, 'neg_log_Aff']].dropna()
             if clean_data.empty: continue
-            
+
             x, y = clean_data[col], clean_data['neg_log_Aff']
             r, p = stats.pearsonr(x, y)
             rho, _ = stats.spearmanr(x, y)
-            
-            # Regression Plot
+
+            dot_color = '#D55E00' if is_ours else '#0072B2'
+            line_color = '#d62728' if is_ours else '#1f77b4'
+
             sns.regplot(data=clean_data, x=col, y='neg_log_Aff', ax=ax,
-                        scatter_kws={'alpha': 0.6, 's': 150, 'edgecolor': 'w'},
-                        line_kws={'color': '#1f77b4' if 'ipSAE' in col else '#d62728', 'linewidth': 4})
-            
-            # Annotate with a slightly smaller font to fit horizontal layout
-            ax.text(0.05, 0.95, f"Pearson R: {r:.3f}\nSpearman $\\rho$: {rho:.3f}\nP: {p:.1e}", 
-                    transform=ax.transAxes, fontsize=16, verticalalignment='top', 
+                        scatter_kws={'alpha': 0.6, 's': 150, 'edgecolor': 'w', 'color': dot_color},
+                        line_kws={'color': line_color, 'linewidth': 4})
+
+            if is_ours:
+                for spine in ax.spines.values():
+                    spine.set_edgecolor('#D55E00')
+                    spine.set_linewidth(3)
+
+            ax.text(0.05, 0.95, f"Pearson R: {r:.3f}\nSpearman $\\rho$: {rho:.3f}\nP: {p:.1e}",
+                    transform=ax.transAxes, fontsize=16, verticalalignment='top',
                     bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.5', edgecolor='gray'))
-            
-            ax.set_title(title, fontsize=22, fontweight='bold', pad=20)
-            ax.set_ylabel("Ground Truth -log_Aff", fontsize=18)
-            ax.set_xlabel(f"Predictor Score ({col})", fontsize=18)
-            ax.grid(True, linestyle='--', alpha=0.5)
+
+            ax.set_title(title, fontsize=22, fontweight='bold', pad=20,
+                         color='#D55E00' if is_ours else 'black')
+            ax.set_ylabel("-Ground Truth log_Aff")
+            ax.set_xlabel(f"-Predicted Affinity" if is_ours else col)
+            ax.grid(True, linestyle='--', alpha=0.3)
 
         plt.tight_layout()
         focused_out = os.path.join(output_dir, "focused_ipsae_min_vs_predicted.png")
@@ -175,24 +197,36 @@ def save_summary(all_stats, output_dir):
     stats_df = pd.DataFrame(all_stats)
     out_csv_path = os.path.join(output_dir, "analysis_summary_full.csv")
     stats_df.to_csv(out_csv_path, index=False)
-    
+
     print("Generating Spearman ranking plot...")
+    setup_slide_style()
     plot_df = stats_df.drop_duplicates(subset=['Metric', 'Spearman_Rho']).copy()
     plot_df = plot_df.sort_values(by="Spearman_Rho", ascending=False)
-    
+
+    # Build color list: highlight Predicted Affinity
+    bar_colors = ['#D55E00' if 'Predicted Affinity' in m else '#0072B2'
+                  for m in plot_df['Metric']]
+
     plt.figure(figsize=(14, max(8, len(plot_df) * 0.6)))
-    ax = sns.barplot(data=plot_df, x="Spearman_Rho", y="Metric", palette="viridis", edgecolor="0.2")
-    
+    ax = sns.barplot(data=plot_df, x="Spearman_Rho", y="Metric", palette=bar_colors, edgecolor="0.2")
+
     for p in ax.patches:
         width = p.get_width()
         ha = 'left' if width >= 0 else 'right'
         x_offset = 0.02 if width >= 0 else -0.02
-        ax.text(width + x_offset, p.get_y() + p.get_height() / 2, f'{width:.3f}', 
-                ha=ha, va='center', fontsize=12, fontweight='bold')
+        ax.text(width + x_offset, p.get_y() + p.get_height() / 2, f'{width:.3f}',
+                ha=ha, va='center', fontsize=14, fontweight='bold')
+
+    # Highlight y-tick label for Predicted Affinity
+    for tick_label in ax.get_yticklabels():
+        if 'Predicted Affinity' in tick_label.get_text():
+            tick_label.set_fontweight('bold')
+            tick_label.set_color('#D55E00')
 
     plt.axvline(0, color='black', linewidth=1.5)
     plt.xlim(-0.4, 0.4)
-    plt.title("Spearman Correlation Ranking (High to Low)", fontsize=20, fontweight='bold', pad=20)
+    plt.ylabel("")
+    plt.title("Spearman Correlation Ranking", fontweight='bold', pad=20)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "spearman_ranking_barplot.png"), dpi=300)
     plt.close()

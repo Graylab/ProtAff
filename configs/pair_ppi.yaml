@@ -1,100 +1,90 @@
 defaults:
   - _self_
-  - model: esm_cross_attn
+  - model: esm_binding
 
-# ==========================================
-# TASK CONFIGURATION
-# ==========================================
+# Task name (Informational for logging)
 task_name: "pair_ppi"
 
-# ==========================================
-# CHECKPOINT PATHS
-# ==========================================
-# Pretrained model to load weights from (e.g., from Phase 1 DMS training)
+# --- TRANSFER LEARNING ---
+# Pretrained model to load weights from (e.g., from a pretrained model)
 pretrained_ckpt_path: null
 
-# Resume training from a specific checkpoint (e.g., "outputs/.../checkpoints/last.ckpt")
+# Resume training from a crash (Load optimizer state)
 resume_checkpoint_path: null
 
-# ==========================================
-# DATA CONFIGURATION
-# ==========================================
 data:
-  # Data files
+  # --- Paths ---
   pairs_csv: "data/ppi/ppi_pairs.csv"
   lookup_csv: "data/ppi/ppi_lookup.csv"
+  test_csv: "data/test/test_adaptyv.csv"
+  binary_test_csv: "data/test/test_binary.csv"
   sources: null
 
-  # Pair generation
+  # --- Pair Mining ---
   min_margin: 0.1
-  pairs_per_anchor: 50
+  pairs_per_anchor: 500
   max_anchors: 500000
   group_col: "protein_a"
 
-  # Split
+  # --- Split ---
   split_col: "protein_a"
-  
-  # DataLoader
+
+  # --- Sampling & Balancing ---
+  weight_col: "protein_a"
+  balance_clusters: true
+  balance_power: 0.25
+
+  # --- DataLoader ---
   num_workers: 6
-  
-  # Balancing configuration
-  balance_clusters: false                      # Enable weighted sampling by target_id
-  balance_power: 0.25                         # Balancing strength (0.25=gentle, 0.5=medium, 1.0=aggressive)
-  weight_col: null                            # Alternative weighting column (usually null)
-  
-# ==========================================
-# TRAINING CONFIGURATION
-# ==========================================
+
 training:
-  # Reproducibility
   seed: 42
-  
-  # Data splitting (CRITICAL: Val must have unseen targets for your task)
-  split_strategy: "group"                     # "group" = split by target_id (val has unseen targets)
-  train_val_split: 0.9                        # 90% targets for train, 10% for val
-  
-  # Batch configuration
+  split_strategy: "group"
+  train_val_split: 0.9
+
+  # Batch and Steps
   batch_size: 16
-  accumulate_grad_batches: 1                 # Effective batch size = 16 * 2 = 32
-  max_epochs: 5
+  accumulate_grad_batches: 2
+  max_epochs: 10
 
   # Loss Function
-  loss_type: "margin"
+  loss_type: "margin_weighted"
   margin: 0.1
-  
+  temperature: 0.1  # For contrastive loss
+
   # Optimizer
   learning_rate: 1e-4
-  weight_decay: 1e-2                          # High weight decay for regularization
+  weight_decay: 1e-2
   warmup_ratio: 0.1
-  
-  # Model saving 
-  monitor_metric: "val_loss"              # Metric to monitor: "val_loss", "val_spearman", "test_spearman"
-  monitor_mode: "min"                         # "min" for loss, "max" for spearman/accuracy
-  
-  # Early stopping
+
+  # Model saving
+  monitor_metric: "val_loss"
+  monitor_mode: "min"
+
+  # Early Stopping
   early_stopping: true
-  early_stopping_patience: 3                  # Stop after N epochs without improvement
-  
+  early_stopping_patience: 5
+
   # Testing
-  test_every_val: false                        # Run test evaluation after each validation
-  
+  test_every_val: true
+  test_binary_every_val: true
+  binary_test_every_n_epoch: 1
+
   # Hardware
-  accelerator: "auto"                         # "gpu", "cpu", or "auto"
-  devices: "auto"                             # Number of devices or "auto"
-  strategy: "auto" # Distributed strategy
-  precision: "bf16-mixed"                     # "16-mixed", "bf16-mixed", or "32"
-  
-  # Training stability
+  accelerator: "auto"
+  devices: "auto"
+  strategy: "auto"
+  precision: "bf16-mixed"
+
+  # Stability
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
-  val_check_interval: 0.5                     # Validate every 0.5 epochs
-  
+  val_check_interval: 0.5
+
   wandb:
     project: "ppi-pretrain"
 
-# ==========================================
-# HYDRA OUTPUT CONFIGURATION (unchanged)
-# ==========================================
+# Standard Hydra Output
 hydra:
   run:
     dir: outputs/pair_ppi/${now:%Y-%m-%d}/${now:%H-%M-%S}

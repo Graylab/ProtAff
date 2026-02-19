@@ -65,15 +65,30 @@ def analyze_column(df, pred_col, target_col, output_dir, base_name):
     print(f"EF @ 10%     : {ef_10:.2f}x")
 
     # Plotting
-    plt.figure(figsize=(8, 6))
-    sns.set_theme(style="ticks")
-    
-    # Scatter plot with regression line (using negated values for visualization)
-    sns.regplot(x=-y_pred, y=-y_true, 
-                scatter_kws={'alpha':0.5, 's':20}, 
-                line_kws={'color':'red'})
-    
-    plt.title(f"Zero-Shot: {pred_col}")
+    sns.set_theme(style="whitegrid", rc={
+        'axes.edgecolor': '.15',
+        'grid.linestyle': '--',
+        'grid.alpha': 0.3,
+    })
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'DejaVu Sans'],
+        'font.size': 18,
+        'axes.titlesize': 22,
+        'axes.labelsize': 24,
+        'xtick.labelsize': 16,
+        'ytick.labelsize': 16,
+        'legend.fontsize': 14,
+        'figure.titlesize': 26,
+        'lines.linewidth': 2.5,
+    })
+    plt.figure(figsize=(8, 7))
+
+    sns.regplot(x=-y_pred, y=-y_true,
+                scatter_kws={'alpha': 0.5, 's': 40, 'edgecolor': 'w'},
+                line_kws={'color': 'red', 'linewidth': 2.5})
+
+    plt.title(f"Zero-Shot: {pred_col}", fontweight='bold')
     plt.xlabel(f"-{pred_col}")
     plt.ylabel("-Ground Truth (log_Aff)")
     

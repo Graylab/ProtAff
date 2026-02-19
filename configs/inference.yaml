@@ -3,7 +3,7 @@ defaults:
   # 1. INHERIT MODEL CONFIG
   # This loads 'configs/model/esm_lora.yaml', providing 'cfg.model.name'
   # so the script knows which ESM-2 version to load automatically.
-  - model: esm_cross_attn
+  - model: esm_binding
   
   # 2. DISABLE LOGGING
   # Keeps your folder structure clean (no inference.log or hydra.log)

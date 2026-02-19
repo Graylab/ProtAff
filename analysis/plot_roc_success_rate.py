@@ -134,7 +134,7 @@ def analyze_enrichment(pred_csv, output_dir, gt_csv, struct_csv, binder_threshol
     FIG_SIZE = (10, 7)
 
     # 4. PLOT 1: ROC Curves
-    setup_plotting()
+    setup_slide_style()
     plt.figure(figsize=FIG_SIZE)
     
     results_sorted = sorted(results, key=lambda x: x['AUC'], reverse=True)
@@ -145,18 +145,20 @@ def analyze_enrichment(pred_csv, output_dir, gt_csv, struct_csv, binder_threshol
         
         fpr, tpr, _ = metrics.roc_curve(res['y_true'], res['y_score'])
         
-        lw = 3 if "Predicted Affinity" in label else 2.5
-        zorder = 10 if "Predicted Affinity" in label else 5
-        
-        plt.plot(fpr, tpr, lw=lw, label=f"{label} (AUC={res['AUC']:.2f})", color=color, zorder=zorder)
+        is_ours = "Predicted Affinity" in label
+        lw = 3.5 if is_ours else 2
+        zorder = 10 if is_ours else 5
+        ls = '-' if is_ours else '--'
+
+        plt.plot(fpr, tpr, lw=lw, linestyle=ls, label=f"{label} (AUC={res['AUC']:.2f})", color=color, zorder=zorder)
 
     plt.plot([0, 1], [0, 1], color='gray', lw=1.5, linestyle='--', label='Random Guess')
     plt.xlim([0.0, 1.0])
     plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate', fontweight='bold')
-    plt.ylabel('True Positive Rate', fontweight='bold')
-    plt.title(f'ROC Evaluation', fontweight='bold', pad=15)
-    
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curves', fontweight='bold', pad=15)
+
     plt.legend(loc="lower right", frameon=True, framealpha=0.9, edgecolor='gray')
     plt.grid(True, alpha=0.2, linestyle='-')
     
@@ -204,27 +206,32 @@ def plot_success_rates(results, total_n, base_rate, color_map, fig_size, output_
     for res in sorted_results:
         label = res['Metric']
         color = color_map[label]
-        
+        is_ours = "Predicted Affinity" in label
+
         precisions = []
         for t in thresholds:
             n = len(res['y_true'])
             cut = int(n * t)
             if cut == 0: cut = 1
-            
+
             sorted_idx = np.argsort(res['y_score'])[::-1]
             top_binders = res['y_true'].iloc[sorted_idx].values[:cut]
             precision = sum(top_binders) / cut
             precisions.append(precision)
-            
-        plt.plot(indices, precisions, marker='o', linewidth=2.5, markersize=8, 
-                 label=label, color=color)
 
-    plt.axhline(y=base_rate, color='#333333', linestyle='--', linewidth=1.5, label=f"Random ({base_rate:.1%})")
+        lw = 3.5 if is_ours else 2
+        ms = 10 if is_ours else 7
+        ls = '-' if is_ours else '--'
+        plt.plot(indices, precisions, marker='o', linewidth=lw, markersize=ms,
+                 linestyle=ls, label=label, color=color,
+                 zorder=10 if is_ours else 5)
 
-    plt.xticks(indices, threshold_labels, fontsize=12)
-    plt.ylabel("Precision (Success Rate)", fontweight='bold')
-    plt.title("Enrichment Analysis", fontweight='bold', pad=15)
-    
+    plt.axhline(y=base_rate, color='#333333', linestyle=':', linewidth=1.5, label=f"Random ({base_rate:.1%})")
+
+    plt.xticks(indices, threshold_labels)
+    plt.ylabel("Success Rate")
+    plt.title("Success Rate by Selection Stringency", fontweight='bold', pad=15)
+
     plt.legend(loc="lower right", frameon=True, framealpha=0.9, edgecolor='gray')
     
     plt.grid(True, axis='y', alpha=0.2)
@@ -241,7 +248,8 @@ def plot_negated_affinity_scatter(df, binder_threshold, output_dir):
     Result: Top-Right corner contains the best binders (Higher is Better).
     """
     print("\nGenerating Negated Affinity Scatter Plot (Higher is Better)...")
-    
+    setup_slide_style()
+
     # 1. Create Negated Columns (Higher = Better)
     plot_df = df.copy()
     plot_df['neg_log_Aff'] = -1 * plot_df['log_Aff']
@@ -283,8 +291,8 @@ def plot_negated_affinity_scatter(df, binder_threshold, output_dir):
         plt.axvline(x=val, color=line_colors[i], linestyle=':', linewidth=2, 
                     label=f'{label} Cutoff (Score >= {val:.2f})', zorder=1)
         
-        plt.text(val, plt.gca().get_ylim()[1], f'  {label}', 
-                 color=line_colors[i], fontsize=10, rotation=90, verticalalignment='top', zorder=3)
+        plt.text(val, plt.gca().get_ylim()[1], f'  {label}',
+                 color=line_colors[i], fontsize=14, rotation=90, verticalalignment='top', zorder=3)
 
     # 5. Highlight "Golden Corner"
     xmin, xmax = plt.gca().get_xlim()
@@ -294,9 +302,9 @@ def plot_negated_affinity_scatter(df, binder_threshold, output_dir):
     plt.fill_between([top5_val, xmax], neg_binder_threshold, ymax, 
                      color='#009E73', alpha=0.1, zorder=0, label='Ideal Region')
 
-    plt.title("Predicted vs. Experimental Affinity (Negated Scale)", fontweight='bold', pad=20, fontsize=16)
-    plt.xlabel("Negative Predicted Affinity (Higher is Better) ->", fontweight='bold', fontsize=14)
-    plt.ylabel("Negative Experimental log_Aff (Higher is Better) ->", fontweight='bold', fontsize=14)
+    plt.title("Predicted vs. Experimental Affinity", fontweight='bold', pad=20)
+    plt.xlabel("-Predicted Affinity (Higher is Better)")
+    plt.ylabel("-Experimental log_Aff (Higher is Better)")
 
     plt.legend(loc='upper left', frameon=True, framealpha=0.95, shadow=True)
     plt.grid(True, linestyle='-', alpha=0.3)
@@ -307,25 +315,26 @@ def plot_negated_affinity_scatter(df, binder_threshold, output_dir):
     print(f"Saved Negated Scatter Plot: {out_path}")
     plt.close()
 
-def setup_plotting():
-    """Sets specific visual styles for scientific publication"""
+def setup_slide_style():
+    """Sets visual styles sized for presentation slides."""
     sns.set_theme(style="whitegrid", rc={
         'axes.edgecolor': '.15',
         'xtick.bottom': True,
         'ytick.left': True,
-        'grid.linestyle': '--'
+        'grid.linestyle': '--',
+        'grid.alpha': 0.3,
     })
     plt.rcParams.update({
         'font.family': 'sans-serif',
-        'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'Bitstream Vera Sans', 'sans-serif'],
-        'font.size': 12,               
-        'axes.titlesize': 14,         
-        'axes.labelsize': 12,         
-        'xtick.labelsize': 11,
-        'ytick.labelsize': 11,
-        'legend.fontsize': 11,
-        'figure.titlesize': 16,
-        'lines.linewidth': 2.5
+        'font.sans-serif': ['Arial', 'DejaVu Sans'],
+        'font.size': 18,
+        'axes.titlesize': 22,
+        'axes.labelsize': 24,
+        'xtick.labelsize': 16,
+        'ytick.labelsize': 16,
+        'legend.fontsize': 14,
+        'figure.titlesize': 26,
+        'lines.linewidth': 2.5,
     })
 
 if __name__ == "__main__":

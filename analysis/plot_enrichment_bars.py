@@ -88,18 +88,32 @@ def calculate_enrichment_stats(df):
 
     return pd.DataFrame(plot_data), base_rate
 
+def setup_slide_style():
+    """Sets visual styles sized for presentation slides."""
+    sns.set_theme(style="whitegrid", rc={
+        'axes.edgecolor': '.15',
+        'grid.linestyle': '--',
+        'grid.alpha': 0.3,
+    })
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'DejaVu Sans'],
+        'font.size': 18,
+        'axes.titlesize': 22,
+        'axes.labelsize': 24,
+        'xtick.labelsize': 16,
+        'ytick.labelsize': 16,
+        'legend.fontsize': 14,
+        'figure.titlesize': 26,
+        'lines.linewidth': 2.5,
+    })
+
 def plot_grouped_bar(df_plot, base_rate, output_dir):
-    # Setup Scientific Style
-    sns.set_theme(style="white", rc={"axes.grid": True, "grid.linestyle": "--", "grid.alpha": 0.3})
-    plt.figure(figsize=(10, 6))
+    setup_slide_style()
+    plt.figure(figsize=(12, 7))
 
-    # Rename 'predicted_affinity' to 'Ours (Affinity)' for clarity
-    df_plot['Method'] = df_plot['Method'].replace({'predicted_affinity': 'Ours (Affinity)'})
-
-    # Custom Palette
-    # Highlights 'Ours' vs Baselines
-    unique_methods = df_plot['Method'].unique()
-    palette = sns.color_palette("Paired", n_colors=len(df_plot['Selection Stringency'].unique()))
+    # Rename 'predicted_affinity' for clarity
+    df_plot['Method'] = df_plot['Method'].replace({'predicted_affinity': 'Predicted Affinity'})
 
     # Plot
     ax = sns.barplot(
@@ -107,27 +121,31 @@ def plot_grouped_bar(df_plot, base_rate, output_dir):
         x="Method",
         y="% Enriched (<1000nM)",
         hue="Selection Stringency",
-        palette=["#0072B2", "#E69F00", "#D55E00"], # Blue, Orange, Red (Okabe-Ito friendly)
+        palette=["#0072B2", "#E69F00", "#D55E00"],
         edgecolor="black",
         linewidth=1.2,
         capsize=0.05
     )
 
-    # Add Random Baseline Line
-    plt.axhline(y=base_rate, color='gray', linestyle='--', linewidth=2, label=f'Random ({base_rate:.1f}%)')
+    # Highlight 'Predicted Affinity' x-tick label
+    for tick_label in ax.get_xticklabels():
+        if 'Predicted Affinity' in tick_label.get_text():
+            tick_label.set_fontweight('bold')
+            tick_label.set_color('#D55E00')
 
-    # Formatting
-    plt.title("Enrichment of High-Affinity Binders by Method", fontweight='bold', fontsize=14, pad=15)
-    plt.ylabel("% Enriched (<1000nM)", fontweight='bold', fontsize=12)
-    plt.xlabel("Scoring Method", fontweight='bold', fontsize=12)
-    plt.ylim(0, 105) # Keep 0-100% range
-    
-    # Legend
-    plt.legend(title="Filter Stringency", loc='upper left', frameon=True, framealpha=0.9)
-    
+    # Add Random Baseline Line
+    plt.axhline(y=base_rate, color='gray', linestyle=':', linewidth=2, label=f'Random ({base_rate:.1f}%)')
+
+    plt.title("Enrichment of High-Affinity Binders", fontweight='bold', pad=15)
+    plt.ylabel("% Enriched (<1000nM)")
+    plt.xlabel("")
+    plt.ylim(0, 105)
+
+    plt.legend(loc='upper left', frameon=True, framealpha=0.9)
+
     # Add values on top of bars
     for container in ax.containers:
-        ax.bar_label(container, fmt='%.0f%%', padding=3, fontsize=10, fontweight='bold')
+        ax.bar_label(container, fmt='%.0f%%', padding=3, fontsize=12, fontweight='bold')
 
     plt.tight_layout()
     

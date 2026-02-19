@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ProtAff is a protein binding affinity prediction framework built on ESM2 (protein language model) with LoRA fine-tuning. It supports both regression and pairwise ranking tasks across three domains: binding affinity, deep mutational scanning (DMS), and protein-protein interactions (PPI).
+ProtAff is a protein binding affinity prediction framework built on ESM2 (protein language model) with LoRA fine-tuning. It supports both regression and pairwise ranking tasks across two domains: binding affinity and protein-protein interactions (PPI).
 
 ## Commands
 
@@ -36,18 +36,16 @@ There is no test suite, linter configuration, or requirements.txt. Dependencies 
 
 ### Task System
 
-Six tasks configured via `--config-name` in `configs/`:
+Four tasks configured via `--config-name` in `configs/`:
 
 | Config | Task | Loss | Key Metric |
 |--------|------|------|------------|
-| `dms` | DMS regression | MSE | Spearman |
-| `pair_dms` | DMS ranking | Margin ranking | Spearman |
 | `affinity` | Affinity regression | MSE | Spearman |
 | `pair_affinity` | Affinity ranking | Margin ranking | Spearman |
 | `ppi` | PPI regression | MSE | Spearman |
 | `pair_ppi` | PPI ranking | Margin ranking | Spearman |
 
-Each task has a config `configs/<task>.yaml` and a dataset `src/datasets/dataset_<task>.py`. Lightning modules are unified: `RegressionModule` (for dms, affinity, ppi) and `RankingModule` (for pair_dms, pair_affinity, pair_ppi), both inheriting from `BaseModule` in `src/lightning/base_module.py`. The factory `TASK_MAP` in `src/train.py` dispatches based on `task_name`.
+Each task has a config `configs/<task>.yaml` and a dataset `src/datasets/dataset_<task>.py`. Lightning modules are unified: `RegressionModule` (for affinity, ppi) and `RankingModule` (for pair_affinity, pair_ppi), both inheriting from `BaseModule` in `src/lightning/base_module.py`. The factory `TASK_MAP` in `src/train.py` dispatches based on `task_name`.
 
 ### Model Architectures
 
@@ -75,7 +73,7 @@ Data splitting uses group-based strategy (`split_strategy: "group"`) to keep ent
 
 ### Transfer Learning
 
-Two-phase training: pretrain on DMS, then fine-tune on affinity/PPI. Set `pretrained_ckpt_path` in config to load Phase 1 LoRA weights.
+Two-phase training: pretrain on PPI, then fine-tune on affinity. Set `pretrained_ckpt_path` in config to load Phase 1 LoRA weights.
 
 ### Configuration
 

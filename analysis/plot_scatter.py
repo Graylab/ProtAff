@@ -167,38 +167,53 @@ def analyze_and_plot(csv_path):
     # -----------------------------------------------------------
     # 4. Plot (NEGATED values)
     # -----------------------------------------------------------
-    sns.set_theme(style="ticks", context="talk", palette="deep")
-    
+    sns.set_theme(style="whitegrid", rc={
+        'axes.edgecolor': '.15',
+        'grid.linestyle': '--',
+        'grid.alpha': 0.3,
+    })
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'DejaVu Sans'],
+        'font.size': 18,
+        'axes.titlesize': 22,
+        'axes.labelsize': 24,
+        'xtick.labelsize': 16,
+        'ytick.labelsize': 16,
+        'legend.fontsize': 14,
+        'figure.titlesize': 26,
+        'lines.linewidth': 2.5,
+    })
+
     # NEGATING both axes as requested
     x_plot = -y_pred
     y_plot = -y_true
 
     g = sns.JointGrid(x=x_plot, y=y_plot, height=8, ratio=5)
 
-    g.plot_joint(sns.regplot, 
-                 color="#4C72B0",
+    g.plot_joint(sns.regplot,
+                 color="#D55E00",
                  truncate=False,
                  scatter_kws={'alpha': 0.6, 's': 80, 'edgecolor': 'white', 'linewidths': 0.8, 'zorder': 2},
-                 line_kws={'color': "#C44E52", 'alpha': 0.9, 'linewidth': 2.5, 'label': 'Linear Fit', 'zorder': 3})
+                 line_kws={'color': "#C44E52", 'alpha': 0.9, 'linewidth': 3, 'label': 'Linear Fit', 'zorder': 3})
 
-    g.plot_marginals(sns.kdeplot, color="#4C72B0", fill=True, alpha=0.3)
+    g.plot_marginals(sns.kdeplot, color="#D55E00", fill=True, alpha=0.3)
 
-    # UPDATED Labels to reflect negation
     g.set_axis_labels(xlabel="-Predicted Affinity", ylabel="-Ground Truth (log_Aff)")
-    g.ax_joint.grid(True, linestyle='--', linewidth=0.5, alpha=0.5, color='gray')
+    g.ax_joint.grid(True, linestyle='--', linewidth=0.5, alpha=0.3, color='gray')
 
     stats_text = (
         f"Spearman: {spearman_rho:.2f}\n"
         f"RMSE: {rmse:.2f}\n"
-        f"EF @ 10%: {ef_10:.1f}x\n"
+        f"EF@10%: {ef_10:.1f}x\n"
         f"AUC: {auroc:.2f}"
     )
-    
+
     props = dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.95, edgecolor='#d3d3d3')
     g.ax_joint.text(0.05, 0.95, stats_text,
                     transform=g.ax_joint.transAxes,
                     verticalalignment='top', horizontalalignment='left',
-                    bbox=props, fontsize=12, zorder=5)
+                    bbox=props, fontsize=16, zorder=5)
 
     g.ax_joint.legend(loc='lower right', frameon=True, framealpha=0.9)
 

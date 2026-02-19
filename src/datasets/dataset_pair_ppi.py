@@ -10,7 +10,8 @@ from transformers import EsmTokenizer
 from sklearn.model_selection import train_test_split
 from omegaconf import DictConfig
 
-from src.datasets.collators import select_collator
+from src.datasets.collators import select_collator, RegressionTestCollator, BinaryClassificationCollator
+from src.datasets.test_datasets import TestRegressionDataset, BinaryClassificationTestDataset
 from src.datasets.split_utils import group_split
 
 
@@ -162,6 +163,8 @@ class PairPPIDataModule(LightningDataModule):
         self.cfg = cfg
         self.tokenizer = EsmTokenizer.from_pretrained(cfg.model.name)
         self.num_workers = cfg.data.get("num_workers", 4)
+        self.weight_col = cfg.data.get("weight_col", None)
+        self.split_col = self.weight_col if self.weight_col is not None else cfg.data.get("split_col", "protein_a")
 
         # Use shared collators (PPI pairwise now outputs better_binder/better_target/...)
         arch = cfg.model.get("arch", "concat")
@@ -171,6 +174,10 @@ class PairPPIDataModule(LightningDataModule):
 
         self.train_dataset = None
         self.val_dataset = None
+        self.test_dataset = None
+        self.test_collate_fn = None
+        self.binary_test_dataset = None
+        self.binary_test_collate_fn = None
         self.sampler = None
 
     @property
@@ -268,13 +275,129 @@ class PairPPIDataModule(LightningDataModule):
             verbose=self.is_main_process,
             rng=rng,
         )
+
+        # Regression test dataset
+        test_csv = self.cfg.data.get("test_csv", None)
+        if test_csv and os.path.exists(test_csv):
+            if self.is_main_process:
+                print(f"\n[PairPPIDataModule] Loading REGRESSION test set from: {test_csv}")
+
+            # Compute normalization stats from train confidence scores
+            train_confs = train_df["confidence"].dropna()
+            train_mean = float(train_confs.mean())
+            train_std = float(train_confs.std())
+
+            if self.is_main_process:
+                print(f"[PairPPIDataModule] Train normalization stats - Mean: {train_mean:.4f}, Std: {train_std:.4f}")
+
+            self.test_dataset = TestRegressionDataset(
+                test_csv_path=test_csv,
+                provided_stats=(train_mean, train_std),
+                verbose=self.is_main_process,
+            )
+            self.test_collate_fn = RegressionTestCollator(
+                tokenizer=self.tokenizer,
+                arch=self.cfg.model.get("arch", "concat"),
+                max_length=self.cfg.model.max_length,
+            )
+        else:
+            if self.is_main_process:
+                print("\n[PairPPIDataModule] No regression test CSV provided")
+
+        # Binary classification test dataset
+        binary_test_csv = self.cfg.data.get("binary_test_csv", None)
+        if binary_test_csv and os.path.exists(binary_test_csv):
+            if self.is_main_process:
+                print(f"\n[PairPPIDataModule] Loading BINARY CLASSIFICATION test set from: {binary_test_csv}")
+
+            self.binary_test_dataset = BinaryClassificationTestDataset(
+                test_csv_path=binary_test_csv,
+                verbose=self.is_main_process,
+            )
+            self.binary_test_collate_fn = BinaryClassificationCollator(
+                tokenizer=self.tokenizer,
+                arch=self.cfg.model.get("arch", "concat"),
+                max_length=self.cfg.model.max_length,
+            )
+        else:
+            if self.is_main_process:
+                print("\n[PairPPIDataModule] No binary test CSV provided")
+
+        self._setup_sampler(pairs_df)
     
+    def _setup_sampler(self, pairs_df: pd.DataFrame):
+        balance_clusters = self.cfg.data.get("balance_clusters", False)
+        balance_power = self.cfg.data.get("balance_power", 0.5)
+
+        if balance_clusters:
+            if self.is_main_process:
+                print(f"\n[Sampler] Balancing enabled with power={balance_power}")
+
+            # Map protein_a to its group (weight_col or protein_a itself)
+            if self.split_col == "protein_a":
+                protein_to_group = {pid: pid for pid in pairs_df["protein_a"].unique()}
+            else:
+                protein_to_group = pairs_df.drop_duplicates("protein_a").set_index("protein_a")[self.split_col].to_dict()
+
+            # Count group frequency across all pair entries
+            train_groups = []
+            for i in range(len(self.train_dataset)):
+                a1 = self.train_dataset.better_a[i]
+                a2 = self.train_dataset.worse_a[i]
+                g1 = protein_to_group.get(a1, a1)
+                g2 = protein_to_group.get(a2, a2)
+                train_groups.extend([g1, g2])
+
+            group_counts = pd.Series(train_groups).value_counts()
+            if self.is_main_process:
+                print(f"  Top {self.split_col}s in pairs:")
+                print(group_counts.head(5).to_string())
+
+            counts_dict = group_counts.to_dict()
+            pair_weights = []
+
+            for i in range(len(self.train_dataset)):
+                a1 = self.train_dataset.better_a[i]
+                a2 = self.train_dataset.worse_a[i]
+                g1 = protein_to_group.get(a1, a1)
+                g2 = protein_to_group.get(a2, a2)
+                combined_freq = np.sqrt(counts_dict.get(g1, 1) * counts_dict.get(g2, 1))
+                weight = 1.0 / np.power(combined_freq, balance_power)
+                pair_weights.append(weight)
+
+            pair_weights = np.array(pair_weights, dtype=np.float32)
+            if self.is_main_process:
+                print(f"  Weight range: {pair_weights.min():.4f} to {pair_weights.max():.4f}")
+
+            self.sampler = WeightedRandomSampler(
+                weights=pair_weights, num_samples=len(pair_weights), replacement=True
+            )
+        else:
+            if self.is_main_process:
+                print(f"\n[Sampler] Balancing by anchor frequency (legacy)")
+
+            # Default: balance by anchor protein_a frequency
+            all_anchors = self.train_dataset.better_a + self.train_dataset.worse_a
+            anchor_counts = pd.Series(all_anchors).value_counts()
+
+            counts_dict = anchor_counts.to_dict()
+            pair_weights = []
+            for i in range(len(self.train_dataset)):
+                a1 = self.train_dataset.better_a[i]
+                a2 = self.train_dataset.worse_a[i]
+                combined_freq = np.sqrt(counts_dict[a1] * counts_dict[a2])
+                pair_weights.append(1.0 / np.sqrt(combined_freq))
+
+            self.sampler = WeightedRandomSampler(
+                weights=pair_weights, num_samples=len(pair_weights), replacement=True
+            )
+
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
             batch_size=self.cfg.training.batch_size,
             collate_fn=self.collate_fn,
-            shuffle=True,
+            sampler=self.sampler,
             num_workers=self.num_workers,
             pin_memory=True,
         )
@@ -284,6 +407,30 @@ class PairPPIDataModule(LightningDataModule):
             self.val_dataset,
             batch_size=self.cfg.training.batch_size,
             collate_fn=self.collate_fn,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
+
+    def test_dataloader(self):
+        if self.test_dataset is None:
+            return None
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.cfg.training.batch_size,
+            collate_fn=self.test_collate_fn,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
+
+    def binary_test_dataloader(self):
+        if self.binary_test_dataset is None:
+            return None
+        return DataLoader(
+            self.binary_test_dataset,
+            batch_size=self.cfg.training.batch_size,
+            collate_fn=self.binary_test_collate_fn,
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,

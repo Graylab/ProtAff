@@ -1,8 +1,6 @@
 import os
-import torch
 import numpy as np
 import pandas as pd
-from typing import Optional, Tuple
 from omegaconf import DictConfig
 
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
@@ -20,58 +18,48 @@ from src.datasets.split_utils import group_split
 class PairwiseAffinityDataset(Dataset):
     def __init__(self, base_df, lookup_csv_path, pairs_per_sample=2, inter_pps=10,
                  min_margin=1.0, max_anchors_per_target=2000, split_name="DATASET",
-                 verbose=True,
-                 add_negatives=False,
-                 neg_per_positive=1,
-                 neg_log_aff=2.0,
-                 pair_within_source=False,
-                 rng=None):
+                 verbose=True, rng=None):
 
         self.verbose = verbose
-        self.neg_log_aff = neg_log_aff
-        self.pair_within_source = pair_within_source
         self.rng = rng if rng is not None else np.random.default_rng()
 
         lookup_df = pd.read_csv(lookup_csv_path)
         lookup_df['key'] = lookup_df['type'].astype(str) + "_" + lookup_df['id'].astype(str)
         self.id2seq = dict(zip(lookup_df['key'], lookup_df['seq']))
-        
-        self._log(f"\n{'='*25} {split_name} GENERATION {'='*25}")
+
+        self._split_name = split_name
+        self._pairs_per_sample = pairs_per_sample
+        self._inter_pps = inter_pps
+        self._min_margin = min_margin
+        self._max_anchors_per_target = max_anchors_per_target
+
+        # Prepare the filtered+merged DataFrame
         num_df = base_df[base_df['log_Aff'].notna()].copy()
-        
-        # Check if source column exists when pair_within_source is enabled
-        if self.pair_within_source:
-            if 'source' not in num_df.columns:
-                raise KeyError("'source' column not found but pair_within_source=True")
-            self._log(f"[*] Pairing within source: ENABLED")
-            self._log(f"[*] Unique sources: {num_df['source'].nunique()}")
-        
         counts = num_df.groupby('target_id').size().reset_index(name='pocket_size')
         num_df = num_df.merge(counts, on='target_id')
+        self._num_df = num_df
+
+        self._build_pairs()
+
+    def _build_pairs(self):
+        """Generate all pairs from stored DataFrame and parameters."""
+        num_df = self._num_df
+        split_name = self._split_name
+
+        self._log(f"\n{'='*25} {split_name} GENERATION {'='*25}")
         self._log(f"[*] Raw Samples: {len(num_df):,}")
         self._log(f"[*] Unique Targets: {num_df['target_id'].nunique():,}")
-        
+
+        # Clear all pair lists
         self.b_better, self.t_better = [], []
         self.b_worse, self.t_worse = [], []
         self.deltas, self.pair_types = [], []
-        self.aff_better, self.aff_worse = [], []
         self.dropped_pairs = 0
         self.missing_keys = set()
 
-        if self.pair_within_source:
-            # Generate pairs within each source
-            for source_id, source_df in num_df.groupby('source'):
-                self._log(f"\n[*] Processing source: {source_id} ({len(source_df)} samples)")
-                self._generate_intra_target_pairs(source_df, pairs_per_sample, min_margin, max_anchors_per_target)
-                self._generate_inter_target_pairs(source_df, inter_pps)
-        else:
-            # Original behavior: all data together
-            self._generate_intra_target_pairs(num_df, pairs_per_sample, min_margin, max_anchors_per_target)
-            self._generate_inter_target_pairs(num_df, inter_pps)
-
-        # --- PATH 3: Negative Pairs ---
-        if add_negatives:
-            self._add_negative_pairs(num_df, neg_per_positive)
+        # Intra/inter target pairs
+        self._generate_intra_target_pairs(num_df, self._pairs_per_sample, self._min_margin, self._max_anchors_per_target)
+        self._generate_inter_target_pairs(num_df, self._inter_pps)
 
         # Summary
         p_df = pd.DataFrame({'type': self.pair_types})
@@ -147,53 +135,6 @@ class PairwiseAffinityDataset(Dataset):
 
         self._log(f"    Inter-target pairs: {inter_count:,}")
 
-    def _add_negative_pairs(self, num_df, neg_per_positive):
-        self._log(f"\n[*] Generating negative pairs...")
-        self._log(f"    Negatives per target: {neg_per_positive}")
-        self._log(f"    Assumed non-binder log_Aff: {self.neg_log_aff}")
-        
-        target_ids = num_df['target_id'].unique()
-        all_binders = num_df['binder_id'].unique()
-        n_binders = len(all_binders)
-        
-        if len(target_ids) < 2:
-            self._log(f"    Skipping: need at least 2 targets")
-            return
-        
-        best_idx = num_df.groupby('target_id')['log_Aff'].idxmin()
-        target_to_best = {rec['target_id']: rec for rec in num_df.loc[best_idx].to_dict('records')}
-        target_to_binders = num_df.groupby('target_id')['binder_id'].apply(set).to_dict()
-        
-        self._log(f"    Sampling negatives for {len(target_ids):,} targets...")
-        neg_count = 0
-        
-        for tid in target_ids:
-            true_rec = target_to_best[tid]
-            true_binders = target_to_binders[tid]
-            
-            sampled = 0
-            attempts = 0
-            max_attempts = neg_per_positive * 3
-            
-            while sampled < neg_per_positive and attempts < max_attempts:
-                neg_bid = all_binders[self.rng.integers(n_binders)]
-                attempts += 1
-                
-                if neg_bid in true_binders:
-                    continue
-                
-                worse_rec = {
-                    'binder_id': neg_bid,
-                    'target_id': tid,
-                    'log_Aff': self.neg_log_aff
-                }
-                
-                self._append_pair(b_rec=true_rec, w_rec=worse_rec, pair_type='negative')
-                neg_count += 1
-                sampled += 1
-        
-        self._log(f"    Negative pairs: {neg_count:,}")
-
     def _append_pair(self, b_rec, w_rec, pair_type: str):
         # Filter out pairs where any sequence is missing
         keys = [
@@ -212,8 +153,6 @@ class PairwiseAffinityDataset(Dataset):
         self.t_worse.append(w_rec['target_id'])
         self.deltas.append(abs(w_rec['log_Aff'] - b_rec['log_Aff']))
         self.pair_types.append(pair_type)
-        self.aff_better.append(b_rec['log_Aff'])
-        self.aff_worse.append(w_rec['log_Aff'])
 
     def _log(self, msg: str):
         if self.verbose:
@@ -231,8 +170,6 @@ class PairwiseAffinityDataset(Dataset):
             "delta": self.deltas[idx],
             "better_target_id": self.t_better[idx],
             "worse_target_id": self.t_worse[idx],
-            "better_log_aff": self.aff_better[idx],
-            "worse_log_aff": self.aff_worse[idx],
             "better_binder_id": self.b_better[idx],
             "worse_binder_id": self.b_worse[idx],
         }
@@ -254,7 +191,7 @@ class PairAffinityDataModule(LightningDataModule):
         self.num_workers = cfg.data.get("num_workers", 4)
         self.weight_col = self.cfg.data.get("weight_col")
         self.split_col = self.weight_col if self.weight_col is not None else "target_id"
-        
+
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
@@ -313,10 +250,6 @@ class PairAffinityDataModule(LightningDataModule):
             max_anchors_per_target=self.cfg.data.get("max_anchors_per_target", 2000),
             split_name="TRAIN",
             verbose=self.is_main_process,
-            add_negatives=self.cfg.data.get("add_negatives", False),
-            neg_per_positive=self.cfg.data.get("neg_per_positive", 1),
-            neg_log_aff=self.cfg.data.get("neg_log_aff", 2.0),
-            pair_within_source=self.cfg.data.get("pair_within_source", False),
             rng=rng,
         )
 
@@ -326,10 +259,6 @@ class PairAffinityDataModule(LightningDataModule):
             inter_pps=5,
             split_name="VAL",
             verbose=self.is_main_process,
-            add_negatives=self.cfg.data.get("add_negatives", False),
-            neg_per_positive=self.cfg.data.get("neg_per_positive", 1),
-            neg_log_aff=self.cfg.data.get("neg_log_aff", 2.0),
-            pair_within_source=self.cfg.data.get("pair_within_source", False),
             rng=rng,
         )
         
@@ -452,8 +381,8 @@ class PairAffinityDataModule(LightningDataModule):
 
     def train_dataloader(self):
         return DataLoader(
-            self.train_dataset, batch_size=self.cfg.training.batch_size, 
-            collate_fn=self.collate_fn, sampler=self.sampler, 
+            self.train_dataset, batch_size=self.cfg.training.batch_size,
+            collate_fn=self.collate_fn, sampler=self.sampler,
             num_workers=self.num_workers, pin_memory=True
         )
 
