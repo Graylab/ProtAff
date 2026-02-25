@@ -11,7 +11,7 @@ GT_CSV = "data/binder/test_design.csv"
 
 METRICS_CONFIG = {
     'AF3 ipSAE': ('af3_ipSAE_min', False),    # Higher is better
-    'Predicted Affinity': ('predicted_affinity', True), # Lower is better
+    'Predicted Affinity': ('predicted_affinity', False), # Higher is better
 }
 
 PLOT_SETTINGS = {

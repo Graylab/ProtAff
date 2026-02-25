@@ -33,7 +33,8 @@ class TestRegressionDataset(Dataset):
     def __getitem__(self, idx):
         row = self.data[idx]
         raw_aff = float(row["log_Aff"])
-        norm_aff = (raw_aff - self.mean) / (self.std + 1e-8)
+        # Negate so predicted_affinity is higher = better (log_Kd is lower = better)
+        norm_aff = -((raw_aff - self.mean) / (self.std + 1e-8))
 
         return {
             "binder_seq": str(row["binder_sequence"]),

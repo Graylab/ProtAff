@@ -83,20 +83,36 @@ class BestModelSaver(Callback):
                 f.write(f"Best Model Metadata\n{'='*50}\n")
                 for key, value in metadata.items():
                     f.write(f"{key}: {value}\n")
-    
-    def _save_model(self, pl_module):
+
+        # Always save the latest model after each validation
+        self._save_last_model(trainer, pl_module)
+
+    def _save_last_model(self, trainer, pl_module):
+        if not trainer.is_global_zero or trainer.sanity_checking:
+            return
+        last_save_path = os.path.join(self.output_dir, "saved_model_last")
+        os.makedirs(last_save_path, exist_ok=True)
+        print(f"\n[BestModelSaver] Saving last model to: {last_save_path}")
+        self._save_model(pl_module, last_save_path)
+
+    def on_train_end(self, trainer, pl_module):
+        self._save_last_model(trainer, pl_module)
+
+    def _save_model(self, pl_module, save_path=None):
+        if save_path is None:
+            save_path = self.save_path
         try:
             if hasattr(pl_module.model, "save_pretrained"):
-                pl_module.model.save_pretrained(self.save_path)
+                pl_module.model.save_pretrained(save_path)
             elif hasattr(pl_module.model, "base_model") and hasattr(pl_module.model.base_model, "save_pretrained"):
-                pl_module.model.base_model.save_pretrained(self.save_path)
+                pl_module.model.base_model.save_pretrained(save_path)
             else:
                 print("[WARN] Could not find 'save_pretrained' method on model.")
                 return
-            
-            self.tokenizer.save_pretrained(self.save_path)
-            print(f"[BestModelSaver] ✓ Model and tokenizer saved successfully")
-            
+
+            self.tokenizer.save_pretrained(save_path)
+            print(f"[BestModelSaver] ✓ Model and tokenizer saved to {save_path}")
+
         except Exception as e:
             print(f"[ERROR] Failed to save model: {e}")
             raise
@@ -233,7 +249,7 @@ class BinaryTestCallback(Callback):
             if len(group) < 2 or group['is_binder'].nunique() < 2:
                 continue
             
-            neg_scores = -np.array(group['score'].values) # Lower is better
+            neg_scores = np.array(group['score'].values)  # Higher is better
             labels = group['is_binder'].values
             
             try:

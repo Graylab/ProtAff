@@ -28,17 +28,18 @@ class RankingModule(BaseModule):
         print(f"[RankingModule] Loss: {self.loss_type}, Margin: {self.margin}")
 
     def _compute_loss(self, scores_better, scores_worse, delta=None):
+        # Convention: scores_better > scores_worse (higher predicted_affinity = better binder)
         if self.loss_type == "margin":
-            target = torch.full_like(scores_better, -1.0)
+            target = torch.full_like(scores_better, 1.0)
             return self.rank_loss(scores_better, scores_worse, target)
 
         elif self.loss_type in ["soft_margin", "bce"]:
-            diff = scores_worse - scores_better
+            diff = scores_better - scores_worse
             target = torch.ones_like(diff)
             return self.rank_loss(diff, target)
 
         elif self.loss_type == "margin_weighted":
-            target = torch.full_like(scores_better, -1.0)
+            target = torch.full_like(scores_better, 1.0)
             loss = F.margin_ranking_loss(
                 scores_better, scores_worse, target,
                 margin=self.margin, reduction="none"
@@ -48,13 +49,13 @@ class RankingModule(BaseModule):
             return loss.mean()
 
         elif self.loss_type == "contrastive":
-            diff = scores_worse - scores_better
+            diff = scores_better - scores_worse
             temp = getattr(self.cfg.training, "temperature", 0.1)
             return -torch.log(torch.sigmoid(diff / temp) + 1e-8).mean()
 
         else:
             # Fallback: standard margin
-            target = torch.full_like(scores_better, -1.0)
+            target = torch.full_like(scores_better, 1.0)
             return self.rank_loss(scores_better, scores_worse, target)
 
     def forward(self, batch, prefix="better"):
@@ -72,7 +73,7 @@ class RankingModule(BaseModule):
 
         delta = batch.get("delta", None)
         loss = self._compute_loss(scores_better, scores_worse, delta)
-        accuracy = (scores_better < scores_worse).float().mean()
+        accuracy = (scores_better > scores_worse).float().mean()
 
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("train_acc", accuracy, on_epoch=True, prog_bar=True, sync_dist=True)
@@ -84,7 +85,7 @@ class RankingModule(BaseModule):
 
         delta = batch.get("delta", None)
         loss = self._compute_loss(scores_better, scores_worse, delta)
-        accuracy = (scores_better < scores_worse).float().mean()
+        accuracy = (scores_better > scores_worse).float().mean()
 
         self.log("val_loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("val_acc", accuracy, on_epoch=True, prog_bar=True, sync_dist=True)

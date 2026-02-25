@@ -53,8 +53,7 @@ def analyze_enrichment(pred_csv, output_dir, gt_csv, struct_csv, binder_threshol
     # 2. Define Binary Class
     merged_df['is_binder'] = (merged_df['log_Aff'] <= binder_threshold).astype(int)
     
-    # Transform scores (Higher = Better)
-    merged_df['neg_predicted_affinity'] = -1 * merged_df['predicted_affinity']
+    # predicted_affinity is already higher = better
 
     num_binders = merged_df['is_binder'].sum()
     total_samples = len(merged_df)
@@ -76,7 +75,7 @@ def analyze_enrichment(pred_csv, output_dir, gt_csv, struct_csv, binder_threshol
     eval_metrics = []
     for m in available_metrics:
         eval_metrics.append((f"{m} ({SELECTED_AGG})", m, True))
-    eval_metrics.append(("Predicted Affinity", "neg_predicted_affinity", False))
+    eval_metrics.append(("Predicted Affinity", "predicted_affinity", False))
 
     # --- DEFINE RESEARCH PAPER COLORS ---
     research_colors = [
@@ -244,30 +243,29 @@ def plot_success_rates(results, total_n, base_rate, color_map, fig_size, output_
 
 def plot_negated_affinity_scatter(df, binder_threshold, output_dir):
     """
-    Plots (-Predicted) vs (-log_Aff). 
-    Result: Top-Right corner contains the best binders (Higher is Better).
+    Plots predicted_affinity vs (-log_Aff).
+    Result: Top-Right corner contains the best binders (Higher is Better for both axes).
     """
-    print("\nGenerating Negated Affinity Scatter Plot (Higher is Better)...")
+    print("\nGenerating Affinity Scatter Plot (Higher is Better)...")
     setup_slide_style()
 
-    # 1. Create Negated Columns (Higher = Better)
+    # 1. Create columns (Higher = Better)
     plot_df = df.copy()
     plot_df['neg_log_Aff'] = -1 * plot_df['log_Aff']
-    plot_df['neg_pred_Aff'] = -1 * plot_df['predicted_affinity']
-    
+
     neg_binder_threshold = -1 * binder_threshold
 
-    # 2. Calculate Top N% Cutoffs (Sort Descending)
-    df_sorted = plot_df.sort_values(by='neg_pred_Aff', ascending=False)
+    # 2. Calculate Top N% Cutoffs (Sort Descending by predicted_affinity)
+    df_sorted = plot_df.sort_values(by='predicted_affinity', ascending=False)
     total_n = len(df_sorted)
-    
+
     thresholds_pct = [0.05, 0.10, 0.20, 0.50]
     cutoff_map = {}
-    
+
     for t in thresholds_pct:
         cutoff_idx = int(total_n * t)
         if cutoff_idx >= total_n: cutoff_idx = total_n - 1
-        val = df_sorted.iloc[cutoff_idx]['neg_pred_Aff']
+        val = df_sorted.iloc[cutoff_idx]['predicted_affinity']
         cutoff_map[f"Top {int(t*100)}%"] = val
 
     # 3. Plot Setup
@@ -276,21 +274,21 @@ def plot_negated_affinity_scatter(df, binder_threshold, output_dir):
 
     # Scatter
     sns.scatterplot(
-        data=plot_df, x='neg_pred_Aff', y='neg_log_Aff',
+        data=plot_df, x='predicted_affinity', y='neg_log_Aff',
         hue='Label', palette={'True Binder': '#D55E00', 'Non-Binder': '#0072B2'},
         style='Label', markers={'True Binder': 'o', 'Non-Binder': 'X'},
         alpha=0.6, s=80, edgecolor='w', linewidth=0.5, zorder=2
     )
 
     # 4. Reference Lines
-    plt.axhline(y=neg_binder_threshold, color='#CC79A7', linestyle='--', linewidth=2.5, 
+    plt.axhline(y=neg_binder_threshold, color='#CC79A7', linestyle='--', linewidth=2.5,
                 label=f'GT Threshold (pKd >= {neg_binder_threshold})', zorder=1)
 
-    line_colors = ['#009E73', '#E69F00', '#56B4E9', '#333333'] 
+    line_colors = ['#009E73', '#E69F00', '#56B4E9', '#333333']
     for i, (label, val) in enumerate(cutoff_map.items()):
-        plt.axvline(x=val, color=line_colors[i], linestyle=':', linewidth=2, 
+        plt.axvline(x=val, color=line_colors[i], linestyle=':', linewidth=2,
                     label=f'{label} Cutoff (Score >= {val:.2f})', zorder=1)
-        
+
         plt.text(val, plt.gca().get_ylim()[1], f'  {label}',
                  color=line_colors[i], fontsize=14, rotation=90, verticalalignment='top', zorder=3)
 
@@ -298,12 +296,12 @@ def plot_negated_affinity_scatter(df, binder_threshold, output_dir):
     xmin, xmax = plt.gca().get_xlim()
     ymin, ymax = plt.gca().get_ylim()
     top5_val = cutoff_map["Top 5%"]
-    
-    plt.fill_between([top5_val, xmax], neg_binder_threshold, ymax, 
+
+    plt.fill_between([top5_val, xmax], neg_binder_threshold, ymax,
                      color='#009E73', alpha=0.1, zorder=0, label='Ideal Region')
 
     plt.title("Predicted vs. Experimental Affinity", fontweight='bold', pad=20)
-    plt.xlabel("-Predicted Affinity (Higher is Better)")
+    plt.xlabel("Predicted Affinity (Higher is Better)")
     plt.ylabel("-Experimental log_Aff (Higher is Better)")
 
     plt.legend(loc='upper left', frameon=True, framealpha=0.95, shadow=True)

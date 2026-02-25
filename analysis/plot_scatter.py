@@ -18,49 +18,37 @@ from sklearn.metrics import (
 # Configuration
 # ---------------------
 
-# Set to True for log(Kd) or dG (where -9 is better than -5)
-# Set to False for pKd or Affinity Score (where 9 is better than 5)
-LOWER_IS_BETTER = True 
-
-# Set your manual threshold here (e.g., -9.0 for tight binding)
+# Set your manual threshold here in -log_Aff units (e.g., 9.0 for Kd ~ 1nM)
 # If set to None, it will default to Top 10%
-BINARY_THRESHOLD = 3
+BINARY_THRESHOLD = -3
 
 # ---------------------
 
 def calculate_enrichment_factor(y_true, y_pred, top_percent, binary_threshold):
     """
-    Calculates EF based on sorting order defined by LOWER_IS_BETTER.
+    Calculates EF. y_true is -log_Aff (higher = better binder).
+    Predictions are sorted descending (highest predicted affinity first).
     """
     n_total = len(y_true)
     n_top = int(n_total * (top_percent / 100.0))
     if n_top == 0: n_top = 1
 
     # 1. Identify Actives (True Binders)
-    if LOWER_IS_BETTER:
-        actives_mask = y_true <= binary_threshold
-    else:
-        actives_mask = y_true >= binary_threshold
-
+    actives_mask = y_true >= binary_threshold
     total_actives = actives_mask.sum()
     background_rate = total_actives / n_total
 
     if total_actives == 0: return 0.0
 
-    # 2. Sort Predictions
-    if LOWER_IS_BETTER:
-        # Sort Ascending (Lowest predicted values come first)
-        sorted_indices = np.argsort(y_pred)
-    else:
-        # Sort Descending (Highest predicted values come first)
-        sorted_indices = np.argsort(y_pred)[::-1]
+    # 2. Sort Predictions Descending (Highest predicted affinity = best rank)
+    sorted_indices = np.argsort(y_pred)[::-1]
 
     # 3. Select Top K
     top_indices = sorted_indices[:n_top]
-    
+
     # 4. Count Hits
     hits_in_top = actives_mask[top_indices].sum()
-    
+
     # 5. Calculate EF
     selection_rate = hits_in_top / n_top
     return selection_rate / background_rate
@@ -78,7 +66,7 @@ def analyze_and_plot(csv_path):
         print(f"[Error] CSV must contain 'log_Aff' and 'predicted_affinity'. Found: {df.columns.tolist()}")
         return
 
-    y_true = df["log_Aff"].values
+    y_true = -df["log_Aff"].values
     y_pred = df["predicted_affinity"].values
     
     output_dir = os.path.dirname(csv_path)
@@ -103,23 +91,13 @@ def analyze_and_plot(csv_path):
         used_threshold = BINARY_THRESHOLD
         print(f"[Config] Using MANUAL threshold: {used_threshold}")
     else:
-        # Fallback to percentile logic
-        if LOWER_IS_BETTER:
-            used_threshold = np.percentile(y_true, 10) 
-            print(f"[Config] Lower is Better. Using calculated 10th percentile: {used_threshold:.2f}")
-        else:
-            used_threshold = np.percentile(y_true, 90)
-            print(f"[Config] Higher is Better. Using calculated 90th percentile: {used_threshold:.2f}")
+        used_threshold = np.percentile(y_true, 90)
+        print(f"[Config] Using calculated 90th percentile: {used_threshold:.2f}")
 
-    # Logic: Define Actives based on threshold
-    if LOWER_IS_BETTER:
-        print(f"[Config] 'Good' defined as log_Aff <= {used_threshold:.2f}")
-        y_bin = (y_true <= used_threshold).astype(int)
-        y_score_for_auc = -y_pred # Invert for sklearn AUC
-    else:
-        print(f"[Config] 'Good' defined as log_Aff >= {used_threshold:.2f}")
-        y_bin = (y_true >= used_threshold).astype(int)
-        y_score_for_auc = y_pred
+    # Logic: Define Actives based on threshold (-log_Aff >= threshold = good binder)
+    print(f"[Config] 'Good' defined as -log_Aff >= {used_threshold:.2f}")
+    y_bin = (y_true >= used_threshold).astype(int)
+    y_score_for_auc = y_pred
 
     # AUC Scores
     if len(np.unique(y_bin)) > 1:
@@ -185,9 +163,9 @@ def analyze_and_plot(csv_path):
         'lines.linewidth': 2.5,
     })
 
-    # NEGATING both axes as requested
-    x_plot = -y_pred
-    y_plot = -y_true
+    # x = predicted_affinity (higher=better), y = -log_Aff (higher=better)
+    x_plot = y_pred
+    y_plot = y_true
 
     g = sns.JointGrid(x=x_plot, y=y_plot, height=8, ratio=5)
 
@@ -199,7 +177,7 @@ def analyze_and_plot(csv_path):
 
     g.plot_marginals(sns.kdeplot, color="#D55E00", fill=True, alpha=0.3)
 
-    g.set_axis_labels(xlabel="-Predicted Affinity", ylabel="-Ground Truth (log_Aff)")
+    g.set_axis_labels(xlabel="Predicted Affinity (Higher is Better)", ylabel="-log_Aff (Higher is Better)")
     g.ax_joint.grid(True, linestyle='--', linewidth=0.5, alpha=0.3, color='gray')
 
     stats_text = (

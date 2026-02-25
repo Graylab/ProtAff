@@ -6,7 +6,7 @@ Columns:
   - binder_seq:          binder sequence as heavy:light chain
   - target_seq:          target protein sequence
   - fitness:             experimental fitness (lower = better; NaN for unlabeled)
-  - predicted_affinity:  model prediction (lower = better, like log_Kd)
+  - predicted_affinity:  model prediction (higher = better)
 
 Use --prepare to regenerate data/az_collab/predict_input.csv before analysis.
 """
@@ -107,7 +107,7 @@ def setup_style():
 
 
 def calculate_ef(y_true, y_pred, top_pct, threshold):
-    """Enrichment factor: lower pred → higher rank (predicted_affinity is lower-is-better)."""
+    """Enrichment factor: higher pred → higher rank (predicted_affinity is higher-is-better)."""
     n_total = len(y_true)
     n_top = max(1, int(n_total * top_pct / 100))
     actives = (y_true <= threshold)
@@ -115,7 +115,7 @@ def calculate_ef(y_true, y_pred, top_pct, threshold):
     if total_actives == 0:
         return 0.0
     bg_rate = total_actives / n_total
-    top_idx = np.argsort(y_pred)[:n_top]   # ascending: low pred first = best predicted binder
+    top_idx = np.argsort(y_pred)[::-1][:n_top]  # descending: high pred first = best predicted binder
     hits = actives.iloc[top_idx].sum()
     return (hits / n_top) / bg_rate
 
@@ -137,9 +137,9 @@ def analyze(csv_path, output_dir):
     # ------------------------------------------------------------------
     y_true = labeled['fitness']
     y_pred = labeled['predicted_affinity']
-    y_score = -y_pred  # higher = better binder (for AUROC/AUPRC/EF)
+    y_score = y_pred  # higher predicted_affinity = better binder (for AUROC/AUPRC/EF)
 
-    # Both lower-is-better: correlate y_true vs y_pred directly (positive = model works)
+    # fitness is lower-is-better; predicted_affinity is higher-is-better → expect negative correlation
     pearson_r, pearson_p = stats.pearsonr(y_true, y_pred)
     spearman_rho, spearman_p = stats.spearmanr(y_true, y_pred)
     kendall_tau, _ = stats.kendalltau(y_true, y_pred)
@@ -210,7 +210,7 @@ def analyze(csv_path, output_dir):
         line_kws={'color': "#C44E52", 'alpha': 0.9, 'linewidth': 3, 'zorder': 3},
     )
     g.plot_marginals(sns.kdeplot, color="#D55E00", fill=True, alpha=0.3)
-    g.set_axis_labels(xlabel="Predicted Affinity (lower = better)", ylabel="Fitness (lower = better)")
+    g.set_axis_labels(xlabel="Predicted Affinity (higher = better)", ylabel="Fitness (lower = better)")
     g.ax_joint.grid(True, linestyle='--', linewidth=0.5, alpha=0.3)
 
     stats_text = (
@@ -255,7 +255,7 @@ def analyze(csv_path, output_dir):
     # 4. Top predictions (unlabeled), sorted by predicted_affinity
     # ------------------------------------------------------------------
     if len(unlabeled) > 0:
-        top_unlabeled = unlabeled.sort_values('predicted_affinity', ascending=True).head(50)  # lowest = best
+        top_unlabeled = unlabeled.sort_values('predicted_affinity', ascending=False).head(50)  # highest = best
         top_path = os.path.join(output_dir, "top50_unlabeled_predictions.csv")
         top_unlabeled[['id', 'predicted_affinity']].to_csv(top_path, index=False)
         print(f"  Saved top-50   -> {top_path}")

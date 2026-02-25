@@ -20,7 +20,7 @@ METRIC_DIRECTIONS = {
     'pDockQ': True,
     'pDockQ2': True,
     'LIS': True,
-    'predicted_affinity': False # Usually Lower Kd/Energy is better
+    'predicted_affinity': True  # Higher predicted affinity = better binder
 }
 # =================================================
 

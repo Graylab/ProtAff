@@ -68,9 +68,8 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
     merged_df = pd.merge(grouped_df, gt_df[['id', 'log_Aff']], on='id', how='inner')
     merged_df = pd.merge(merged_df, aff_pred_df[['id', 'predicted_affinity']], on='id', how='inner')
 
-    # Transformation
+    # Transformation: negate log_Aff so higher = better binding
     merged_df['neg_log_Aff'] = -1 * merged_df['log_Aff']
-    merged_df['neg_predicted_affinity'] = -1 * merged_df['predicted_affinity']
 
     n_samples = len(merged_df)
     print(f"Merged {n_samples} targets.")
@@ -91,7 +90,7 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
         plot_targets = []
         for m in available_metrics:
             plot_targets.append((f"{m}_{agg}", f"{m} ({agg})"))
-        plot_targets.append(('neg_predicted_affinity', 'Predicted Affinity'))
+        plot_targets.append(('predicted_affinity', 'Predicted Affinity'))
 
         for i, (col_name, label) in enumerate(plot_targets):
             if i >= len(axes): break
@@ -133,7 +132,7 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
 
             ax.set_title(label, fontsize=22, fontweight='bold', pad=15,
                          color='#D55E00' if is_ours else 'black')
-            ax.set_xlabel("-Predicted Affinity" if is_ours else label)
+            ax.set_xlabel("Predicted Affinity" if is_ours else label)
             ax.set_ylabel("-Ground Truth log_Aff")
 
         out_img_path = os.path.join(output_dir, f"correlation_{agg}_final.png")
@@ -151,7 +150,7 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
 
         comparison_tasks = [
             (ipsae_min_col, "ipSAE (min)", ax1, False),
-            ('neg_predicted_affinity', "Predicted Affinity", ax2, True)
+            ('predicted_affinity', "Predicted Affinity", ax2, True)
         ]
 
         for col, title, ax, is_ours in comparison_tasks:
@@ -181,7 +180,7 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
             ax.set_title(title, fontsize=22, fontweight='bold', pad=20,
                          color='#D55E00' if is_ours else 'black')
             ax.set_ylabel("-Ground Truth log_Aff")
-            ax.set_xlabel(f"-Predicted Affinity" if is_ours else col)
+            ax.set_xlabel("Predicted Affinity" if is_ours else col)
             ax.grid(True, linestyle='--', alpha=0.3)
 
         plt.tight_layout()

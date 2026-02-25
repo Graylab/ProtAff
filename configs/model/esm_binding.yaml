@@ -9,6 +9,7 @@ d_model: 256
 n_heads: 8
 n_cross_layers: 2
 dropout: 0.1
+sparse_topk: 0  # 0 = dense attention; >0 = sparse top-k cross-attention (per query position)
 
 # LoRA
 lora:

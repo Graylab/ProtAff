@@ -174,6 +174,7 @@ class ESMBindingModel(nn.Module):
       1. Pretraining: binary bind/no-bind classification
       2. Finetuning: scalar affinity score for marginal ranking
     Uni-directional: binder attends to target only.
+    Set sparse_topk > 0 in config to use sparse top-k cross-attention.
     """
 
     def __init__(self, model_name, cfg: DictConfig):
@@ -185,13 +186,18 @@ class ESMBindingModel(nn.Module):
         n_heads = getattr(cfg.model, "n_heads", 8)
         n_layers = getattr(cfg.model, "n_cross_layers", 2)
         dropout = getattr(cfg.model, "dropout", 0.1)
+        sparse_topk = getattr(cfg.model, "sparse_topk", 0)
 
         self.input_proj = nn.Linear(hidden_dim, d_model)
         self.input_norm = nn.LayerNorm(d_model)
 
+        def _make_cross_layer():
+            if sparse_topk > 0:
+                return SparseUniCrossAttnBlock(d_model, n_heads, dropout, sparse_topk)
+            return UniCrossAttnBlock(d_model, n_heads, dropout)
+
         self.cross_layers = nn.ModuleList([
-            UniCrossAttnBlock(d_model, n_heads, dropout)
-            for _ in range(n_layers)
+            _make_cross_layer() for _ in range(n_layers)
         ])
 
         self.pool = AttnPool(d_model)
@@ -284,6 +290,73 @@ class UniCrossAttnBlock(nn.Module):
         q = q + self.dropout(q_out)
         q = q + self.ffn(q)
         return q, attn_weights
+
+
+class SparseUniCrossAttnBlock(nn.Module):
+    """
+    Sparse uni-directional cross-attention: each query position attends to only
+    the top-k key positions by attention score. Implemented manually to allow
+    per-position top-k masking. Interface matches UniCrossAttnBlock.
+    """
+
+    def __init__(self, d_model, n_heads, dropout, sparse_topk):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.sparse_topk = sparse_topk
+        self.scale = self.head_dim ** -0.5
+
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, q, kv, kv_mask):
+        B, Lq, D = q.shape
+        Lkv = kv.shape[1]
+        H, Dh = self.n_heads, self.head_dim
+
+        q_normed = self.norm_q(q)
+        kv_normed = self.norm_kv(kv)
+
+        Q = self.q_proj(q_normed).reshape(B, Lq, H, Dh).transpose(1, 2)    # (B, H, Lq, Dh)
+        K = self.k_proj(kv_normed).reshape(B, Lkv, H, Dh).transpose(1, 2)  # (B, H, Lkv, Dh)
+        V = self.v_proj(kv_normed).reshape(B, Lkv, H, Dh).transpose(1, 2)  # (B, H, Lkv, Dh)
+
+        scores = (Q @ K.transpose(-2, -1)) * self.scale  # (B, H, Lq, Lkv)
+
+        # Mask padding positions before top-k selection
+        if kv_mask is not None:
+            scores = scores.masked_fill(~kv_mask.bool()[:, None, None, :], float('-inf'))
+
+        # Top-k sparsification: zero out scores below the k-th largest per query
+        k_actual = min(self.sparse_topk, Lkv)
+        topk_threshold = scores.topk(k_actual, dim=-1).values[..., -1:]  # (B, H, Lq, 1)
+        scores = scores.masked_fill(scores < topk_threshold, float('-inf'))
+
+        attn_weights = torch.softmax(scores, dim=-1)           # (B, H, Lq, Lkv)
+        attn_weights = torch.nan_to_num(attn_weights, nan=0.0) # guard all-padding rows
+        attn_weights = self.attn_dropout(attn_weights)
+
+        out = (attn_weights @ V).transpose(1, 2).reshape(B, Lq, D)
+        out = self.out_proj(out)
+
+        q = q + self.dropout(out)
+        q = q + self.ffn(q)
+        return q, attn_weights.mean(dim=1)  # averaged across heads for inspection
 
 
 class BiCrossAttnBlock(nn.Module):
