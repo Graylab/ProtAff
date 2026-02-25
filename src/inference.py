@@ -12,7 +12,7 @@ from torch.utils.data import Dataset, DataLoader
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from src.models import build_model
-from src.datasets.collators import CROSS_ATTN_ARCHS, select_collator
+from src.datasets.collators import select_collator
 from transformers import EsmTokenizer
 from peft import PeftModel
 
@@ -81,25 +81,18 @@ def load_model(cfg, device):
     return model.to(device).eval()
 
 
-def run_inference(model, dataloader, arch, device, binding_head="affinity"):
+def run_inference(model, dataloader, device):
     """Run model inference and return predictions."""
-    is_cross_attn = arch in CROSS_ATTN_ARCHS
     predictions = []
 
     with torch.no_grad():
         for batch in tqdm(dataloader):
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            if is_cross_attn:
-                kwargs = dict(
-                    binder_ids=batch["binder_ids"], binder_mask=batch["binder_mask"],
-                    target_ids=batch["target_ids"], target_mask=batch["target_mask"],
-                )
-                if arch == "binding":
-                    kwargs["task"] = binding_head
-                outputs = model(**kwargs)
-            else:
-                outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+            outputs = model(
+                binder_ids=batch["binder_ids"], binder_mask=batch["binder_mask"],
+                target_ids=batch["target_ids"], target_mask=batch["target_mask"],
+            )
 
             predictions.extend(outputs.reshape(-1).float().cpu().numpy().tolist())
 
@@ -112,8 +105,7 @@ def run_inference(model, dataloader, arch, device, binding_head="affinity"):
 @hydra.main(version_base=None, config_path="../configs", config_name="inference")
 def main(cfg: DictConfig):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    arch = cfg.model.get("arch", "concat")
-    print(f"[System] Device: {device} | Architecture: {arch}")
+    print(f"[System] Device: {device}")
 
     input_path = Path(cfg.input_csv)
     model_path = Path(cfg.model_path)
@@ -123,16 +115,15 @@ def main(cfg: DictConfig):
     tokenizer = EsmTokenizer.from_pretrained(cfg.model.name)
 
     df = pd.read_csv(input_path)
-    max_length = cfg.model.get("max_length", 2048 if arch == "concat" else 1024)
+    max_length = cfg.model.get("max_length", 1024)
     dataloader = DataLoader(
         InferenceDataset(df),
         batch_size=cfg.get("batch_size", 16),
-        collate_fn=select_collator(arch, tokenizer, max_length, mode="inference"),
+        collate_fn=select_collator(tokenizer, max_length, mode="inference"),
         num_workers=cfg.get("num_workers", 0),
     )
 
-    binding_head = cfg.model.get("binding_head", "affinity")
-    predictions = run_inference(model, dataloader, arch, device, binding_head=binding_head)
+    predictions = run_inference(model, dataloader, device)
     df["predicted_affinity"] = predictions
     df.to_csv(output_path, index=False)
     print(f"[SUCCESS] Results saved to: {output_path}")

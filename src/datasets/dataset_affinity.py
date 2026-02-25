@@ -97,8 +97,7 @@ class AffinityDataModule(LightningDataModule):
         self.tokenizer = EsmTokenizer.from_pretrained(cfg.model.name)
         self.num_workers = cfg.data.num_workers if cfg.data.num_workers is not None else os.cpu_count()
         
-        arch = self.cfg.model.get("arch", "concat")
-        self.collate_fn = select_collator(arch, self.tokenizer, self.cfg.model.max_length, mode="regression")
+        self.collate_fn = select_collator(self.tokenizer, self.cfg.model.max_length, mode="regression")
         print(f"[DataModule] Initializing {type(self.collate_fn).__name__}")
         
         self.weight_col = self.cfg.data.get("weight_col")
@@ -183,7 +182,6 @@ class AffinityDataModule(LightningDataModule):
             )
             self.binary_test_collate_fn = BinaryClassificationCollator(
                 tokenizer=self.tokenizer,
-                arch=self.cfg.model.get("arch", "concat"),
                 max_length=self.cfg.model.max_length,
             )
         else:

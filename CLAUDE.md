@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ProtAff is a protein binding affinity prediction framework built on ESM2 (protein language model) with LoRA fine-tuning. It supports both regression and pairwise ranking tasks across two domains: binding affinity and protein-protein interactions (PPI).
+ProtAff is a protein binding affinity prediction framework built on ESM2 (protein language model) with LoRA fine-tuning. It supports both regression and pairwise ranking tasks for binding affinity prediction.
 
 ## Commands
 
@@ -36,36 +36,30 @@ There is no test suite, linter configuration, or requirements.txt. Dependencies 
 
 ### Task System
 
-Four tasks configured via `--config-name` in `configs/`:
+Two tasks configured via `--config-name` in `configs/`:
 
 | Config | Task | Loss | Key Metric |
 |--------|------|------|------------|
 | `affinity` | Affinity regression | MSE | Spearman |
 | `pair_affinity` | Affinity ranking | Margin ranking | Spearman |
-| `ppi` | PPI regression | MSE | Spearman |
-| `pair_ppi` | PPI ranking | Margin ranking | Spearman |
 
-Each task has a config `configs/<task>.yaml` and a dataset `src/datasets/dataset_<task>.py`. Lightning modules are unified: `RegressionModule` (for affinity, ppi) and `RankingModule` (for pair_affinity, pair_ppi), both inheriting from `BaseModule` in `src/lightning/base_module.py`. The factory `TASK_MAP` in `src/train.py` dispatches based on `task_name`.
+Each task has a config `configs/<task>.yaml` and a dataset `src/datasets/dataset_<task>.py`. Lightning modules are unified: `RegressionModule` (for affinity) and `RankingModule` (for pair_affinity), both inheriting from `BaseModule` in `src/lightning/base_module.py`. The factory `TASK_MAP` in `src/train.py` dispatches based on `task_name`.
 
-### Model Architectures
+### Model Architecture
 
-Three ESM2-based architectures registered in `src/models/__init__.py` (selected via `cfg.model.arch`):
+Single ESM2-based architecture (`ESMBindingModel` in `src/models/esm_model.py`): separate encoding of binder and target, uni-directional cross-attention (binder queries target), attention pooling, and affinity score head.
 
-- **`concat`** (`ESMConcatModel`): Concatenates binder+target as `[CLS] Binder [EOS] Target [EOS]`, single self-attention pass. Max 2048 tokens.
-- **`cross_attn`** (`ESMCrossAttnModel`): Separate encoding, uni-directional cross-attention (binder queries target). Max 1024 tokens each.
-- **`bi_cross_attn`** (`ESMBiCrossAttnModel`): Bidirectional cross-attention, concatenated pooling. Max 1024 tokens each.
+ESM2 backbone (`facebook/esm2_t33_650M_UR50D`) → LoRA on last N layers → projection (1280→256) → cross-attention layers → affinity head. Max 1024 tokens each.
 
-All models: ESM2 backbone (`facebook/esm2_t33_650M_UR50D`) → LoRA on last N layers → projection (1280→256) → cross-attention layers → score head.
-
-Model configs live in `configs/model/` (e.g., `esm_cross_attn.yaml`).
+Model config: `configs/model/esm_binding.yaml`.
 
 ### Data Pipeline
 
-Shared collators in `src/datasets/collators.py` handle architecture-specific tokenization:
-- `ConcatCollator` / `CrossAttnCollator` for regression tasks
-- `PairwiseConcatCollator` / `PairwiseCrossAttnCollator` for ranking tasks (produces better/worse pairs)
-- `RegressionTestCollator` / `BinaryClassificationCollator` for test evaluation
-- `select_collator(arch, tokenizer, max_length, mode)` factory function
+Collators in `src/datasets/collators.py` handle tokenization (separate binder/target encoding):
+- `CrossAttnCollator` for regression tasks
+- `PairwiseCrossAttnCollator` for ranking tasks (produces better/worse pairs)
+- `RegressionTestCollator` / `BinaryClassificationCollator` / `InferenceCollator` for evaluation
+- `select_collator(tokenizer, max_length, mode)` factory function
 
 Shared test datasets in `src/datasets/test_datasets.py`: `TestRegressionDataset`, `BinaryClassificationTestDataset`.
 
@@ -73,12 +67,11 @@ Data splitting uses group-based strategy (`split_strategy: "group"`) to keep ent
 
 ### Transfer Learning
 
-Two-phase training: pretrain on PPI, then fine-tune on affinity. Set `pretrained_ckpt_path` in config to load Phase 1 LoRA weights.
+Set `pretrained_ckpt_path` in config to load pretrained LoRA weights for fine-tuning.
 
 ### Configuration
 
 Hydra YAML configs in `configs/`. Key override patterns:
-- `model=esm_cross_attn` selects model config from `configs/model/`
 - `training.loss_type=soft_margin` switches loss function
 - `pretrained_ckpt_path=path/to/saved_model` enables transfer learning
 - `resume_checkpoint_path=path/to/last.ckpt` resumes from crash

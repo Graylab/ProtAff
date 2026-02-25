@@ -8,7 +8,7 @@ from src.lightning.base_module import BaseModule, FocalLoss
 
 class RegressionModule(BaseModule):
     """
-    Unified regression module for affinity and PPI tasks.
+    Unified regression module for affinity tasks.
     Supports loss types: mse, smooth_l1, huber, bce, focal.
     """
 

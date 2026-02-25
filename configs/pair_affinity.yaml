@@ -5,11 +5,6 @@ defaults:
 # Task name (Informational for logging)
 task_name: "pair_affinity"
 
-# --- TRANSFER LEARNING ---
-# Path to the Phase 1 (PPI) adapter weights
-# e.g., "outputs/ppi/2026-01-01/12-00-00/saved_model"
-pretrained_ckpt_path: null
-
 # Resume training from a crash (Load optimizer state)
 resume_checkpoint_path: null
 

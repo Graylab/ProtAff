@@ -18,8 +18,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 # DataModules
 from src.datasets.dataset_affinity import AffinityDataModule
 from src.datasets.dataset_pair_affinity import PairAffinityDataModule
-from src.datasets.dataset_ppi import PPIDataModule
-from src.datasets.dataset_pair_ppi import PairPPIDataModule
 
 # Unified Lightning Modules
 from src.lightning.regression_module import RegressionModule
@@ -276,8 +274,6 @@ class BinaryTestCallback(Callback):
 TASK_MAP = {
     "affinity":      (AffinityDataModule,     RegressionModule),
     "pair_affinity": (PairAffinityDataModule, RankingModule),
-    "ppi":           (PPIDataModule,          RegressionModule),
-    "pair_ppi":      (PairPPIDataModule,      RankingModule),
 }
 
 

@@ -75,12 +75,13 @@ def main(cfg: DictConfig):
 
     # Load Data
     df = pd.read_csv(cfg.input_csv)
-    from src.inference import InferenceDataset, InferenceCollator # Use your existing classes
-    
+    from src.inference import InferenceDataset
+    from src.datasets.collators import InferenceCollator
+
     dataloader = DataLoader(
         InferenceDataset(df),
         batch_size=cfg.get("batch_size", 8),
-        collate_fn=InferenceCollator(tokenizer, arch="cross_attn", max_length=1024)
+        collate_fn=InferenceCollator(tokenizer, max_length=1024)
     )
 
     cos_scores, energy_scores = [], []

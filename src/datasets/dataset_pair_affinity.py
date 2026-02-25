@@ -213,7 +213,7 @@ class PairAffinityDataModule(LightningDataModule):
         self.tokenizer = EsmTokenizer.from_pretrained(cfg.model.name)
         
         self.collate_fn = select_collator(
-            cfg.model.get("arch", "concat"), self.tokenizer, cfg.model.max_length, mode="pairwise"
+            self.tokenizer, cfg.model.max_length, mode="pairwise"
         )
         
         self.num_workers = cfg.data.get("num_workers", 4)
@@ -300,7 +300,6 @@ class PairAffinityDataModule(LightningDataModule):
 
             self.test_collate_fn = RegressionTestCollator(
                 tokenizer=self.tokenizer,
-                arch=self.cfg.model.get("arch", "concat"),
                 max_length=self.cfg.model.max_length
             )
         else:
@@ -317,7 +316,6 @@ class PairAffinityDataModule(LightningDataModule):
 
             self.binary_test_collate_fn = BinaryClassificationCollator(
                 tokenizer=self.tokenizer,
-                arch=self.cfg.model.get("arch", "concat"),
                 max_length=self.cfg.model.max_length
             )
         else:
