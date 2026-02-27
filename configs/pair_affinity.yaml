@@ -63,7 +63,6 @@ training:
   # Testing
   test_every_val: true                        # Run test evaluation after each validation
   test_binary_every_val: true
-  binary_test_every_n_epoch: 1
 
   # Hardware
   accelerator: "auto"
