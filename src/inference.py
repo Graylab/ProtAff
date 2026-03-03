@@ -75,9 +75,20 @@ def resolve_output_path(cfg, input_path, model_path):
 
 
 def load_model(cfg, device):
-    """Load base model with LoRA adapter."""
+    """Load model — LoRA adapter or baseline custom layers."""
     base_model = build_model(cfg)
-    model = PeftModel.from_pretrained(base_model, cfg.model_path)
+    model_path = Path(cfg.model_path)
+
+    baseline_path = model_path / "baseline_model.pt"
+    if baseline_path.exists():
+        # Baseline mode: load custom layer weights into the base model
+        state_dict = torch.load(baseline_path, map_location=device)
+        base_model.load_state_dict(state_dict, strict=False)
+        print(f"[Inference] Loaded baseline model from {baseline_path}")
+        return base_model.to(device).eval()
+
+    # LoRA mode
+    model = PeftModel.from_pretrained(base_model, str(model_path))
     return model.to(device).eval()
 
 

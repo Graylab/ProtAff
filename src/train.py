@@ -101,12 +101,15 @@ class BestModelSaver(Callback):
             save_path = self.save_path
         try:
             if hasattr(pl_module.model, "save_pretrained"):
+                # PEFT/LoRA model
                 pl_module.model.save_pretrained(save_path)
             elif hasattr(pl_module.model, "base_model") and hasattr(pl_module.model.base_model, "save_pretrained"):
                 pl_module.model.base_model.save_pretrained(save_path)
             else:
-                print("[WARN] Could not find 'save_pretrained' method on model.")
-                return
+                # Baseline (no LoRA): save only trainable custom layer weights
+                state_dict = {k: v for k, v in pl_module.model.state_dict().items() if k.startswith(("input_proj", "input_norm", "cross_layers", "pool", "head_affinity"))}
+                torch.save(state_dict, os.path.join(save_path, "baseline_model.pt"))
+                print(f"[BestModelSaver] Saved baseline custom layers to {save_path}/baseline_model.pt")
 
             self.tokenizer.save_pretrained(save_path)
             print(f"[BestModelSaver] ✓ Model and tokenizer saved to {save_path}")
@@ -133,7 +136,6 @@ class TestEveryValidationCallback(Callback):
             return
         
         if self._test_dataloader is None:
-            self.datamodule.setup("test")
             self._test_dataloader = self.datamodule.test_dataloader()
             if self._test_dataloader is None:
                 return
@@ -432,7 +434,8 @@ def main(cfg: DictConfig):
         final_model_path = os.path.join(hydra_out_dir, "saved_model")
         
         if os.path.exists(os.path.join(final_model_path, "adapter_model.safetensors")) or \
-           os.path.exists(os.path.join(final_model_path, "adapter_model.bin")):
+           os.path.exists(os.path.join(final_model_path, "adapter_model.bin")) or \
+           os.path.exists(os.path.join(final_model_path, "baseline_model.pt")):
             print(f"\n✓ Best model already saved by BestModelSaver")
             print(f"  Location: {final_model_path}")
             print(f"  Best {monitor_metric}: {best_model_saver.best_value:.4f}")
@@ -454,7 +457,11 @@ def main(cfg: DictConfig):
                 model.load_state_dict(ckpt["state_dict"])
                 
                 os.makedirs(final_model_path, exist_ok=True)
-                model.model.save_pretrained(final_model_path)
+                if hasattr(model.model, "save_pretrained"):
+                    model.model.save_pretrained(final_model_path)
+                else:
+                    state_dict = {k: v for k, v in model.model.state_dict().items() if k.startswith(("input_proj", "input_norm", "cross_layers", "pool", "head_affinity"))}
+                    torch.save(state_dict, os.path.join(final_model_path, "baseline_model.pt"))
                 dm.tokenizer.save_pretrained(final_model_path)
                 
                 print(f"✓ Model saved to: {final_model_path}")

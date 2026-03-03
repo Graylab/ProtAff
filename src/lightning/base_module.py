@@ -47,6 +47,19 @@ class BaseModule(pl.LightningModule):
 
 
     def _setup_peft(self, cfg):
+        use_lora = cfg.model.get("use_lora", True)
+
+        if not use_lora:
+            # Frozen ESM2 baseline: freeze backbone, train only custom layers
+            print("[Baseline] LoRA disabled — freezing ESM2 backbone")
+            for param in self.base_model.esm.parameters():
+                param.requires_grad = False
+
+            trainable = sum(p.numel() for p in self.base_model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in self.base_model.parameters())
+            print(f"trainable params: {trainable:,} || all params: {total:,} || trainable%: {100 * trainable / total:.4f}")
+            return self.base_model
+
         n_cross = getattr(cfg.model, "n_cross_layers", 1)
 
         modules_to_save = ["pool", "input_norm", "input_proj", "head_affinity"]

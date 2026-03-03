@@ -5,9 +5,9 @@ Standalone prediction script for ProtAff models.
 Usage:
     python predict.py --model_dir /path/to/saved_model --input_csv data.csv --output_csv results.csv
 
-    # Override architecture (if model_config.yaml is not in saved_model/)
-    python predict.py --model_dir /path/to/saved_model --input_csv data.csv --output_csv results.csv \
-        --arch binding --d_model 256 --n_heads 8 --n_cross_layers 2
+    # Provide a single target sequence for all rows
+    python predict.py --model_dir /path/to/saved_model --input_csv binders.csv --output_csv results.csv \
+        --target_seq MKWVTFISLLFLFSSAYS...
 
 Input CSV must have binder and target sequence columns. Accepted column names:
     binder: binder_sequence, binder_seq, binder, seq_1, heavy_chain, cdr3
@@ -28,7 +28,7 @@ PROTAFF_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROTAFF_ROOT))
 
 from src.models import build_model
-from src.datasets.collators import CROSS_ATTN_ARCHS, select_collator
+from src.datasets.collators import select_collator
 from transformers import EsmTokenizer
 from peft import PeftModel
 from omegaconf import OmegaConf
@@ -66,7 +66,16 @@ def find_col(columns, candidates):
 # ----------------------------------------------------------------------
 def load_model(model_dir, model_cfg, device):
     base_model = build_model(model_cfg)
-    model = PeftModel.from_pretrained(base_model, model_dir)
+    model_path = Path(model_dir)
+
+    baseline_path = model_path / "baseline_model.pt"
+    if baseline_path.exists():
+        state_dict = torch.load(baseline_path, map_location=device)
+        base_model.load_state_dict(state_dict, strict=False)
+        print(f"[Inference] Loaded baseline model from {baseline_path}")
+        return base_model.to(device).eval()
+
+    model = PeftModel.from_pretrained(base_model, str(model_path))
     return model.to(device).eval()
 
 
@@ -82,15 +91,12 @@ def build_cfg_from_args(args):
         print(f"[Config] No model_config.yaml found, using CLI args / defaults")
         model_dict = {
             "name": args.esm_model,
-            "arch": args.arch,
             "max_length": args.max_length,
             "d_model": args.d_model,
             "n_heads": args.n_heads,
             "n_cross_layers": args.n_cross_layers,
             "dropout": args.dropout,
         }
-        if args.arch == "binding":
-            model_dict["binding_head"] = args.binding_head
 
     return OmegaConf.create({"model": model_dict})
 
@@ -98,24 +104,17 @@ def build_cfg_from_args(args):
 # ----------------------------------------------------------------------
 # Inference
 # ----------------------------------------------------------------------
-def run_inference(model, dataloader, arch, device, binding_head="affinity"):
-    is_cross_attn = arch in CROSS_ATTN_ARCHS
+def run_inference(model, dataloader, device):
     predictions = []
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Predicting"):
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            if is_cross_attn:
-                kwargs = dict(
-                    binder_ids=batch["binder_ids"], binder_mask=batch["binder_mask"],
-                    target_ids=batch["target_ids"], target_mask=batch["target_mask"],
-                )
-                if arch == "binding":
-                    kwargs["task"] = binding_head
-                outputs = model(**kwargs)
-            else:
-                outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+            outputs = model(
+                binder_ids=batch["binder_ids"], binder_mask=batch["binder_mask"],
+                target_ids=batch["target_ids"], target_mask=batch["target_mask"],
+            )
 
             predictions.extend(outputs.reshape(-1).float().cpu().numpy().tolist())
 
@@ -134,16 +133,12 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0)
 
     # Model config overrides (used only if model_config.yaml is absent)
-    parser.add_argument("--arch", default="binding",
-                        choices=["concat", "cross_attn", "bi_cross_attn", "binding"])
     parser.add_argument("--esm_model", default="facebook/esm2_t33_650M_UR50D")
     parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--n_cross_layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--binding_head", default="affinity",
-                        choices=["affinity", "classify"])
     parser.add_argument("--target_seq", default=None,
                         help="Target sequence applied to all rows. "
                              "If provided, the input CSV does not need a target column.")
@@ -152,8 +147,7 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cfg = build_cfg_from_args(args)
-    arch = cfg.model.arch
-    print(f"[System] Device: {device} | Architecture: {arch}")
+    print(f"[System] Device: {device}")
 
     # Load model
     model = load_model(args.model_dir, cfg, device)
@@ -181,17 +175,16 @@ def main():
             sys.exit(1)
     print(f"[Data] Using columns: binder={b_col}, target={t_col}, rows={len(df)}")
 
-    max_length = cfg.model.get("max_length", 2048 if arch == "concat" else 1024)
+    max_length = cfg.model.get("max_length", 1024)
     dataloader = DataLoader(
         InferenceDataset(df, b_col, t_col),
         batch_size=args.batch_size,
-        collate_fn=select_collator(arch, tokenizer, max_length, mode="inference"),
+        collate_fn=select_collator(tokenizer, max_length, mode="inference"),
         num_workers=args.num_workers,
     )
 
     # Run inference
-    binding_head = cfg.model.get("binding_head", "affinity")
-    predictions = run_inference(model, dataloader, arch, device, binding_head=binding_head)
+    predictions = run_inference(model, dataloader, device)
 
     # Save results
     df["predicted_affinity"] = predictions

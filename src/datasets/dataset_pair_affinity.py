@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import pandas as pd
+import torch
 from omegaconf import DictConfig
 
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
@@ -16,9 +17,10 @@ from src.datasets.split_utils import group_split
 # HYBRID PAIRWISE DATASET (Target-Centric) - For Train/Val
 # ======================================================================
 class PairwiseAffinityDataset(Dataset):
-    def __init__(self, base_df, lookup_csv_path, pairs_per_sample=2, inter_pps=10,
-                 min_margin=1.0, max_margin=None, max_anchors_per_target=2000,
-                 pair_group_cols=None, split_name="DATASET",
+    def __init__(self, base_df, lookup_csv_path, intra_pps=2, inter_pps=10,
+                 min_margin=1.0, max_margin=None, intra_max_anchors_per_target=2000,
+                 pair_group_cols=None,
+                 inter_samples_per_target=None, split_name="DATASET",
                  verbose=True, rng=None):
 
         self.verbose = verbose
@@ -29,12 +31,13 @@ class PairwiseAffinityDataset(Dataset):
         self.id2seq = dict(zip(lookup_df['key'], lookup_df['seq']))
 
         self._split_name = split_name
-        self._pairs_per_sample = pairs_per_sample
+        self._intra_pps = intra_pps
         self._inter_pps = inter_pps
         self._min_margin = min_margin
         self._max_margin = max_margin
-        self._max_anchors_per_target = max_anchors_per_target
+        self._intra_max_anchors_per_target = intra_max_anchors_per_target
         self._pair_group_cols = pair_group_cols
+        self._inter_samples_per_target = inter_samples_per_target
 
         # Prepare the filtered+merged DataFrame
         num_df = base_df[base_df['log_Aff'].notna()].copy()
@@ -57,8 +60,10 @@ class PairwiseAffinityDataset(Dataset):
         self.b_better, self.t_better = [], []
         self.b_worse, self.t_worse = [], []
         self.deltas, self.pair_types = [], []
+        self.sources = []
         self.dropped_pairs = 0
         self.missing_keys = set()
+        self._current_group = None
 
         if self._pair_group_cols:
             # Mine pairs separately within each group defined by pair_group_cols
@@ -74,6 +79,7 @@ class PairwiseAffinityDataset(Dataset):
                     counts = grp.groupby('target_id').size().reset_index(name='pocket_size')
                     grp = grp.merge(counts, on='target_id')
                     self._log(f"  Group {group_key}: {len(grp):,} samples, {grp['target_id'].nunique()} targets")
+                    self._current_group = group_key
                     self._mine_pairs(grp)
         else:
             self._mine_pairs(num_df)
@@ -93,17 +99,22 @@ class PairwiseAffinityDataset(Dataset):
 
     def _mine_pairs(self, df):
         """Run intra/inter pair generation on a (sub)dataframe."""
-        self._generate_intra_target_pairs(df, self._pairs_per_sample, self._min_margin, self._max_margin, self._max_anchors_per_target)
-        self._generate_inter_target_pairs(df, self._inter_pps)
+        self._generate_intra_target_pairs(df, self._intra_pps, self._min_margin, self._max_margin, self._intra_max_anchors_per_target)
+        if self._inter_samples_per_target is not None:
+            self._generate_inter_target_pairs(df, self._inter_pps,
+                                              self._min_margin, self._max_margin,
+                                              self._inter_samples_per_target)
+        else:
+            self._generate_inter_target_pairs_legacy(df, self._inter_pps)
 
-    def _generate_intra_target_pairs(self, df, pairs_per_sample, min_margin, max_margin, max_anchors_per_target):
+    def _generate_intra_target_pairs(self, df, intra_pps, min_margin, max_margin, max_anchors_per_target):
         """Generate intra-target pairs from given dataframe."""
         self._log(f"[*] Generating intra-target pairs (min_margin={min_margin}, max_margin={max_margin})...")
         rich_df = df[df['pocket_size'] > 1]
         intra_count = 0
 
         for t_id, group in rich_df.groupby('target_id'):
-            group = group.sort_values('log_Aff')
+            group = group.sort_values('log_Aff', kind='mergesort')
             affs, recs = group['log_Aff'].values, group.to_dict('records')
             n = len(recs)
             starts = np.searchsorted(affs, affs + min_margin, side='right')
@@ -121,7 +132,7 @@ class PairwiseAffinityDataset(Dataset):
             if len(valid_anchors) == 0:
                 continue
 
-            rand_floats = self.rng.random((len(valid_anchors), pairs_per_sample))
+            rand_floats = self.rng.random((len(valid_anchors), intra_pps))
             ranges = ends[valid_anchors] - starts[valid_anchors]
             match_indices = (rand_floats * ranges[:, None]).astype(int) + starts[valid_anchors][:, None]
 
@@ -134,9 +145,9 @@ class PairwiseAffinityDataset(Dataset):
 
         self._log(f"    Intra-target pairs: {intra_count:,}")
 
-    def _generate_inter_target_pairs(self, df, inter_pps):
-        """Generate inter-target pairs from given dataframe."""
-        self._log(f"[*] Generating inter-target pairs...")
+    def _generate_inter_target_pairs_legacy(self, df, inter_pps):
+        """Generate inter-target pairs from singleton targets only (legacy behavior)."""
+        self._log(f"[*] Generating inter-target pairs (legacy, singletons only)...")
         singleton_df = df[df['pocket_size'] == 1]
         recs = singleton_df.to_dict('records')
         n = len(recs)
@@ -163,6 +174,65 @@ class PairwiseAffinityDataset(Dataset):
 
         self._log(f"    Inter-target pairs: {inter_count:,}")
 
+    def _generate_inter_target_pairs(self, df, inter_pps, min_margin, max_margin, samples_per_target):
+        """Generate inter-target pairs with margin filtering using searchsorted.
+
+        For each target, sample up to samples_per_target binders. Sort all sampled
+        records by log_Aff, then use searchsorted to find pairs within the margin window
+        across different targets.
+        """
+        self._log(f"[*] Generating inter-target pairs (margin=[{min_margin}, {max_margin}], "
+                  f"samples_per_target={samples_per_target})...")
+
+        # Sample up to samples_per_target binders per target
+        sampled_recs = []
+        for t_id, group in df.groupby('target_id'):
+            recs = group.to_dict('records')
+            if len(recs) <= samples_per_target:
+                sampled_recs.extend(recs)
+            else:
+                chosen = self.rng.choice(len(recs), samples_per_target, replace=False)
+                sampled_recs.extend(recs[i] for i in chosen)
+
+        if len(sampled_recs) < 2:
+            self._log(f"    Inter-target pairs: 0")
+            return
+
+        # Sort by log_Aff ascending (better binders first)
+        sampled_recs.sort(key=lambda r: r['log_Aff'])
+        affs = np.array([r['log_Aff'] for r in sampled_recs])
+        target_ids = np.array([r['target_id'] for r in sampled_recs])
+        n = len(sampled_recs)
+
+        # searchsorted for margin window: for anchor i, find candidates j where
+        # affs[j] in [affs[i] + min_margin, affs[i] + max_margin]
+        starts = np.searchsorted(affs, affs + min_margin, side='left')
+        if max_margin is not None:
+            ends = np.searchsorted(affs, affs + max_margin, side='right')
+        else:
+            ends = np.full(n, n, dtype=int)
+
+        inter_count = 0
+        for i in range(n):
+            if starts[i] >= ends[i]:
+                continue
+            # Filter to different target_ids within the window
+            window = np.arange(starts[i], ends[i])
+            diff_target_mask = target_ids[window] != target_ids[i]
+            candidates = window[diff_target_mask]
+            if len(candidates) == 0:
+                continue
+
+            chosen = candidates if len(candidates) <= inter_pps else \
+                self.rng.choice(candidates, inter_pps, replace=False)
+
+            for c_idx in chosen:
+                # Anchor i has lower log_Aff (better), candidate c_idx has higher (worse)
+                self._append_pair(sampled_recs[i], sampled_recs[c_idx], pair_type='inter_target')
+                inter_count += 1
+
+        self._log(f"    Inter-target pairs: {inter_count:,}")
+
     def _append_pair(self, b_rec, w_rec, pair_type: str):
         # Filter out pairs where any sequence is missing
         keys = [
@@ -181,6 +251,7 @@ class PairwiseAffinityDataset(Dataset):
         self.t_worse.append(w_rec['target_id'])
         self.deltas.append(abs(w_rec['log_Aff'] - b_rec['log_Aff']))
         self.pair_types.append(pair_type)
+        self.sources.append(self._current_group)
 
     def _log(self, msg: str):
         if self.verbose:
@@ -259,15 +330,19 @@ class PairAffinityDataModule(LightningDataModule):
         if pair_group_cols is not None:
             pair_group_cols = list(pair_group_cols)
 
+        # Parse inter-target params
+        inter_samples_per_target = self.cfg.data.get("inter_samples_per_target", None)
+
         # Train/Val datasets
         self.train_dataset = PairwiseAffinityDataset(
             train_df, self.cfg.data.lookup_csv,
-            pairs_per_sample=self.cfg.data.get("pairs_per_sample", 2),
+            intra_pps=self.cfg.data.get("intra_pps", 2),
             inter_pps=self.cfg.data.get("inter_pps", 10),
             min_margin=self.cfg.data.get("min_margin", 1.0),
             max_margin=self.cfg.data.get("max_margin", None),
-            max_anchors_per_target=self.cfg.data.get("max_anchors_per_target", 2000),
+            intra_max_anchors_per_target=self.cfg.data.get("intra_max_anchors_per_target", 2000),
             pair_group_cols=pair_group_cols,
+            inter_samples_per_target=inter_samples_per_target,
             split_name="TRAIN",
             verbose=True,
             rng=rng,
@@ -275,11 +350,12 @@ class PairAffinityDataModule(LightningDataModule):
 
         self.val_dataset = PairwiseAffinityDataset(
             val_df, self.cfg.data.lookup_csv,
-            pairs_per_sample=2,
+            intra_pps=2,
             inter_pps=5,
             min_margin=self.cfg.data.get("min_margin", 1.0),
             max_margin=self.cfg.data.get("max_margin", None),
             pair_group_cols=pair_group_cols,
+            inter_samples_per_target=inter_samples_per_target,
             split_name="VAL",
             verbose=True,
             rng=rng,
@@ -357,14 +433,10 @@ class PairAffinityDataModule(LightningDataModule):
                 pair_weights.append(weight)
 
             pair_weights = np.array(pair_weights, dtype=np.float32)
-
-            self.sampler = WeightedRandomSampler(
-                weights=pair_weights, num_samples=len(pair_weights), replacement=True
-            )
         else:
             t_all = self.train_dataset.t_better + self.train_dataset.t_worse
             target_counts = pd.Series(t_all).value_counts()
-            
+
             counts_dict = target_counts.to_dict()
             pair_weights = []
             for i in range(len(self.train_dataset)):
@@ -372,10 +444,28 @@ class PairAffinityDataModule(LightningDataModule):
                 t2 = self.train_dataset.t_worse[i]
                 combined_freq = np.sqrt(counts_dict[t1] * counts_dict[t2])
                 pair_weights.append(1.0 / np.sqrt(combined_freq))
-            
-            self.sampler = WeightedRandomSampler(
-                weights=pair_weights, num_samples=len(pair_weights), replacement=True
+
+            pair_weights = np.array(pair_weights, dtype=np.float32)
+
+        # Optional source-aware balancing
+        balance_sources = self.cfg.data.get("balance_sources", False)
+        if balance_sources and any(s is not None for s in self.train_dataset.sources):
+            source_series = pd.Series(self.train_dataset.sources)
+            source_counts = source_series.value_counts().to_dict()
+            source_weights = np.array(
+                [1.0 / source_counts.get(s, 1) for s in self.train_dataset.sources],
+                dtype=np.float32,
             )
+            # Normalize so mean source weight is 1 (preserves scale of existing weights)
+            source_weights /= source_weights.mean()
+            pair_weights *= source_weights
+
+        g = torch.Generator()
+        g.manual_seed(self.cfg.training.get("seed", 42))
+        self.sampler = WeightedRandomSampler(
+            weights=pair_weights, num_samples=len(pair_weights), replacement=True,
+            generator=g,
+        )
 
     def train_dataloader(self):
         return DataLoader(

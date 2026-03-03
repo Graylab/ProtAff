@@ -8,6 +8,9 @@ n_heads: 8
 n_cross_layers: 2
 dropout: 0.1
 
+# Whether to use LoRA fine-tuning (false = frozen ESM2 baseline)
+use_lora: true
+
 # LoRA
 lora:
   r: 16

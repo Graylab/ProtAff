@@ -16,17 +16,19 @@ data:
   binary_test_csv: "data/test/test_binary.csv"
   
   # --- Pair Mining ---
-  pair_group_cols: null
-  pairs_per_sample: 2 # default 2
+  pair_group_cols: null # default null
+  intra_pps: 2 # default 2
   inter_pps: 10 # default 10
   min_margin: 1.0 # default 1.0
-  max_margin: 5.0 # default null
-  max_anchors_per_target: 2000 # default 2000
+  max_margin: 5.0 # default 5.0
+  intra_max_anchors_per_target: 2000 # default 2000
+  inter_samples_per_target: null # default null (null = legacy singleton-only behavior)
 
   # --- Sampling & Balancing ---
   weight_col: "cluster_id"
   balance_clusters: true
-  balance_power: 0.25 # default 0.25
+  balance_power: 0.5 # default 0.25
+  balance_sources: false # default false
 
   # --- DataLoader ---
   num_workers: 6

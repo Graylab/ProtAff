@@ -6,3 +6,5 @@ slogs/
 inference_results/
 analysis/
 weights/
+figures/
+scripts/
