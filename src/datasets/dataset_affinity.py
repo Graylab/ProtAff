@@ -12,7 +12,7 @@ from sklearn.model_selection import train_test_split
 
 from src.datasets.collators import select_collator, BinaryClassificationCollator
 from src.datasets.test_datasets import TestRegressionDataset, BinaryClassificationTestDataset
-from src.datasets.split_utils import group_split
+from src.datasets.split_utils import group_split, within_group_split
 
 # ----------------------------------------------------------------------
 # Dataset
@@ -77,8 +77,8 @@ class AffinityDataset(Dataset):
     def __getitem__(self, idx):
         row = self.data[idx]
         raw_aff = float(row["log_Aff"])
-        # Negate so predicted_affinity is higher = better (log_Kd is lower = better)
-        norm_aff = -((raw_aff - self.mean) / (self.std + 1e-8))
+        # Normalize: lower predicted_affinity = better binder (natural log Kd scale)
+        norm_aff = (raw_aff - self.mean) / (self.std + 1e-8)
 
         return {
             "binder_seq": self.id2seq.get(row["binder_key"], ""),
@@ -133,6 +133,12 @@ class AffinityDataModule(LightningDataModule):
         elif strategy == "group":
             print(f"--- Running STRICT GROUP Split (Val has UNSEEN {self.split_col}s) ---")
             train_df, val_df = group_split(
+                base_df, col=self.split_col, ratio=train_ratio, seed=seed, verbose=True
+            )
+
+        elif strategy == "within_group":
+            print(f"--- Running WITHIN-GROUP Split (all {self.split_col}s in both train & val) ---")
+            train_df, val_df = within_group_split(
                 base_df, col=self.split_col, ratio=train_ratio, seed=seed, verbose=True
             )
 

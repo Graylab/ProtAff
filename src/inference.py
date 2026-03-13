@@ -120,7 +120,12 @@ def main(cfg: DictConfig):
 
     input_path = Path(cfg.input_csv)
     model_path = Path(cfg.model_path)
-    output_path = resolve_output_path(cfg, input_path, model_path)
+
+    if cfg.get("output_csv"):
+        output_path = Path(cfg.output_csv)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        output_path = resolve_output_path(cfg, input_path, model_path)
 
     model = load_model(cfg, device)
     tokenizer = EsmTokenizer.from_pretrained(cfg.model.name)

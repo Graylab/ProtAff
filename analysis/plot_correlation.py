@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 from scipy import stats
@@ -7,11 +8,13 @@ import sys
 import argparse
 
 # ================= CONFIGURATION (DEFAULTS) =================
-DEFAULT_STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv" 
-DEFAULT_GT_CSV = "data/test/test_adaptyv.csv"                       
+DEFAULT_STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv"
+DEFAULT_STRUCT_AF3_CSV = "data/af3/all_models_scores.csv"
+DEFAULT_GT_CSV = "data/test/test_adaptyv.csv"
 
 STRUCT_METRICS = ['ipSAE', 'ipTM_af', 'pDockQ', 'pDockQ2', 'LIS']
 AGG_METHODS = ['max', 'min', 'mean', 'median']
+STRUCT_SOURCES = {'Boltz2': None, 'AF3': None}  # populated at runtime
 # ============================================================
 
 def setup_slide_style():
@@ -34,7 +37,7 @@ def setup_slide_style():
         'lines.linewidth': 2.5,
     })
 
-def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
+def analyze_results(pred_csv, output_dir, gt_csv, struct_csv, struct_af3_csv=None):
     print(f"\n[Analysis] Predictions: {pred_csv}")
     print(f"[Analysis] Output Dir : {output_dir}")
     print(f"[Analysis] Ground Truth: {gt_csv}")
@@ -44,32 +47,46 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
 
     print("Loading data...")
     try:
-        struct_df = pd.read_csv(struct_csv)
         gt_df = pd.read_csv(gt_csv)
         aff_pred_df = pd.read_csv(pred_csv)
     except FileNotFoundError as e:
         print(f"[Error] File not found: {e}")
         return
 
-    # Cleanup IDs
-    struct_df['id'] = struct_df['id'].astype(str).str.strip()
     gt_df['id'] = gt_df['id'].astype(str).str.strip()
     aff_pred_df['id'] = aff_pred_df['id'].astype(str).str.strip()
 
-    # Aggregation of Structural Metrics
-    print(f"Aggregating {len(struct_df)} structural models...")
-    available_metrics = [m for m in STRUCT_METRICS if m in struct_df.columns]
-    
-    grouped_df = struct_df.groupby('id')[available_metrics].agg(AGG_METHODS)
-    grouped_df.columns = ['_'.join(col).strip() for col in grouped_df.columns.values]
-    grouped_df = grouped_df.reset_index()
+    # Load and aggregate structural scores from each source
+    struct_sources = {'Boltz2': struct_csv}
+    if struct_af3_csv:
+        struct_sources['AF3'] = struct_af3_csv
 
-    # Merging Dataframes
-    merged_df = pd.merge(grouped_df, gt_df[['id', 'log_Aff']], on='id', how='inner')
-    merged_df = pd.merge(merged_df, aff_pred_df[['id', 'predicted_affinity']], on='id', how='inner')
+    merged_df = pd.merge(gt_df[['id', 'log_Aff']], aff_pred_df[['id', 'predicted_affinity']], on='id', how='inner')
+    all_available_metrics = []
+
+    for source_name, csv_path in struct_sources.items():
+        try:
+            src_df = pd.read_csv(csv_path)
+        except FileNotFoundError:
+            print(f"[Warning] {source_name} structural scores not found: {csv_path}")
+            continue
+        src_df['id'] = src_df['id'].astype(str).str.strip()
+        available = [m for m in STRUCT_METRICS if m in src_df.columns]
+        print(f"Aggregating {len(src_df)} {source_name} structural models...")
+        grouped = src_df.groupby('id')[available].agg(AGG_METHODS)
+        grouped.columns = [f'{source_name}_{m}_{a}' for m, a in grouped.columns]
+        grouped = grouped.reset_index()
+        merged_df = pd.merge(merged_df, grouped, on='id', how='left')
+        for m in available:
+            for a in AGG_METHODS:
+                all_available_metrics.append((f'{source_name}_{m}_{a}', f'{source_name} {m} ({a})'))
+    available_metrics = all_available_metrics
 
     # Transformation: negate log_Aff so higher = better binding
     merged_df['neg_log_Aff'] = -1 * merged_df['log_Aff']
+
+    # predicted_affinity is lower=better (log_Kd-like); negate so higher=better like neg_log_Aff
+    merged_df['predicted_affinity'] = -merged_df['predicted_affinity']
 
     n_samples = len(merged_df)
     print(f"Merged {n_samples} targets.")
@@ -80,17 +97,24 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
 
     all_stats = []
 
-    # 1. MAIN ANALYSIS LOOP (Original Grids)
+    # 1. MAIN ANALYSIS LOOP (Grids per aggregation method)
     for agg in AGG_METHODS:
         print(f"--- Processing Aggregation: {agg.upper()} ---")
-        setup_slide_style()
-        fig, axes = plt.subplots(2, 3, figsize=(22, 16))
-        axes = axes.flatten()
-        
-        plot_targets = []
-        for m in available_metrics:
-            plot_targets.append((f"{m}_{agg}", f"{m} ({agg})"))
+
+        # Collect metrics for this aggregation
+        plot_targets = [(col, label) for col, label in available_metrics if f'({agg})' in label]
         plot_targets.append(('predicted_affinity', 'Predicted Affinity'))
+
+        n_plots = len(plot_targets)
+        n_cols = min(3, n_plots)
+        n_rows = (n_plots + n_cols - 1) // n_cols
+
+        setup_slide_style()
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(8 * n_cols, 8 * n_rows))
+        if n_plots == 1:
+            axes = [axes]
+        else:
+            axes = np.array(axes).flatten()
 
         for i, (col_name, label) in enumerate(plot_targets):
             if i >= len(axes): break
@@ -112,8 +136,9 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
             })
 
             is_ours = "Predicted Affinity" in label
-            dot_color = '#D55E00' if is_ours else '#4C72B0'
-            line_color = '#d62728' if is_ours else '#1f77b4'
+            is_af3 = label.startswith("AF3")
+            dot_color = '#D55E00' if is_ours else ('#009E73' if is_af3 else '#4C72B0')
+            line_color = '#d62728' if is_ours else ('#006046' if is_af3 else '#1f77b4')
 
             sns.regplot(data=merged_df, x=col_name, y='neg_log_Aff', ax=ax,
                         scatter_kws={'alpha': 0.6, 'edgecolor': 'w', 's': 120, 'color': dot_color},
@@ -132,8 +157,12 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
 
             ax.set_title(label, fontsize=22, fontweight='bold', pad=15,
                          color='#D55E00' if is_ours else 'black')
-            ax.set_xlabel("Predicted Affinity" if is_ours else label)
+            ax.set_xlabel("-Predicted Affinity" if is_ours else label)
             ax.set_ylabel("-Ground Truth log_Aff")
+
+        # Hide unused axes
+        for j in range(n_plots, len(axes)):
+            axes[j].set_visible(False)
 
         out_img_path = os.path.join(output_dir, f"correlation_{agg}_final.png")
         fig.suptitle(f"Binder Selection Metrics ({agg.upper()}) | N={n_samples}", fontsize=26, fontweight='bold', y=0.99)
@@ -141,19 +170,19 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
         plt.savefig(out_img_path, dpi=300)
         plt.close(fig)
 
-    # 2. ADDED: FOCUSED 1x2 SUBPLOT (ipSAE_min vs Predicted_Affinity)
-    print("\n[Analysis] Generating focused 1x2 ipSAE_min vs Predicted Affinity comparison...")
-    ipsae_min_col = "ipSAE_min"
-    if ipsae_min_col in merged_df.columns:
+    # 2. FOCUSED SUBPLOT: ipSAE_min from each source vs Predicted_Affinity
+    ipsae_cols = [(col, label) for col, label in available_metrics if 'ipSAE' in col and col.endswith('_min')]
+    if ipsae_cols:
+        print("\n[Analysis] Generating focused ipSAE(min) vs Predicted Affinity comparison...")
+        comparison_tasks = [(col, label, False) for col, label in ipsae_cols]
+        comparison_tasks.append(('predicted_affinity', "Predicted Affinity", True))
+
         setup_slide_style()
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 20))
+        fig, axes = plt.subplots(len(comparison_tasks), 1, figsize=(10, 10 * len(comparison_tasks)))
+        if len(comparison_tasks) == 1:
+            axes = [axes]
 
-        comparison_tasks = [
-            (ipsae_min_col, "ipSAE (min)", ax1, False),
-            ('predicted_affinity', "Predicted Affinity", ax2, True)
-        ]
-
-        for col, title, ax, is_ours in comparison_tasks:
+        for ax, (col, title, is_ours) in zip(axes, comparison_tasks):
             clean_data = merged_df[[col, 'neg_log_Aff']].dropna()
             if clean_data.empty: continue
 
@@ -161,8 +190,9 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
             r, p = stats.pearsonr(x, y)
             rho, _ = stats.spearmanr(x, y)
 
-            dot_color = '#D55E00' if is_ours else '#0072B2'
-            line_color = '#d62728' if is_ours else '#1f77b4'
+            is_af3 = title.startswith("AF3")
+            dot_color = '#D55E00' if is_ours else ('#009E73' if is_af3 else '#0072B2')
+            line_color = '#d62728' if is_ours else ('#006046' if is_af3 else '#1f77b4')
 
             sns.regplot(data=clean_data, x=col, y='neg_log_Aff', ax=ax,
                         scatter_kws={'alpha': 0.6, 's': 150, 'edgecolor': 'w', 'color': dot_color},
@@ -180,13 +210,13 @@ def analyze_results(pred_csv, output_dir, gt_csv, struct_csv):
             ax.set_title(title, fontsize=22, fontweight='bold', pad=20,
                          color='#D55E00' if is_ours else 'black')
             ax.set_ylabel("-Ground Truth log_Aff")
-            ax.set_xlabel("Predicted Affinity" if is_ours else col)
+            ax.set_xlabel("-Predicted Affinity" if is_ours else col)
             ax.grid(True, linestyle='--', alpha=0.3)
 
         plt.tight_layout()
         focused_out = os.path.join(output_dir, "focused_ipsae_min_vs_predicted.png")
         plt.savefig(focused_out, dpi=300)
-        print(f"Saved focused 1x2 comparison: {focused_out}")
+        print(f"Saved focused comparison: {focused_out}")
         plt.close(fig)
 
     # 3. SAVE SUMMARY AND RANKING PLOT
@@ -235,10 +265,13 @@ if __name__ == "__main__":
     parser.add_argument("path", type=str, help="Path to predictions csv")
     parser.add_argument("--gt", type=str, default=DEFAULT_GT_CSV)
     parser.add_argument("--struct", type=str, default=DEFAULT_STRUCT_SCORES_CSV)
-    
+    parser.add_argument("--struct-af3", type=str, default=DEFAULT_STRUCT_AF3_CSV,
+                        help="Path to AF3 structural scores CSV (set to '' to disable)")
+
     args = parser.parse_args()
     target_path = args.path
     if os.path.isdir(target_path):
         target_path = os.path.join(target_path, "predictions.csv")
-            
-    analyze_results(target_path, os.path.dirname(target_path), args.gt, args.struct)
+
+    af3_path = args.struct_af3 if args.struct_af3 else None
+    analyze_results(target_path, os.path.dirname(target_path), args.gt, args.struct, af3_path)

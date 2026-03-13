@@ -7,52 +7,71 @@ import sys
 import argparse
 
 # ================= CONFIGURATION (DEFAULTS) =================
-DEFAULT_STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv" 
-DEFAULT_GT_CSV = "data/test/test_adaptyv.csv"                            
+DEFAULT_STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv"
+DEFAULT_STRUCT_AF3_CSV = "data/af3/all_models_scores.csv"
+DEFAULT_GT_CSV = "data/test/test_adaptyv.csv"
 
 # Aggregation for structural scores
-SELECTED_AGG = 'min'  
+SELECTED_AGG = 'min'
+
+STRUCT_METRICS = ['ipSAE', 'ipTM_af', 'pDockQ', 'pDockQ2', 'LIS']
 
 # Define directionality: True if Higher Score = Better Binder
-METRIC_DIRECTIONS = {
+# Populated at runtime with source-prefixed keys
+BASE_METRIC_DIRECTIONS = {
     'ipSAE': True,
     'ipTM_af': True,
     'pDockQ': True,
     'pDockQ2': True,
     'LIS': True,
-    'predicted_affinity': True  # Higher predicted affinity = better binder
 }
 # =================================================
 
-def load_and_prep_data(pred_csv, gt_csv, struct_csv, binder_threshold):
+def load_and_prep_data(pred_csv, gt_csv, struct_csv, binder_threshold, struct_af3_csv=None):
     try:
-        struct_df = pd.read_csv(struct_csv)
         gt_df = pd.read_csv(gt_csv)
         pred_df = pd.read_csv(pred_csv)
     except FileNotFoundError as e:
-        print(f"❌ Error: {e}")
-        return None
+        print(f"Error: {e}")
+        return None, {}
 
-    # Cleanup IDs
-    for df in [struct_df, gt_df, pred_df]:
+    for df in [gt_df, pred_df]:
         df['id'] = df['id'].astype(str).str.strip()
 
-    # Aggregate structural scores (e.g., best pose per target)
-    score_cols = [c for c in METRIC_DIRECTIONS.keys() if c in struct_df.columns]
-    grouped_struct = struct_df.groupby('id')[score_cols].agg(SELECTED_AGG).reset_index()
+    merged = pd.merge(gt_df[['id', 'log_Aff']], pred_df[['id', 'predicted_affinity']], on='id', how='inner')
 
-    # Merge
-    merged = pd.merge(grouped_struct, gt_df[['id', 'log_Aff']], on='id', how='inner')
-    merged = pd.merge(merged, pred_df[['id', 'predicted_affinity']], on='id', how='inner')
+    # Build metric directions dynamically from each structural source
+    metric_directions = {}
+
+    struct_sources = {'Boltz2': struct_csv}
+    if struct_af3_csv:
+        struct_sources['AF3'] = struct_af3_csv
+
+    for source_name, csv_path in struct_sources.items():
+        try:
+            src_df = pd.read_csv(csv_path)
+        except FileNotFoundError:
+            print(f"[Warning] {source_name} structural scores not found: {csv_path}")
+            continue
+        src_df['id'] = src_df['id'].astype(str).str.strip()
+        available = [m for m in STRUCT_METRICS if m in src_df.columns]
+        grouped = src_df.groupby('id')[available].agg(SELECTED_AGG).reset_index()
+        grouped.columns = ['id'] + [f'{source_name}_{m}' for m in available]
+        merged = pd.merge(merged, grouped, on='id', how='left')
+        for m in available:
+            metric_directions[f'{source_name}_{m}'] = BASE_METRIC_DIRECTIONS[m]
+
+    # predicted_affinity: lower = better binder
+    metric_directions['predicted_affinity'] = False
 
     # Define Ground Truth Binary Label
     merged['is_binder'] = (merged['log_Aff'] <= binder_threshold).astype(int)
-    
-    return merged
 
-def calculate_enrichment_stats(df):
+    return merged, metric_directions
+
+def calculate_enrichment_stats(df, metric_directions):
     plot_data = []
-    
+
     # Base Rate (Random Chance)
     base_rate = df['is_binder'].mean() * 100
     print(f"Base Hit Rate (Random): {base_rate:.2f}%")
@@ -62,24 +81,21 @@ def calculate_enrichment_stats(df):
     tier_labels = ["Top 5%", "Top 10%", "Top 20%"]
 
     # Loop through each method/metric
-    for metric, higher_is_better in METRIC_DIRECTIONS.items():
+    for metric, higher_is_better in metric_directions.items():
         if metric not in df.columns:
             continue
-            
+
         # Sort dataframe by this metric
-        # If Higher is Better: Ascending=False. If Lower is Better: Ascending=True
         sorted_df = df.sort_values(by=metric, ascending=not higher_is_better)
-        
+
         for tier, tier_name in zip(tiers, tier_labels):
-            # Select Top N% candidates
             cutoff_idx = int(len(df) * tier)
             if cutoff_idx < 1: cutoff_idx = 1
-            
+
             subset = sorted_df.iloc[:cutoff_idx]
-            
-            # Calculate % Enriched (Precision)
+
             enrichment = subset['is_binder'].mean() * 100
-            
+
             plot_data.append({
                 "Method": metric,
                 "Selection Stringency": tier_name,
@@ -158,21 +174,23 @@ if __name__ == "__main__":
     parser.add_argument("path", type=str, help="Path to predictions csv OR directory containing predictions.csv")
     parser.add_argument("--gt", type=str, default=DEFAULT_GT_CSV, help="Path to Ground Truth CSV")
     parser.add_argument("--struct", type=str, default=DEFAULT_STRUCT_SCORES_CSV, help="Path to Structural Scores CSV")
+    parser.add_argument("--struct-af3", type=str, default=DEFAULT_STRUCT_AF3_CSV,
+                        help="Path to AF3 structural scores CSV (set to '' to disable)")
     parser.add_argument("--threshold", type=float, default=3.0, help="Binder Threshold (log_Aff <= X is binder)")
-    
+
     args = parser.parse_args()
-    
+
     target_path = args.path
-    
+
     # Auto-infer logic
     if os.path.isdir(target_path):
         potential_file = os.path.join(target_path, "predictions.csv")
         if os.path.exists(potential_file):
             target_path = potential_file
         else:
-            print(f"❌ Error: Directory provided but 'predictions.csv' not found in: {target_path}")
+            print(f"Error: Directory provided but 'predictions.csv' not found in: {target_path}")
             sys.exit(1)
-            
+
     # Derive output directory from the final file path
     output_dir = os.path.dirname(target_path)
     if not os.path.exists(output_dir):
@@ -181,8 +199,9 @@ if __name__ == "__main__":
     print(f"[Analysis] Processing: {target_path}")
     print(f"[Analysis] Output Dir: {output_dir}")
 
-    df = load_and_prep_data(target_path, args.gt, args.struct, args.threshold)
-    
+    af3_path = args.struct_af3 if args.struct_af3 else None
+    df, metric_directions = load_and_prep_data(target_path, args.gt, args.struct, args.threshold, af3_path)
+
     if df is not None:
-        stats_df, random_rate = calculate_enrichment_stats(df)
+        stats_df, random_rate = calculate_enrichment_stats(df, metric_directions)
         plot_grouped_bar(stats_df, random_rate, output_dir)

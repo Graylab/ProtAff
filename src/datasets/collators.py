@@ -71,28 +71,15 @@ class PairwiseCrossAttnCollator:
             result["better_bid"] = [x["better_binder_id"] for x in batch]
             result["worse_bid"] = [x["worse_binder_id"] for x in batch]
 
+        if "lambda_weight" in batch[0]:
+            result["lambda_weight"] = torch.tensor([x["lambda_weight"] for x in batch], dtype=torch.float32)
+
         return result
 
 
 # ======================================================================
 # Test Collators
 # ======================================================================
-
-@dataclass
-class RegressionTestCollator:
-    """Collator for regression test set - single samples (not pairs)."""
-    tokenizer: Any
-    max_length: int = 1024
-
-    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        binders = [x["binder_seq"] for x in batch]
-        targets = [x["target_seq"] for x in batch]
-        labels = torch.tensor([x["log_Aff"] for x in batch], dtype=torch.float32).unsqueeze(1)
-
-        result = tokenize_cross_attn(self.tokenizer, binders, targets, self.max_length)
-        result["reg_labels"] = labels
-        return result
-
 
 @dataclass
 class BinaryClassificationCollator:
@@ -131,7 +118,7 @@ def select_collator(tokenizer, max_length: int, mode: str = "regression"):
     elif mode == "pairwise":
         return PairwiseCrossAttnCollator(tokenizer=tokenizer, max_length=max_length)
     elif mode == "regression_test":
-        return RegressionTestCollator(tokenizer=tokenizer, max_length=max_length)
+        return CrossAttnCollator(tokenizer=tokenizer, max_length=max_length)
     elif mode == "binary_test":
         return BinaryClassificationCollator(tokenizer=tokenizer, max_length=max_length)
     elif mode == "inference":

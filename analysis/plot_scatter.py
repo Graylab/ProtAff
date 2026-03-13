@@ -18,10 +18,6 @@ from sklearn.metrics import (
 # Configuration
 # ---------------------
 
-# Set your manual threshold here in -log_Aff units (e.g., 9.0 for Kd ~ 1nM)
-# If set to None, it will default to Top 10%
-BINARY_THRESHOLD = -3
-
 # ---------------------
 
 def calculate_enrichment_factor(y_true, y_pred, top_percent, binary_threshold):
@@ -53,7 +49,7 @@ def calculate_enrichment_factor(y_true, y_pred, top_percent, binary_threshold):
     selection_rate = hits_in_top / n_top
     return selection_rate / background_rate
 
-def analyze_and_plot(csv_path):
+def analyze_and_plot(csv_path, gt_col="log_Aff", threshold=None):
     print(f"\n[Analysis] Processing: {csv_path}")
     
     # 1. Load Data
@@ -62,12 +58,19 @@ def analyze_and_plot(csv_path):
     
     df = pd.read_csv(csv_path)
     
-    if "log_Aff" not in df.columns or "predicted_affinity" not in df.columns:
-        print(f"[Error] CSV must contain 'log_Aff' and 'predicted_affinity'. Found: {df.columns.tolist()}")
+    if gt_col not in df.columns or "predicted_affinity" not in df.columns:
+        print(f"[Error] CSV must contain '{gt_col}' and 'predicted_affinity'. Found: {df.columns.tolist()}")
         return
 
-    y_true = -df["log_Aff"].values
-    y_pred = df["predicted_affinity"].values
+    # Drop rows where ground truth or prediction is NaN
+    mask = df[gt_col].notna() & df["predicted_affinity"].notna()
+    n_dropped = (~mask).sum()
+    if n_dropped > 0:
+        print(f"[Info] Dropped {n_dropped} rows with NaN in '{gt_col}' or 'predicted_affinity'")
+    df = df[mask]
+
+    y_true = -df[gt_col].values
+    y_pred = -df["predicted_affinity"].values
     
     output_dir = os.path.dirname(csv_path)
     base_name = os.path.splitext(os.path.basename(csv_path))[0]
@@ -87,15 +90,15 @@ def analyze_and_plot(csv_path):
     # -----------------------------------------------------------
     
     # Logic: Determine Threshold
-    if BINARY_THRESHOLD is not None:
-        used_threshold = BINARY_THRESHOLD
-        print(f"[Config] Using MANUAL threshold: {used_threshold}")
+    if threshold is not None:
+        used_threshold = -threshold  # negate to match y_true space
+        print(f"[Config] Using MANUAL threshold: {threshold} (negated: {used_threshold})")
     else:
         used_threshold = np.percentile(y_true, 90)
         print(f"[Config] Using calculated 90th percentile: {used_threshold:.2f}")
 
-    # Logic: Define Actives based on threshold (-log_Aff >= threshold = good binder)
-    print(f"[Config] 'Good' defined as -log_Aff >= {used_threshold:.2f}")
+    # Logic: Define Actives based on threshold (-gt_col >= threshold = good binder)
+    print(f"[Config] 'Good' defined as -{gt_col} >= {used_threshold:.2f}")
     y_bin = (y_true >= used_threshold).astype(int)
     y_score_for_auc = y_pred
 
@@ -177,7 +180,7 @@ def analyze_and_plot(csv_path):
 
     g.plot_marginals(sns.kdeplot, color="#D55E00", fill=True, alpha=0.3)
 
-    g.set_axis_labels(xlabel="Predicted Affinity (Higher is Better)", ylabel="-log_Aff (Higher is Better)")
+    g.set_axis_labels(xlabel="-Predicted Affinity (Higher is Better)", ylabel=f"-{gt_col} (Higher is Better)")
     g.ax_joint.grid(True, linestyle='--', linewidth=0.5, alpha=0.3, color='gray')
 
     stats_text = (
@@ -193,7 +196,7 @@ def analyze_and_plot(csv_path):
                     verticalalignment='top', horizontalalignment='left',
                     bbox=props, fontsize=16, zorder=5)
 
-    g.ax_joint.legend(loc='lower right', frameon=True, framealpha=0.9)
+    g.ax_joint.legend(loc='upper right', frameon=True, framealpha=0.9)
 
     plot_path = os.path.join(output_dir, f"{base_name}_scatter.png")
     plt.savefig(plot_path, bbox_inches='tight', dpi=300)
@@ -204,11 +207,13 @@ def analyze_and_plot(csv_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Analyze inference results.")
     parser.add_argument("path", type=str, help="Path to csv file OR directory containing predictions.csv")
-    
+    parser.add_argument("--gt-col", type=str, default="log_Aff", help="Ground truth column name (default: log_Aff)")
+    parser.add_argument("--threshold", type=float, default=None, help="Binary threshold in original scale (default: 90th percentile of negated values)")
+
     args = parser.parse_args()
-    
+
     target_path = args.path
-    
+
     # Auto-infer logic
     if os.path.isdir(target_path):
         # If it's a directory, assume the file is named "predictions.csv"
@@ -218,5 +223,5 @@ if __name__ == "__main__":
         else:
             print(f"[Error] Directory provided but 'predictions.csv' not found in: {target_path}")
             sys.exit(1)
-            
-    analyze_and_plot(target_path)
+
+    analyze_and_plot(target_path, gt_col=args.gt_col, threshold=args.threshold)

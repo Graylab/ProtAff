@@ -18,8 +18,8 @@ resume_checkpoint_path: null
 # ==========================================
 data:
   # Data files
-  base_csv: "data/dummy/base_data.csv"       # Train/Val data with target_id column
-  lookup_csv: "data/dummy/lookup_data.csv"   # Sequence lookup table
+  base_csv: "data/combined/base_cleaned.csv"
+  lookup_csv: "data/combined/lookup_data.csv"
   test_csv: "data/test/test_adaptyv.csv"     # Test data (format: id,binder_sequence,target_sequence,log_Aff)
   binary_test_csv: "data/test/test_binary.csv"
   
@@ -29,7 +29,7 @@ data:
   # Balancing configuration
   balance_clusters: true                      # Enable weighted sampling by target_id
   balance_power: 0.25                         # Balancing strength (0.25=gentle, 0.5=medium, 1.0=aggressive)
-  weight_col: null                            # Alternative weighting column (usually null)
+  weight_col: "cluster_id"                            # Alternative weighting column (usually null)
   
 # ==========================================
 # TRAINING CONFIGURATION
@@ -45,7 +45,7 @@ training:
   # Batch configuration
   batch_size: 16
   accumulate_grad_batches: 2                 # Effective batch size = 16 * 2 = 32
-  max_epochs: 15
+  max_epochs: 25
   
   # Optimizer
   learning_rate: 5e-5
@@ -57,12 +57,12 @@ training:
   monitor_mode: "min"                         # "min" for loss, "max" for spearman/accuracy
   
   # Early stopping
-  early_stopping: true
-  early_stopping_patience: 3                  # Stop after N epochs without improvement
+  early_stopping: false
+  early_stopping_patience: 5                  # Stop after N epochs without improvement
   
   # Testing
   test_every_val: true                        # Run test evaluation after each validation
-  test_binary_every_val: true
+  test_binary_every_val: false
   
   # Hardware
   accelerator: "auto"                         # "gpu", "cpu", or "auto"
@@ -73,7 +73,7 @@ training:
   # Training stability
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
-  val_check_interval: 0.5                     # Validate every 0.5 epochs
+  val_check_interval: 1.0
   
   wandb:
     project: "affinity-finetune"

@@ -162,3 +162,73 @@ def _stratified_split(
         print(f"[Split]   NaN-median groups → train: {len(nan_groups)}")
 
     return val_groups, train_groups
+
+
+def within_group_split(
+    df: pd.DataFrame,
+    col: str,
+    ratio: float,
+    seed: int,
+    verbose: bool = True,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Split a DataFrame so that every group appears in both train and val.
+
+    For each group in ``col``, ``ratio`` of its samples go to train and the
+    rest to val.  Singletons (groups with only 1 sample) go to train only.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Full dataset.
+    col : str
+        Column to group by (e.g. 'target_id').
+    ratio : float
+        Fraction of each group's samples assigned to training.
+    seed : int
+        Random seed for reproducibility.
+    verbose : bool
+        Whether to print split statistics.
+
+    Returns
+    -------
+    train_df, val_df : Tuple[pd.DataFrame, pd.DataFrame]
+    """
+    rng = np.random.default_rng(seed)
+
+    train_indices = []
+    val_indices = []
+    n_singletons = 0
+    n_shared = 0
+
+    for group, group_df in df.groupby(col):
+        idx = group_df.index.to_numpy()
+        if len(idx) == 1:
+            train_indices.append(idx)
+            n_singletons += 1
+            continue
+
+        rng.shuffle(idx)
+        n_train = max(1, int(len(idx) * ratio))
+        # Ensure at least 1 sample in val when group size > 1
+        if n_train == len(idx):
+            n_train = len(idx) - 1
+        train_indices.append(idx[:n_train])
+        val_indices.append(idx[n_train:])
+        n_shared += 1
+
+    train_idx = np.concatenate(train_indices) if train_indices else np.array([], dtype=int)
+    val_idx = np.concatenate(val_indices) if val_indices else np.array([], dtype=int)
+
+    train_df = df.loc[train_idx].copy()
+    val_df = df.loc[val_idx].copy()
+
+    if verbose:
+        total_groups = df[col].nunique()
+        print(f"[Split] Within-group split on '{col}'")
+        print(f"[Split] Total groups: {total_groups}")
+        print(f"[Split]   Shared (in both train & val): {n_shared}")
+        print(f"[Split]   Singleton (train only):       {n_singletons}")
+        print(f"[Split] Train samples: {len(train_df):,} | Val samples: {len(val_df):,}")
+
+    return train_df, val_df

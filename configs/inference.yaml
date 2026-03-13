@@ -25,7 +25,10 @@ input_csv: "data/raw/test_data.csv"
 # ==============================================================================
 # OUTPUTS
 # ==============================================================================
-# The results will be saved to: inference_results/{input_filename}/predictions.csv
+# If output_csv is set, results are saved directly to that path.
+# Otherwise, auto-versioned path under base_results_dir is used.
+output_csv: null
+output_dir: null  # For extract_attention.py: directory to save attention maps
 base_results_dir: "inference_results"
 output_filename: "predictions.csv"
 

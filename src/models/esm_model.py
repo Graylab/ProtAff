@@ -44,7 +44,8 @@ class ESMBindingModel(nn.Module):
             if "esm" not in n and p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def encode(self, binder_ids, binder_mask, target_ids, target_mask):
+    def encode(self, binder_ids, binder_mask, target_ids, target_mask,
+               return_attn=False):
         b = self.input_norm(self.input_proj(
             self.esm(input_ids=binder_ids, attention_mask=binder_mask).last_hidden_state
         ))
@@ -52,15 +53,25 @@ class ESMBindingModel(nn.Module):
             self.esm(input_ids=target_ids, attention_mask=target_mask).last_hidden_state
         ))
 
+        attn_weights_list = []
         for layer in self.cross_layers:
-            b, _ = layer(b, t, target_mask)
+            b, aw = layer(b, t, target_mask, return_attn=return_attn)
+            if return_attn:
+                attn_weights_list.append(aw)
 
+        if return_attn:
+            pooled, pool_weights = self.pool(b, binder_mask, return_weights=True)
+            return pooled, attn_weights_list, pool_weights
         return self.pool(b, binder_mask)
 
     def forward(self, binder_ids, binder_mask, target_ids, target_mask,
                 return_attn=False, **kwargs):
-        pooled = self.encode(binder_ids, binder_mask, target_ids, target_mask)
-        return self.head_affinity(pooled)
+        if return_attn:
+            pooled, attn_weights, pool_weights = self.encode(
+                binder_ids, binder_mask, target_ids, target_mask, return_attn=True)
+            return self.head_affinity(pooled), attn_weights, pool_weights
+        return self.head_affinity(self.encode(
+            binder_ids, binder_mask, target_ids, target_mask))
 
 
 # ─── Building Blocks ────────────────────────────────────────────────
@@ -72,11 +83,14 @@ class AttnPool(nn.Module):
         super().__init__()
         self.attn = nn.Linear(d_model, 1)
 
-    def forward(self, x, mask):
+    def forward(self, x, mask, return_weights=False):
         weights = self.attn(x).squeeze(-1)  # (B, L)
         weights = weights.masked_fill(~mask.bool(), float('-inf'))
-        weights = torch.softmax(weights, dim=-1).unsqueeze(-1)  # (B, L, 1)
-        return (x * weights).sum(dim=1)  # (B, d_model)
+        weights = torch.softmax(weights, dim=-1)  # (B, L)
+        pooled = (x * weights.unsqueeze(-1)).sum(dim=1)  # (B, d_model)
+        if return_weights:
+            return pooled, weights
+        return pooled
 
 class UniCrossAttnBlock(nn.Module):
     """Uni-directional cross-attention: query attends to context, with pre-norm, FFN, and residual."""
@@ -99,11 +113,11 @@ class UniCrossAttnBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, q, kv, kv_mask):
+    def forward(self, q, kv, kv_mask, return_attn=False):
         q_out, attn_weights = self.cross_attn(
             self.norm_q(q), self.norm_kv(kv), self.norm_kv(kv),
             key_padding_mask=~kv_mask.bool(),
-            average_attn_weights=True,
+            average_attn_weights=not return_attn,
         )
         q = q + self.dropout(q_out)
         q = q + self.ffn(q)

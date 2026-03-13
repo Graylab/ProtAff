@@ -14,7 +14,7 @@ ProtAff is a protein binding affinity prediction framework built on ESM2 (protei
 python src/train.py --config-name pair_affinity
 
 # With overrides
-python src/train.py --config-name pair_affinity model=esm_bi_cross_attn training.learning_rate=1e-4
+python src/train.py --config-name pair_affinity training.learning_rate=1e-4
 
 # Distributed via SLURM (see jobs/ for examples)
 srun -n 4 python src/train.py --config-name pair_affinity
@@ -58,7 +58,7 @@ Model config: `configs/model/esm_binding.yaml`.
 Collators in `src/datasets/collators.py` handle tokenization (separate binder/target encoding):
 - `CrossAttnCollator` for regression tasks
 - `PairwiseCrossAttnCollator` for ranking tasks (produces better/worse pairs)
-- `RegressionTestCollator` / `BinaryClassificationCollator` / `InferenceCollator` for evaluation
+- `BinaryClassificationCollator` / `InferenceCollator` for evaluation
 - `select_collator(tokenizer, max_length, mode)` factory function
 
 Shared test datasets in `src/datasets/test_datasets.py`: `TestRegressionDataset`, `BinaryClassificationTestDataset`.
@@ -80,7 +80,7 @@ Outputs go to `outputs/{task_name}/{date}/{time}/` containing checkpoints, saved
 
 ### Logging and Evaluation
 
-W&B logging is configured per-task in `training.wandb.project`. Custom callbacks in `src/train.py`:
+W&B logging is configured per-task in `training.wandb.project`. Custom callbacks in `src/callbacks.py`:
 - `BestModelSaver`: exports best LoRA adapter to `saved_model/`
 - `TestEveryValidationCallback`: regression test on held-out data each validation
 - `BinaryTestCallback`: per-target AUC/AP on binary binder classification

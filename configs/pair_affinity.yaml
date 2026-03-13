@@ -14,20 +14,21 @@ data:
   lookup_csv: "data/combined/lookup_data.csv"
   test_csv: "data/test/test_adaptyv.csv"
   binary_test_csv: "data/test/test_binary.csv"
+  split_file: null #"data/splits/split_seed42.json"  # Pre-computed train/val split
   
   # --- Pair Mining ---
   pair_group_cols: null # default null
   intra_pps: 2 # default 2
   inter_pps: 10 # default 10
   min_margin: 1.0 # default 1.0
-  max_margin: 5.0 # default 5.0
+  max_margin: null # default 5.0
   intra_max_anchors_per_target: 2000 # default 2000
-  inter_samples_per_target: null # default null (null = legacy singleton-only behavior)
+  inter_samples_per_target: 2 # Binders sampled per target for inter-target pairs (null = legacy singleton-only)
 
   # --- Sampling & Balancing ---
   weight_col: "cluster_id"
   balance_clusters: true
-  balance_power: 0.5 # default 0.25
+  balance_power: 0.25 # default 0.25
   balance_sources: false # default false
 
   # --- DataLoader ---
@@ -45,9 +46,10 @@ training:
   max_epochs: 25             # Ranking often takes longer to converge than regression
 
   # Loss Function
-  loss_type: "margin"  # Options: margin, soft_margin, bce, margin_weighted, contrastive
+  loss_type: "margin"  # Options: margin, soft_margin, bce, margin_weighted, contrastive, lambdarank
   margin: 0.1
   temperature: 0.1  # For contrastive loss
+  sigma: 1.0  # LambdaRank sigmoid steepness
 
   # Optimizer
   learning_rate: 5e-5        # Slightly lower LR is often better for ranking fine-tuning
@@ -64,7 +66,7 @@ training:
 
   # Testing
   test_every_val: true                        # Run test evaluation after each validation
-  test_binary_every_val: true
+  test_binary_every_val: false
 
   # Hardware
   accelerator: "auto"

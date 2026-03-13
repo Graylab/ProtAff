@@ -1,7 +1,6 @@
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import pytorch_lightning as pl
 from peft import get_peft_model, LoraConfig
 from omegaconf import DictConfig, OmegaConf
@@ -19,18 +18,6 @@ def get_esm_lora_target_modules(esm_model, target_modules: list, n_last_layers: 
         for i in range(num_layers - n_last_layers, num_layers)
         for m in target_modules
     ]
-
-
-class FocalLoss(nn.Module):
-    def __init__(self, alpha: float = 1.0, gamma: float = 2.0):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-
-    def forward(self, logits, targets):
-        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-        p_t = torch.sigmoid(logits) * targets + (1 - torch.sigmoid(logits)) * (1 - targets)
-        return (self.alpha * (1 - p_t) ** self.gamma * bce).mean()
 
 
 class BaseModule(pl.LightningModule):

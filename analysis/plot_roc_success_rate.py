@@ -8,16 +8,17 @@ import sys
 import argparse
 
 # ================= CONFIGURATION (DEFAULTS) =================
-DEFAULT_STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv" 
-DEFAULT_GT_CSV = "data/test/test_adaptyv.csv"                            
+DEFAULT_STRUCT_SCORES_CSV = "data/boltz2/adaptyv/all_models_scores.csv"
+DEFAULT_STRUCT_AF3_CSV = "data/af3/all_models_scores.csv"
+DEFAULT_GT_CSV = "data/test/test_adaptyv.csv"
 
 # Aggregation to use for the Structural Scores
-SELECTED_AGG = 'min' 
+SELECTED_AGG = 'min'
 
 STRUCT_METRICS = ['ipSAE', 'ipTM_af', 'pDockQ', 'pDockQ2', 'LIS']
 # =================================================
 
-def analyze_enrichment(pred_csv, output_dir, gt_csv, struct_csv, binder_threshold):
+def analyze_enrichment(pred_csv, output_dir, gt_csv, struct_csv, binder_threshold, struct_af3_csv=None):
     print(f"\n[Analysis] Predictions: {pred_csv}")
     print(f"[Analysis] Output Dir : {output_dir}")
     print(f"[Analysis] GT File    : {gt_csv}")
@@ -28,32 +29,42 @@ def analyze_enrichment(pred_csv, output_dir, gt_csv, struct_csv, binder_threshol
 
     print("Loading data...")
     try:
-        struct_df = pd.read_csv(struct_csv)
         gt_df = pd.read_csv(gt_csv)
         aff_pred_df = pd.read_csv(pred_csv)
     except FileNotFoundError as e:
         print(f"[Error] File not found: {e}")
         return
 
-    # Cleanup IDs
-    struct_df['id'] = struct_df['id'].astype(str).str.strip()
     gt_df['id'] = gt_df['id'].astype(str).str.strip()
     aff_pred_df['id'] = aff_pred_df['id'].astype(str).str.strip()
 
-    # 1. Prepare Data
-    # Filter for available structural metrics
-    available_metrics = [m for m in STRUCT_METRICS if m in struct_df.columns]
-    
-    grouped_df = struct_df.groupby('id')[available_metrics].agg(SELECTED_AGG).reset_index()
-    
-    # Merge All
-    merged_df = pd.merge(grouped_df, gt_df[['id', 'log_Aff']], on='id', how='inner')
-    merged_df = pd.merge(merged_df, aff_pred_df[['id', 'predicted_affinity']], on='id', how='inner')
+    # 1. Prepare Data — load and aggregate each structural source
+    struct_sources = {'Boltz2': struct_csv}
+    if struct_af3_csv:
+        struct_sources['AF3'] = struct_af3_csv
+
+    merged_df = pd.merge(gt_df[['id', 'log_Aff']], aff_pred_df[['id', 'predicted_affinity']], on='id', how='inner')
+    eval_metrics = []
+
+    for source_name, csv_path in struct_sources.items():
+        try:
+            src_df = pd.read_csv(csv_path)
+        except FileNotFoundError:
+            print(f"[Warning] {source_name} structural scores not found: {csv_path}")
+            continue
+        src_df['id'] = src_df['id'].astype(str).str.strip()
+        available = [m for m in STRUCT_METRICS if m in src_df.columns]
+        grouped = src_df.groupby('id')[available].agg(SELECTED_AGG).reset_index()
+        grouped.columns = ['id'] + [f'{source_name}_{m}' for m in available]
+        merged_df = pd.merge(merged_df, grouped, on='id', how='left')
+        for m in available:
+            eval_metrics.append((f"{source_name} {m} ({SELECTED_AGG})", f'{source_name}_{m}', True))
 
     # 2. Define Binary Class
     merged_df['is_binder'] = (merged_df['log_Aff'] <= binder_threshold).astype(int)
-    
-    # predicted_affinity is already higher = better
+
+    # predicted_affinity is lower=better (log_Kd-like); negate so higher=better for sorting/AUC
+    merged_df['predicted_affinity'] = -merged_df['predicted_affinity']
 
     num_binders = merged_df['is_binder'].sum()
     total_samples = len(merged_df)
@@ -66,38 +77,30 @@ def analyze_enrichment(pred_csv, output_dir, gt_csv, struct_csv, binder_threshol
     # --- Generate Confirmatory Scatter Plot ---
     plot_negated_affinity_scatter(merged_df, binder_threshold, output_dir)
     # =================================================================
-    
+
     if num_binders == 0 or num_binders == total_samples:
         print("ERROR: Cannot calculate ROC/Enrichment. 0 binders or 0 non-binders.")
         return
 
-    # Prepare list of metrics
-    eval_metrics = []
-    for m in available_metrics:
-        eval_metrics.append((f"{m} ({SELECTED_AGG})", m, True))
     eval_metrics.append(("Predicted Affinity", "predicted_affinity", False))
 
     # --- DEFINE RESEARCH PAPER COLORS ---
-    research_colors = [
-        "#0072B2", # Blue
-        "#009E73", # Bluish Green
-        "#CC79A7", # Reddish Purple
-        "#56B4E9", # Sky Blue
-        "#E69F00", # Orange
-        "#333333", # Dark Grey
-        "#F0E442", # Yellow
-    ]
-    
+    boltz2_colors = ["#0072B2", "#CC79A7", "#56B4E9", "#E69F00", "#333333"]
+    af3_colors = ["#009E73", "#2CA02C", "#17BECF", "#BCBD22", "#7F7F7F"]
+
     color_map = {}
-    color_idx = 0
-    
+    boltz2_idx = 0
+    af3_idx = 0
+
     for label, col, is_struct in eval_metrics:
         if "Predicted Affinity" in label:
-            # Highlight: Vermillion (Deep Red-Orange)
-            color_map[label] = "#D55E00" 
+            color_map[label] = "#D55E00"
+        elif label.startswith("AF3"):
+            color_map[label] = af3_colors[af3_idx % len(af3_colors)]
+            af3_idx += 1
         else:
-            color_map[label] = research_colors[color_idx % len(research_colors)]
-            color_idx += 1
+            color_map[label] = boltz2_colors[boltz2_idx % len(boltz2_colors)]
+            boltz2_idx += 1
 
     # Store results
     results = []
@@ -301,7 +304,7 @@ def plot_negated_affinity_scatter(df, binder_threshold, output_dir):
                      color='#009E73', alpha=0.1, zorder=0, label='Ideal Region')
 
     plt.title("Predicted vs. Experimental Affinity", fontweight='bold', pad=20)
-    plt.xlabel("Predicted Affinity (Higher is Better)")
+    plt.xlabel("-Predicted Affinity (Higher is Better)")
     plt.ylabel("-Experimental log_Aff (Higher is Better)")
 
     plt.legend(loc='upper left', frameon=True, framealpha=0.95, shadow=True)
@@ -340,12 +343,14 @@ if __name__ == "__main__":
     parser.add_argument("path", type=str, help="Path to predictions csv OR directory containing predictions.csv")
     parser.add_argument("--gt", type=str, default=DEFAULT_GT_CSV, help="Path to Ground Truth CSV")
     parser.add_argument("--struct", type=str, default=DEFAULT_STRUCT_SCORES_CSV, help="Path to Structural Scores CSV")
+    parser.add_argument("--struct-af3", type=str, default=DEFAULT_STRUCT_AF3_CSV,
+                        help="Path to AF3 structural scores CSV (set to '' to disable)")
     parser.add_argument("--threshold", type=float, default=3.0, help="Binder Threshold (log_Aff <= X is binder)")
-    
+
     args = parser.parse_args()
-    
+
     target_path = args.path
-    
+
     # Auto-infer logic
     if os.path.isdir(target_path):
         potential_file = os.path.join(target_path, "predictions.csv")
@@ -354,8 +359,9 @@ if __name__ == "__main__":
         else:
             print(f"[Error] Directory provided but 'predictions.csv' not found in: {target_path}")
             sys.exit(1)
-            
+
     # Derive output directory from the final file path
     output_dir = os.path.dirname(target_path)
-    
-    analyze_enrichment(target_path, output_dir, args.gt, args.struct, args.threshold)
+
+    af3_path = args.struct_af3 if args.struct_af3 else None
+    analyze_enrichment(target_path, output_dir, args.gt, args.struct, args.threshold, af3_path)

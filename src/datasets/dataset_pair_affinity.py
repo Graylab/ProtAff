@@ -1,3 +1,4 @@
+import json
 import os
 import numpy as np
 import pandas as pd
@@ -8,9 +9,9 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from pytorch_lightning import LightningDataModule
 from transformers import EsmTokenizer
 
-from src.datasets.collators import select_collator, RegressionTestCollator, BinaryClassificationCollator
+from src.datasets.collators import select_collator, BinaryClassificationCollator
 from src.datasets.test_datasets import TestRegressionDataset, BinaryClassificationTestDataset
-from src.datasets.split_utils import group_split
+from src.datasets.split_utils import group_split, within_group_split
 
 
 # ======================================================================
@@ -45,6 +46,7 @@ class PairwiseAffinityDataset(Dataset):
         num_df = num_df.merge(counts, on='target_id')
         self._num_df = num_df
 
+        self._loss_type = None  # set externally if needed
         self._build_pairs()
 
     def _build_pairs(self):
@@ -61,6 +63,7 @@ class PairwiseAffinityDataset(Dataset):
         self.b_worse, self.t_worse = [], []
         self.deltas, self.pair_types = [], []
         self.sources = []
+        self.lambda_weights = []
         self.dropped_pairs = 0
         self.missing_keys = set()
         self._current_group = None
@@ -252,6 +255,75 @@ class PairwiseAffinityDataset(Dataset):
         self.deltas.append(abs(w_rec['log_Aff'] - b_rec['log_Aff']))
         self.pair_types.append(pair_type)
         self.sources.append(self._current_group)
+        self.lambda_weights.append(1.0)  # default; overwritten by _compute_lambda_weights
+
+    def _compute_lambda_weights(self):
+        """Compute |ΔNDCG| weights for intra-target pairs."""
+        num_df = self._num_df
+
+        # Build per-target ideal DCG and position/gain lookups
+        target_info = {}  # target_id -> {idealDCG, binder_rank, binder_gain}
+        for t_id, group in num_df.groupby('target_id'):
+            affs = group['log_Aff'].values
+            binder_ids = group['binder_id'].values
+
+            # Normalize affinities to [0, 4] range within this target
+            aff_min, aff_max = affs.min(), affs.max()
+            if aff_max > aff_min:
+                norm_affs = (affs - aff_min) / (aff_max - aff_min) * 4.0
+            else:
+                norm_affs = np.full_like(affs, 2.0)
+
+            gains = 2.0 ** norm_affs - 1.0
+
+            # Sort by gain descending to get ideal ranking
+            sorted_idx = np.argsort(-gains)
+            ideal_dcg = np.sum(gains[sorted_idx] / np.log2(np.arange(len(sorted_idx)) + 2))
+
+            # Map binder_id -> (ideal_rank_position, gain)
+            binder_rank = {}
+            binder_gain = {}
+            for rank, idx in enumerate(sorted_idx):
+                bid = binder_ids[idx]
+                binder_rank[bid] = rank
+                binder_gain[bid] = gains[idx]
+
+            target_info[t_id] = {
+                'idealDCG': ideal_dcg,
+                'binder_rank': binder_rank,
+                'binder_gain': binder_gain,
+            }
+
+        # Compute lambda weight for each pair
+        updated = 0
+        for i in range(len(self.lambda_weights)):
+            if self.pair_types[i] != 'intra_target':
+                continue  # inter-target pairs keep weight=1.0
+
+            t_id = self.t_better[i]
+            info = target_info.get(t_id)
+            if info is None or info['idealDCG'] < 1e-10:
+                continue
+
+            bid_better = self.b_better[i]
+            bid_worse = self.b_worse[i]
+
+            gain_b = info['binder_gain'].get(bid_better)
+            gain_w = info['binder_gain'].get(bid_worse)
+            rank_b = info['binder_rank'].get(bid_better)
+            rank_w = info['binder_rank'].get(bid_worse)
+
+            if gain_b is None or gain_w is None or rank_b is None or rank_w is None:
+                continue
+
+            delta_gain = abs(gain_b - gain_w)
+            delta_discount = abs(1.0 / np.log2(rank_b + 2) - 1.0 / np.log2(rank_w + 2))
+            delta_ndcg = delta_gain * delta_discount / info['idealDCG']
+
+            self.lambda_weights[i] = max(delta_ndcg, 1e-6)
+            updated += 1
+
+        self._log(f"[*] LambdaRank: computed ΔNDCG weights for {updated:,} intra-target pairs")
 
     def _log(self, msg: str):
         if self.verbose:
@@ -261,7 +333,7 @@ class PairwiseAffinityDataset(Dataset):
         return len(self.b_better)
     
     def __getitem__(self, idx):
-        return {
+        item = {
             "better_binder": self.id2seq.get(f"binder_{self.b_better[idx]}", ""),
             "better_target": self.id2seq.get(f"target_{self.t_better[idx]}", ""),
             "worse_binder": self.id2seq.get(f"binder_{self.b_worse[idx]}", ""),
@@ -272,6 +344,9 @@ class PairwiseAffinityDataset(Dataset):
             "better_binder_id": self.b_better[idx],
             "worse_binder_id": self.b_worse[idx],
         }
+        if self._loss_type == "lambdarank":
+            item["lambda_weight"] = self.lambda_weights[idx]
+        return item
 
 
 # ======================================================================
@@ -310,7 +385,22 @@ class PairAffinityDataModule(LightningDataModule):
         strategy = self.cfg.training.get("split_strategy", "group")
         rng = np.random.default_rng(seed)
 
-        if strategy == "random":
+        split_file = self.cfg.data.get("split_file", None)
+        if split_file and os.path.exists(split_file):
+            with open(split_file) as f:
+                split_info = json.load(f)
+            if split_info["split_col"] != self.split_col:
+                raise ValueError(
+                    f"split_file split_col '{split_info['split_col']}' != "
+                    f"datamodule split_col '{self.split_col}'"
+                )
+            val_groups = set(split_info["val_groups"])
+            val_df = base_df[base_df[self.split_col].isin(val_groups)].copy()
+            train_df = base_df[~base_df[self.split_col].isin(val_groups)].copy()
+            print(f"[Split] Loaded from {split_file}: "
+                  f"{len(train_df):,} train / {len(val_df):,} val samples, "
+                  f"{len(val_groups)} val groups")
+        elif strategy == "random":
             from sklearn.model_selection import train_test_split
             train_df, val_df = train_test_split(
                 base_df, train_size=train_ratio, random_state=seed, shuffle=True
@@ -321,6 +411,11 @@ class PairAffinityDataModule(LightningDataModule):
                 base_df, col=self.split_col, ratio=train_ratio, seed=seed,
                 verbose=True,
                 label_col="log_Aff",
+            )
+        elif strategy == "within_group":
+            train_df, val_df = within_group_split(
+                base_df, col=self.split_col, ratio=train_ratio, seed=seed,
+                verbose=True,
             )
         else:
             raise ValueError(f"Unknown split_strategy: {strategy}")
@@ -334,6 +429,8 @@ class PairAffinityDataModule(LightningDataModule):
         inter_samples_per_target = self.cfg.data.get("inter_samples_per_target", None)
 
         # Train/Val datasets
+        loss_type = self.cfg.training.get("loss_type", "margin")
+
         self.train_dataset = PairwiseAffinityDataset(
             train_df, self.cfg.data.lookup_csv,
             intra_pps=self.cfg.data.get("intra_pps", 2),
@@ -347,6 +444,9 @@ class PairAffinityDataModule(LightningDataModule):
             verbose=True,
             rng=rng,
         )
+        self.train_dataset._loss_type = loss_type
+        if loss_type == "lambdarank":
+            self.train_dataset._compute_lambda_weights()
 
         self.val_dataset = PairwiseAffinityDataset(
             val_df, self.cfg.data.lookup_csv,
@@ -360,6 +460,9 @@ class PairAffinityDataModule(LightningDataModule):
             verbose=True,
             rng=rng,
         )
+        self.val_dataset._loss_type = loss_type
+        if loss_type == "lambdarank":
+            self.val_dataset._compute_lambda_weights()
 
         # Regression test dataset
         test_csv = self.cfg.data.get("test_csv", None)
@@ -374,9 +477,10 @@ class PairAffinityDataModule(LightningDataModule):
                 verbose=True
             )
 
-            self.test_collate_fn = RegressionTestCollator(
+            self.test_collate_fn = select_collator(
                 tokenizer=self.tokenizer,
-                max_length=self.cfg.model.max_length
+                max_length=self.cfg.model.max_length,
+                mode="regression_test"
             )
         else:
             self.test_dataset = None
