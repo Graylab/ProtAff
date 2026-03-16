@@ -1,13 +1,13 @@
 __pycache__/
 data/
+!data/combined/
+data/combined/*/
+!data/combined/*.csv
 outputs/
-jobs/
 slogs/
 inference_results/
 analysis/
-weights/
 figures/
-scripts/
 results/
 latex/
 review/
