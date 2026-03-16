@@ -9,3 +9,6 @@ weights/
 figures/
 scripts/
 results/
+latex/
+review/
+*.zip

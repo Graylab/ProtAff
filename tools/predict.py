@@ -24,7 +24,7 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 
 # Allow imports from the ProtAff project
-PROTAFF_ROOT = Path(__file__).resolve().parent
+PROTAFF_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROTAFF_ROOT))
 
 from src.models import build_model
