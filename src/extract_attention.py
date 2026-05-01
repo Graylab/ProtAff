@@ -37,6 +37,45 @@ def main(cfg: DictConfig):
     tokenizer = EsmTokenizer.from_pretrained(cfg.model.name)
 
     df = pd.read_csv(input_path)
+
+    # --- Target perturbation experiments ---
+    experiment = cfg.get("experiment", None)
+    if experiment is not None:
+        t_col = None
+        for c in InferenceDataset.TARGET_CANDIDATES:
+            if c in df.columns:
+                t_col = c
+                break
+        if t_col is None:
+            raise ValueError("Cannot find target column for perturbation")
+
+        if experiment == "scramble":
+            import random
+            seed = cfg.get("scramble_seed", 42)
+            rng = random.Random(seed)
+
+            def scramble(seq):
+                residues = list(seq)
+                rng.shuffle(residues)
+                return "".join(residues)
+
+            df[t_col] = df[t_col].apply(scramble)
+            print(f"[Experiment] Scrambled target sequences (seed={seed})")
+
+        elif experiment == "constant":
+            DEFAULT_GFP = (
+                "MSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKFICTTGKLPVPWPTL"
+                "VTTFSYGVQCFSRYPDHMKQHDFFKSAMPEGYVQERTIFFKDDGNYKTRAEVKFEGDTLVN"
+                "RIELKGIDFKEDGNILGHKLEYNYNSHNVYIMADKQKNGIKVNFKIRHNIEDGSVQLADHY"
+                "QQNTPIGDGPVLLPDNHYLSTQSALSKDPNEKRDHMVLLEFVTAAGITHGMDELYK"
+            )
+            constant_seq = cfg.get("constant_target_seq", None) or DEFAULT_GFP
+            df[t_col] = constant_seq
+            print(f"[Experiment] Replaced all targets with constant sequence (len={len(constant_seq)})")
+
+        else:
+            raise ValueError(f"Unknown experiment mode: {experiment}")
+
     dataset = InferenceDataset(df)
     max_length = cfg.model.get("max_length", 1024)
     dataloader = DataLoader(

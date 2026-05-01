@@ -10,6 +10,6 @@ inference_results/
 analysis/
 figures/
 results/
-latex/
 review/
+scripts/
 *.zip

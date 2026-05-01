@@ -39,6 +39,13 @@ batch_size: 32
 device: "auto"  # "cuda", "cpu", or "auto"
 
 # ==============================================================================
+# TARGET PERTURBATION EXPERIMENTS
+# ==============================================================================
+experiment: null          # null | "scramble" | "constant"
+scramble_seed: 42
+constant_target_seq: null # null = use default GFP sequence
+
+# ==============================================================================
 # HYDRA SYSTEM SETTINGS
 # ==============================================================================
 hydra:

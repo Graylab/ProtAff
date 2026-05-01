@@ -23,7 +23,7 @@ data:
   min_margin: 1.0 # default 1.0
   max_margin: null # default 5.0
   intra_max_anchors_per_target: 2000 # default 2000
-  inter_samples_per_target: 2 # Binders sampled per target for inter-target pairs (null = legacy singleton-only)
+  inter_samples_per_target: null # Binders sampled per target for inter-target pairs (null = legacy singleton-only)
 
   # --- Sampling & Balancing ---
   weight_col: "cluster_id"
