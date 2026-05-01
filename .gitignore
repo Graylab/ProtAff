@@ -3,7 +3,8 @@ data/
 !data/combined/
 data/combined/*/
 !data/combined/*.csv
-weights/
+weights/*
+!weights/model_margin_weighted/
 outputs/
 slogs/
 inference_results/

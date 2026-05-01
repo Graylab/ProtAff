@@ -1,0 +1,6 @@
+Best Model Metadata
+==================================================
+epoch: 9
+global_step: 11670
+val_loss: 0.0635547935962677
+mode: min
