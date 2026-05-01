@@ -1,0 +1,17 @@
+# Minimal conda env for ProtAff inference (tools/predict.py).
+# For the full training/analysis env, use environment-full.yml.
+name: protaff
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - torch>=2.1,<3
+      - transformers>=4.40,<5
+      - peft>=0.10
+      - safetensors>=0.4
+      - omegaconf>=2.3
+      - pandas>=2.0
+      - tqdm>=4.60
+      - pyyaml>=6.0
