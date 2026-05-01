@@ -22,7 +22,7 @@ weights/model_margin_weighted/
 ## Installation
 
 ```bash
-git clone https://github.com/<your-org>/ProtAff.git
+git clone https://github.com/Graylab/ProtAff.git
 cd ProtAff
 ```
 
