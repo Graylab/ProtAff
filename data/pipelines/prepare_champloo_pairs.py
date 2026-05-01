@@ -5,14 +5,14 @@ Reads the champloo supplementary table, filters to the 91 non-excluded PDB syste
 (matching the iPTM matrices), and generates all 91×91 = 8,281 pairs.
 
 Usage:
-    python tools/prepare_champloo_pairs.py \
+    python data/pipelines/prepare_champloo_pairs.py \
         --output data/sources/ab_ag_champloo/champloo_allvsall.csv
 """
 import argparse
 import pandas as pd
 from pathlib import Path
 
-PROTAFF_ROOT = Path(__file__).resolve().parent.parent
+PROTAFF_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_SUPP_TABLE = (
     PROTAFF_ROOT
     / "data/sources/ab_ag_champloo"

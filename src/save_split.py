@@ -1,8 +1,8 @@
 """Save a canonical train/val split to a JSON file.
 
 Usage:
-    python scripts/save_split.py --config-name pair_affinity
-    python scripts/save_split.py --config-name pair_affinity training.seed=42
+    python src/save_split.py --config-name pair_affinity
+    python src/save_split.py --config-name pair_affinity training.seed=42
 
 The output JSON contains:
     {"split_col": "cluster_id", "val_groups": ["grp1", "grp2", ...]}

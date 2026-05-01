@@ -56,7 +56,7 @@ HuggingFace Hub.
 
 ## Quick start — run inference
 
-`tools/predict.py` is a standalone script (no Hydra) that loads the LoRA
+`src/predict.py` is a standalone script (no Hydra) that loads the LoRA
 adapter on top of ESM2 and writes per-row predictions.
 
 ### 1. Prepare an input CSV
@@ -79,7 +79,7 @@ binder_B,EVKLEESGGGLVQ...,LEEKKVCQGTSNK...
 ### 2. Run prediction
 
 ```bash
-python tools/predict.py \
+python src/predict.py \
     --model_dir weights/model_margin_weighted \
     --input_csv inputs.csv \
     --output_csv predictions.csv
@@ -93,7 +93,7 @@ The output is your input CSV with one extra column, `predicted_affinity`
 Apply the same target to every row (skip the target column in the CSV):
 
 ```bash
-python tools/predict.py \
+python src/predict.py \
     --model_dir weights/model_margin_weighted \
     --input_csv binders_only.csv \
     --output_csv predictions.csv \
@@ -103,7 +103,7 @@ python tools/predict.py \
 Tune throughput / memory:
 
 ```bash
-python tools/predict.py \
+python src/predict.py \
     --model_dir weights/model_margin_weighted \
     --input_csv inputs.csv \
     --output_csv predictions.csv \
@@ -128,7 +128,7 @@ python tools/predict.py \
 source .venv/bin/activate           # or: conda activate protaff
 
 # 2. Predict on the bundled NIV test set
-python tools/predict.py \
+python src/predict.py \
     --model_dir weights/model_margin_weighted \
     --input_csv data/test/test_niv.csv \
     --output_csv predictions_niv.csv

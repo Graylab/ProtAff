@@ -8,7 +8,7 @@
 #SBATCH --time=1:00:00
 #SBATCH --output=slogs/%j.out
 
-python tools/predict.py \
+python src/predict.py \
     --model_dir $1 \
     --input_csv data/sources/az_collab/predict_input_untrim.csv \
     --output_csv data/sources/az_collab/predict_output_untrim.csv

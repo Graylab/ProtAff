@@ -27,7 +27,7 @@ srun -n 4 python src/train.py --config-name pair_affinity
 python src/inference.py model_path="outputs/pair_affinity/2026-01-01/12-00-00/saved_model" input_csv="data/test/test.csv"
 
 # Standalone prediction script (no Hydra dependency)
-python tools/predict.py --model_dir /path/to/saved_model --input_csv data.csv --output_csv results.csv
+python src/predict.py --model_dir /path/to/saved_model --input_csv data.csv --output_csv results.csv
 # Use --target_seq to apply the same target to all binders
 ```
 
@@ -46,7 +46,6 @@ python src/zero_shot.py input_csv="data/test/test.csv"
 
 ```
 scripts/          # Shell scripts (.sh only)
-tools/            # Standalone CLI tools (predict.py, save_split.py)
 analysis/         # All figure generation and analysis scripts
   paper/          # Paper figure outputs
   slides/         # Slide figure outputs
