@@ -159,5 +159,4 @@ same target rather than treating any single value as a calibrated Kd.
 
 ## Citation
 
-If you use ProtAff or these weights, please cite the accompanying paper
-(see the repository for current citation details).
+https://www.biorxiv.org/content/10.64898/2026.06.13.732058v1
